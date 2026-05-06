@@ -3,18 +3,58 @@
 Originally `tasks/generate_sidecar_csv/client_sidecar.py`.
 """
 
+import json
 import logging
 import re
 from collections import defaultdict
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
-from atomic_tools.client_schemas import ClientSchema, client_schema_for_bucket
 from atomic_tools.utils.utils import find_sidecar_row, load_sidecar_df
 
 logger = logging.getLogger(__name__)
+
+
+# ---- Schema ----------------------------------------------------------------
+#
+# A client schema describes how to normalise a client-supplied sidecar CSV
+# before merging:
+#
+#   * headerless_columns — positional column names applied when the client
+#     CSV ships without a header row. Empty / omitted means "the CSV has a
+#     header".
+#   * column_renames — per-client column renames applied AFTER positional
+#     naming and BEFORE the global alias canonicalisation.
+#
+# See ``schemas/example.json`` for an example.
+
+
+@dataclass(frozen=True)
+class ClientSchema:
+    headerless_columns: tuple[str, ...] = ()
+    column_renames: Mapping[str, str] = field(default_factory=dict)
+
+
+_EMPTY_SCHEMA = ClientSchema()
+
+
+def load_client_schema(path: Path | None) -> ClientSchema:
+    """Load a client schema from a JSON file.
+
+    Returns the empty schema (no headerless columns, no renames) when ``path``
+    is ``None`` — i.e. when the caller hasn't supplied a schema.
+    """
+    if path is None:
+        return _EMPTY_SCHEMA
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return ClientSchema(
+        headerless_columns=tuple(data.get("headerless_columns", ())),
+        column_renames=dict(data.get("column_renames", {})),
+    )
 
 
 class SidecarMergeError(RuntimeError):
@@ -153,19 +193,22 @@ def _validate_filename_column(df: pd.DataFrame) -> None:
 
 def load_and_clean_client_sidecar(
     url: str,
-    bucket: str,
+    schema_path: Path | None,
     required_field_groups: dict[str, list[list[str]]],
 ) -> pd.DataFrame:
     """Load the client sidecar at `url` and run the cleaning pipeline.
 
-    `bucket` is used to look up the per-client schema. `required_field_groups`
-    is injected (rather than imported) to avoid a circular dependency with the
-    sidecar generator section below.
+    `schema_path` points to a client-provided JSON schema (see
+    ``schemas/example.json``); when ``None``, no headerless-column naming or
+    per-client renames are applied. `required_field_groups` is injected
+    (rather than imported) to avoid a circular dependency with the sidecar
+    generator.
     """
-    schema = client_schema_for_bucket(bucket)
+    schema = load_client_schema(schema_path)
     logger.info(
-        f"Loading client sidecar {url!r} for bucket {bucket!r} "
-        f"(headerless={'yes' if schema.headerless_columns else 'no'}, "
+        f"Loading client sidecar {url!r} "
+        f"(schema={str(schema_path) if schema_path else 'none'}, "
+        f"headerless={'yes' if schema.headerless_columns else 'no'}, "
         f"renames={len(schema.column_renames)})"
     )
     df = load_sidecar_df(url, headerless_columns=schema.headerless_columns or None)

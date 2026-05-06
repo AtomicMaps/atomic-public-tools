@@ -71,6 +71,10 @@ _PDAL_BIN = "/opt/conda/envs/pdal/bin/pdal"
 # LAS header stores bounds as flat keys; remap to bounds.X for downstream.
 _LAS_BOUNDS_DIMS = frozenset({"minx", "miny", "maxx", "maxy", "minz", "maxz"})
 
+# Directory where the sidecar-path pointer file is written. None falls back to
+# the current working directory. Holder for a future CLI option.
+SIDECAR_PATH_OUTPUT_DIR: Path | None = None
+
 # Each inner list: [canonical_name, *alternatives].
 # A file "satisfies" a group if it has any field from the group in its metadata.
 # If any file fails to satisfy a group, the canonical field is prepended as a
@@ -314,11 +318,12 @@ def _generate(
     data_type: DataTypeEnum,
     output_filename: str,
     client_sidecar: str | None,
+    client_schema: Path | None,
 ) -> str:
     logger.info(
         f"Starting sidecar CSV generation — bucket={bucket!r} directory={directory!r} "
         f"data_type={data_type} output={output_filename!r} "
-        f"client_sidecar={client_sidecar!r}"
+        f"client_sidecar={client_sidecar!r} client_schema={client_schema!r}"
     )
 
     if data_type == DataTypeEnum.vector:
@@ -395,7 +400,7 @@ def _generate(
         logger.info(f"Merging client sidecar from {client_url}")
         client_df = load_and_clean_client_sidecar(
             url=client_url,
-            bucket=bucket,
+            schema_path=client_schema,
             required_field_groups=_REQUIRED_SIDECAR_FIELD_GROUPS,
         )
         merge_client_metadata(file_metadata, client_df)
@@ -417,16 +422,18 @@ def _generate(
     sidecar_s3_path = f"s3://{bucket}/{output_key}"
     logger.info(f"Sidecar CSV written: {sidecar_s3_path}")
 
-    # Argo workflow integration: write the output S3 path to the parameters
-    # file the workflow controller reads. Best-effort — non-Argo runs simply
-    # skip this with a warning.
+    # Best-effort pointer file — failures only warn.
+    pointer_dir = SIDECAR_PATH_OUTPUT_DIR or Path.cwd()
+    pointer_path = pointer_dir / "sidecar_csv_path"
     try:
-        argo_output_dir = "/var/run/argo/outputs/parameters"
-        os.makedirs(argo_output_dir, exist_ok=True)
-        with open(f"{argo_output_dir}/sidecar_csv_path", "w") as f:
-            f.write(sidecar_s3_path)
+        pointer_dir.mkdir(parents=True, exist_ok=True)
+        pointer_path.write_text(sidecar_s3_path)
+        logger.info(f"Wrote sidecar path pointer to {pointer_path}")
     except Exception:
-        logger.warning(f"Could not write Argo output parameter. sidecar_csv_path={sidecar_s3_path}")
+        logger.warning(
+            f"Could not write sidecar path pointer to {pointer_path}. "
+            f"sidecar_csv_path={sidecar_s3_path}"
+        )
 
     return sidecar_s3_path
 
@@ -463,6 +470,20 @@ def generate(
             ),
         ),
     ] = None,
+    client_schema: Annotated[
+        Path | None,
+        typer.Option(
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help=(
+                "Optional path to a client-supplied JSON schema describing how to "
+                "normalise the client sidecar CSV (headerless column names, "
+                "per-client renames). See schemas/example.json. If omitted, the "
+                "client CSV is used as-is with no renames."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Scan an S3 directory, extract per-file metadata, and write a sidecar CSV."""
     # Configure logging at command entry only — keeps the library importable
@@ -479,12 +500,8 @@ def generate(
             data_type=data_type,
             output_filename=output_filename,
             client_sidecar=client_sidecar,
+            client_schema=client_schema,
         )
     except Exception:
-        logger.exception(
-            f"Failed to generate sidecar CSV. "
-            f"--bucket {bucket} --directory {directory} "
-            f"--data-type {data_type} "
-            f"--client-sidecar {client_sidecar}"
-        )
+        logger.exception("Failed to generate sidecar CSV")
         raise typer.Exit(code=1) from None

@@ -9,7 +9,6 @@ runner = CliRunner()
 def test_root_help():
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
-    assert "metadata" in result.stdout
     assert "sidecar" in result.stdout
 
 
@@ -28,6 +27,7 @@ def test_sidecar_generate_help_lists_options():
         "--data-type",
         "--output-filename",
         "--client-sidecar",
+        "--client-schema",
     ):
         assert flag in result.stdout
 
@@ -38,24 +38,3 @@ def test_version():
     assert __version__ in result.stdout
 
 
-def test_metadata_help_lists_subcommands():
-    result = runner.invoke(app, ["metadata", "--help"])
-    assert result.exit_code == 0
-    assert "validate" in result.stdout
-    assert "format" in result.stdout
-
-
-def test_metadata_validate_detects_format(tmp_path):
-    sample = tmp_path / "sample.json"
-    sample.write_text("{}")
-    result = runner.invoke(app, ["metadata", "validate", str(sample)])
-    assert result.exit_code == 0
-    assert "json" in result.stdout
-    assert "not yet implemented" in result.stdout
-
-
-def test_metadata_validate_rejects_unknown_extension(tmp_path):
-    sample = tmp_path / "sample.txt"
-    sample.write_text("hello")
-    result = runner.invoke(app, ["metadata", "validate", str(sample)])
-    assert result.exit_code != 0

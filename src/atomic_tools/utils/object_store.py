@@ -29,6 +29,16 @@ REMOTE_SCHEME_TO_STORE_TYPE: dict[str, str] = {
 }
 
 
+def normalize_bucket(bucket: str) -> str:
+    """Strip the ``s3://`` scheme and any trailing slash from a bucket name."""
+    if not bucket:
+        return ""
+    b = bucket.strip()
+    if b.startswith("s3://"):
+        b = b[len("s3://") :]
+    return b.rstrip("/")
+
+
 class ObjectStore:
     """Wrapper for creating cloud storage instances dynamically.
 
