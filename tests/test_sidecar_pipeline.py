@@ -34,36 +34,45 @@ def _exif_like_metadata() -> list[tuple[str, dict]]:
     images, after the GPSPosition noise filter and dict ordering match what
     `extract_exif_metadata` emits."""
     return [
-        ("1.jpg", {
-            "DateTimeOriginal": "2024:06:15 10:30:00",
-            "CreateDate": "2024:06:15 10:30:00",
-            "GPSAltitude": "1100 m Above Sea Level",
-            "GPSLatitude": "51 deg 2' 40.92\" N",
-            "GPSLongitude": "114 deg 4' 18.84\" W",
-            "GimbalPitchDegree": -90.0,
-            "GimbalYawDegree": 0.0,
-            "GimbalRollDegree": 0.0,
-        }),
-        ("2.jpeg", {
-            "DateTimeOriginal": "2024:06:15 10:31:00",
-            "CreateDate": "2024:06:15 10:31:00",
-            "GPSAltitude": "1200 m Above Sea Level",
-            "GPSLatitude": "51 deg 3' 0.00\" N",
-            "GPSLongitude": "114 deg 4' 30.00\" W",
-            "GimbalPitchDegree": -85.0,
-            "GimbalYawDegree": 45.0,
-            "GimbalRollDegree": 1.5,
-        }),
-        ("3.jpg", {
-            "DateTimeOriginal": "2024:06:15 10:32:00",
-            "CreateDate": "2024:06:15 10:32:00",
-            "GPSAltitude": "1150 m Above Sea Level",
-            "GPSLatitude": "51 deg 2' 52.80\" N",
-            "GPSLongitude": "114 deg 4' 12.00\" W",
-            "GimbalPitchDegree": -88.0,
-            "GimbalYawDegree": 90.0,
-            "GimbalRollDegree": -0.5,
-        }),
+        (
+            "1.jpg",
+            {
+                "DateTimeOriginal": "2024:06:15 10:30:00",
+                "CreateDate": "2024:06:15 10:30:00",
+                "GPSAltitude": "1100 m Above Sea Level",
+                "GPSLatitude": "51 deg 2' 40.92\" N",
+                "GPSLongitude": "114 deg 4' 18.84\" W",
+                "GimbalPitchDegree": -90.0,
+                "GimbalYawDegree": 0.0,
+                "GimbalRollDegree": 0.0,
+            },
+        ),
+        (
+            "2.jpeg",
+            {
+                "DateTimeOriginal": "2024:06:15 10:31:00",
+                "CreateDate": "2024:06:15 10:31:00",
+                "GPSAltitude": "1200 m Above Sea Level",
+                "GPSLatitude": "51 deg 3' 0.00\" N",
+                "GPSLongitude": "114 deg 4' 30.00\" W",
+                "GimbalPitchDegree": -85.0,
+                "GimbalYawDegree": 45.0,
+                "GimbalRollDegree": 1.5,
+            },
+        ),
+        (
+            "3.jpg",
+            {
+                "DateTimeOriginal": "2024:06:15 10:32:00",
+                "CreateDate": "2024:06:15 10:32:00",
+                "GPSAltitude": "1150 m Above Sea Level",
+                "GPSLatitude": "51 deg 2' 52.80\" N",
+                "GPSLongitude": "114 deg 4' 12.00\" W",
+                "GimbalPitchDegree": -88.0,
+                "GimbalYawDegree": 90.0,
+                "GimbalRollDegree": -0.5,
+            },
+        ),
     ]
 
 
@@ -139,10 +148,13 @@ def test_headerless_sidecar_with_schema_matches_headered():
             )
 
 
-@pytest.mark.parametrize("client_csv,schema", [
-    (INPUT_SIDECAR, None),
-    (HEADERLESS_SIDECAR, EXAMPLE_SCHEMA),
-])
+@pytest.mark.parametrize(
+    "client_csv,schema",
+    [
+        (INPUT_SIDECAR, None),
+        (HEADERLESS_SIDECAR, EXAMPLE_SCHEMA),
+    ],
+)
 def test_merge_client_overrides_gps_altitude(client_csv, schema):
     """For 1.jpg the example sidecars set GPSAltitude=1000, EXIF=1100.
     Client should win.
@@ -171,9 +183,7 @@ def test_merge_client_empty_cell_preserves_exif():
 
 
 def test_split_gps_position_string():
-    out = _split_gps_position(
-        {"GPSPosition": "51 deg 3' 0.00\" N, 114 deg 4' 30.00\" W"}
-    )
+    out = _split_gps_position({"GPSPosition": "51 deg 3' 0.00\" N, 114 deg 4' 30.00\" W"})
     assert out == {
         "GPSLatitude": "51 deg 3' 0.00\" N",
         "GPSLongitude": "114 deg 4' 30.00\" W",
@@ -188,19 +198,24 @@ def test_split_gps_position_list():
 
 
 def test_split_gps_position_overwrites_existing():
-    out = _split_gps_position({
-        "GPSPosition": "1.0, 2.0",
-        "GPSLatitude": "old",
-        "GPSLongitude": "old",
-    })
+    out = _split_gps_position(
+        {
+            "GPSPosition": "1.0, 2.0",
+            "GPSLatitude": "old",
+            "GPSLongitude": "old",
+        }
+    )
     assert out == {"GPSLatitude": "1.0", "GPSLongitude": "2.0"}
 
 
-@pytest.mark.parametrize("meta", [
-    {"X": 1},                                # absent
-    {"GPSPosition": "no-comma"},             # unparseable string
-    {"GPSPosition": ", "},                   # empty halves
-    {"GPSPosition": [1, 2, 3]},              # wrong list length
-])
+@pytest.mark.parametrize(
+    "meta",
+    [
+        {"X": 1},  # absent
+        {"GPSPosition": "no-comma"},  # unparseable string
+        {"GPSPosition": ", "},  # empty halves
+        {"GPSPosition": [1, 2, 3]},  # wrong list length
+    ],
+)
 def test_split_gps_position_unchanged_on_bad_input(meta):
     assert _split_gps_position(meta) == meta
