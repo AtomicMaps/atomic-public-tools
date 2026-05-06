@@ -1,0 +1,5 @@
+Filename,CreateDate,GPSAltitude,GPSLatitude,GPSLongitude,Pitch,Roll,Heading
+DEFAULT,2024:07:15 10:30:00,,,,,,
+1.jpg,,1000 m Above Sea Level,"51 deg 2' 40.92"" N","114 deg 4' 18.84"" W",-90.0,0.0,0.0
+2.jpeg,2024:06:15 10:31:00,1000 m Above Sea Level,"51 deg 3' 0.00"" N","114 deg 4' 30.00"" W",-85.0,1.5,45.0
+3.jpg,2024:06:15 10:32:00,1150 m Above Sea Level,"51 deg 4' 52.80"" N","114 deg 4' 12.00"" W",-88.0,-0.5,90.0
