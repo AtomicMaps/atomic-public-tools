@@ -10,6 +10,26 @@ def test_root_help():
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
     assert "metadata" in result.stdout
+    assert "sidecar" in result.stdout
+
+
+def test_sidecar_help_lists_generate():
+    result = runner.invoke(app, ["sidecar", "--help"])
+    assert result.exit_code == 0
+    assert "generate" in result.stdout
+
+
+def test_sidecar_generate_help_lists_options():
+    result = runner.invoke(app, ["sidecar", "generate", "--help"])
+    assert result.exit_code == 0
+    for flag in (
+        "--bucket",
+        "--directory",
+        "--data-type",
+        "--output-filename",
+        "--client-sidecar",
+    ):
+        assert flag in result.stdout
 
 
 def test_version():

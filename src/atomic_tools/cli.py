@@ -3,7 +3,7 @@ from typing import Annotated
 import typer
 
 from atomic_tools import __version__
-from atomic_tools.commands.metadata import metadata_app
+from atomic_tools.commands.sidecar import sidecar_app
 
 app = typer.Typer(
     name="am-tools",
@@ -12,7 +12,7 @@ app = typer.Typer(
     add_completion=False,
 )
 
-app.add_typer(metadata_app, name="metadata", help="Validate and format metadata files.")
+app.add_typer(sidecar_app, name="sidecar", help="Generate a sidecar CSV from S3.")
 
 
 def _version_callback(value: bool) -> None:
