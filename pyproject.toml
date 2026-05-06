@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "atomic-public-tools"
+version = "0.1.0"
+description = "Client-facing tools to format metadata for Flow intake."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Atomic Maps", email = "quinn@atomicmaps.io" },
+]
+keywords = ["atomic", "flow", "metadata", "cli"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "typer>=0.12",
+    "pydantic>=2",
+    "openpyxl>=3.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+am-tools = "atomic_tools.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/atomicmaps/atomic-public-tools"
+Issues = "https://github.com/atomicmaps/atomic-public-tools/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/atomic_tools"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.mypy]
+python_version = "3.10"
+strict = false
+ignore_missing_imports = true
