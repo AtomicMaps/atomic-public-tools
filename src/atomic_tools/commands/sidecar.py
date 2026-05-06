@@ -15,6 +15,8 @@ import tempfile
 from pathlib import Path
 from typing import Annotated
 
+import click
+import questionary
 import typer
 
 from atomic_tools.client_sidecar import (
@@ -57,8 +59,8 @@ SIDECAR_PATH_OUTPUT_DIR: Path | None = None
 # blank column.
 _REQUIRED_SIDECAR_FIELD_GROUPS: dict[str, list[list[str]]] = {
     DataTypeEnum.oriented_image: [
-        ["GPSLatitude", "GPSPosition"],
-        ["GPSLongitude", "GPSPosition"],
+        ["GPSLatitude"],
+        ["GPSLongitude"],
         ["GPSAltitude"],
         ["CreateDate", "DateTimeOriginal", "ModifyDate", "GPSDateStamp"],
         [
@@ -96,8 +98,8 @@ _REQUIRED_SIDECAR_FIELD_GROUPS: dict[str, list[list[str]]] = {
         ],
     ],
     DataTypeEnum.spherical_image: [
-        ["GPSLatitude", "GPSPosition"],
-        ["GPSLongitude", "GPSPosition"],
+        ["GPSLatitude"],
+        ["GPSLongitude"],
         ["GPSAltitude"],
         ["CreateDate", "DateTimeOriginal", "ModifyDate", "GPSDateStamp"],
         ["Pitch", "CameraPitch", "GimbalPitchDegree", "PosePitchDegrees"],
@@ -105,8 +107,8 @@ _REQUIRED_SIDECAR_FIELD_GROUPS: dict[str, list[list[str]]] = {
         ["Roll", "CameraRoll", "GimbalRollDegree", "PoseRollDegrees"],
     ],
     DataTypeEnum.ortho_image: [
-        ["GPSLatitude", "GPSPosition"],
-        ["GPSLongitude", "GPSPosition"],
+        ["GPSLatitude"],
+        ["GPSLongitude"],
         ["GPSAltitude"],
         ["DateTimeOriginal", "CreateDate", "ModifyDate", "GPSDateStamp"],
     ],
@@ -127,12 +129,115 @@ _REQUIRED_SIDECAR_FIELD_GROUPS: dict[str, list[list[str]]] = {
 }
 
 
+def _list_local_schemas() -> list[Path]:
+    """Return sorted ``*.json`` files from ``./schemas/`` if that dir exists."""
+    schemas_dir = Path.cwd() / "schemas"
+    if not schemas_dir.is_dir():
+        return []
+    return sorted(schemas_dir.glob("*.json"))
+
+
+def _ask_directory() -> str:
+    return questionary.text(
+        "Directory to scan:",
+        instruction="(Local folder or object-store URI like s3://bucket/prefix)",
+        validate=lambda v: bool(v.strip()) or "Required.",
+    ).unsafe_ask().strip()
+
+
+def _ask_data_type() -> DataTypeEnum:
+    choice = questionary.select(
+        "Data type of the input data:",
+        choices=[v.value for v in DataTypeEnum if v in _REQUIRED_SIDECAR_FIELD_GROUPS],
+    ).unsafe_ask()
+    return DataTypeEnum(choice)
+
+
+def _ask_output_filename() -> str:
+    return questionary.text(
+        "Output filename:",
+        default="sidecar.csv",
+        instruction="(Press Enter to keep the default)",
+    ).unsafe_ask()
+
+
+def _ask_full() -> bool:
+    return questionary.confirm(
+        "Include every metadata field exiftool/pdal extracted? "
+        "(No keeps only the canonical fields Flow needs)",
+        default=False,
+    ).unsafe_ask()
+
+
+def _ask_client_sidecar() -> str | None:
+    answer = questionary.text(
+        "Optional client-supplied sidecar CSV to merge in:",
+        instruction="(Local path or s3:// URI; press Enter to skip)",
+    ).unsafe_ask()
+    answer = answer.strip()
+    return answer or None
+
+
+_SCHEMA_CUSTOM = "Custom path…"
+_SCHEMA_SKIP = "Skip"
+
+
+def _ask_client_schema() -> Path | None:
+    schemas = _list_local_schemas()
+    choices = [str(p.name) for p in schemas] + [_SCHEMA_CUSTOM, _SCHEMA_SKIP]
+    selection = questionary.select(
+        "Optional client schema (normalises a client-supplied sidecar):",
+        choices=choices,
+        default=_SCHEMA_SKIP,
+    ).unsafe_ask()
+    if selection == _SCHEMA_SKIP:
+        return None
+    if selection == _SCHEMA_CUSTOM:
+        custom = questionary.path(
+            "Path to schema JSON:",
+            validate=lambda v: Path(v).expanduser().is_file() or "File not found.",
+        ).unsafe_ask()
+        return Path(custom).expanduser().resolve()
+    return next(p for p in schemas if p.name == selection)
+
+
+def _split_gps_position(meta: dict) -> dict:
+    """Split a ``GPSPosition`` value into ``GPSLatitude``/``GPSLongitude``.
+
+    exiftool emits ``GPSPosition`` as ``"<lat>, <lon>"`` (DMS or decimal),
+    or as a 2-element list when the ``-n`` flag is in play. When a file or
+    client sidecar provides ``GPSPosition``, treat it as authoritative and
+    overwrite ``GPSLatitude``/``GPSLongitude`` with the split halves.
+    Returns `meta` unchanged if ``GPSPosition`` is absent or unparseable.
+    """
+    raw = meta.get("GPSPosition")
+    if raw is None:
+        return meta
+    if isinstance(raw, (list, tuple)):
+        if len(raw) != 2:
+            return meta
+        lat, lon = (str(part).strip() for part in raw)
+    else:
+        text = str(raw)
+        if "," not in text:
+            return meta
+        lat, lon = (part.strip() for part in text.split(",", 1))
+    if not lat or not lon:
+        return meta
+    out = {k: v for k, v in meta.items() if k != "GPSPosition"}
+    out["GPSLatitude"] = lat
+    out["GPSLongitude"] = lon
+    return out
+
+
 def _canonicalize_keys(meta: dict, alias_to_canonical: dict[str, str]) -> dict:
     """Rename alias keys in `meta` to their canonical names. If the canonical
     is already present, the alias is dropped; among multiple aliases for the
     same canonical, the first-encountered one wins.
     """
-    out: dict = {key: value for key, value in meta.items() if key not in alias_to_canonical}
+    out: dict = {
+        key: value for key, value in meta.items() if key not in alias_to_canonical
+    }
     for key, value in meta.items():
         if key in alias_to_canonical:
             out.setdefault(alias_to_canonical[key], value)
@@ -164,7 +269,7 @@ def build_sidecar_df(
 
     alias_to_canonical = build_global_alias_map(required_field_groups or [])
     file_metadata = [
-        (filename, _canonicalize_keys(meta, alias_to_canonical))
+        (filename, _canonicalize_keys(_split_gps_position(meta), alias_to_canonical))
         for filename, meta in file_metadata
     ]
 
@@ -184,7 +289,9 @@ def build_sidecar_df(
     if required_field_groups:
         for group in required_field_groups:
             canonical = group[0]
-            all_covered = all(any(field in meta for field in group) for _, meta in file_metadata)
+            all_covered = all(
+                any(field in meta for field in group) for _, meta in file_metadata
+            )
             if not all_covered and canonical not in prepend_cols:
                 prepend_cols.append(canonical)
 
@@ -198,7 +305,9 @@ def build_sidecar_df(
     df = pd.DataFrame(rows, columns=columns)
     df = df.sort_values(by="Filename", kind="stable", ignore_index=True)
 
-    default_row = pd.DataFrame([{"Filename": "DEFAULT", **{col: "" for col in all_cols}}])
+    default_row = pd.DataFrame(
+        [{"Filename": "DEFAULT", **{col: "" for col in all_cols}}]
+    )
     return pd.concat([default_row, df], ignore_index=True)
 
 
@@ -317,30 +426,63 @@ def _generate(
     return sidecar_path
 
 
+def _run_interactive_wizard(
+    directory: str | None,
+    data_type: DataTypeEnum | None,
+    output_filename: str | None,
+    client_sidecar: str | None,
+    client_schema: Path | None,
+    full: bool,
+    full_provided: bool,
+) -> tuple[str, DataTypeEnum, str | None, str | None, Path | None, bool]:
+    """Prompt for any value the user didn't pass on the CLI. Returns the
+    final (directory, data_type, output_filename, client_sidecar, client_schema, full).
+    """
+    questionary.print(
+        "Interactive mode — press Ctrl+C at any time to cancel.\n",
+        style="fg:ansibrightblack",
+    )
+    try:
+        if directory is None:
+            directory = _ask_directory()
+        if data_type is None:
+            data_type = _ask_data_type()
+        if output_filename is None:
+            output_filename = _ask_output_filename()
+        if client_sidecar is None:
+            client_sidecar = _ask_client_sidecar()
+        if client_schema is None:
+            client_schema = _ask_client_schema()
+        if not full_provided:
+            full = _ask_full()
+    except KeyboardInterrupt:
+        raise typer.Exit(code=130) from None
+    return directory, data_type, output_filename, client_sidecar, client_schema, full
+
+
 @sidecar_app.command()
 def generate(
+    ctx: typer.Context,
     directory: Annotated[
-        str,
+        str | None,
         typer.Option(
-            ...,
             help=(
                 "Directory to scan. Either an object-store URI "
                 "(s3://bucket/prefix, gs://..., az://...) or a local filesystem path."
             ),
         ),
-    ],
+    ] = None,
     data_type: Annotated[
-        DataTypeEnum,
+        DataTypeEnum | None,
         typer.Option(
-            ...,
             help="Data type of the input data (e.g. 'oriented_image', 'point_cloud').",
             case_sensitive=False,
         ),
-    ],
+    ] = None,
     output_filename: Annotated[
-        str,
+        str | None,
         typer.Option(help="Filename for the generated sidecar CSV."),
-    ] = "sidecar.csv",
+    ] = None,
     client_sidecar: Annotated[
         str | None,
         typer.Option(
@@ -369,7 +511,7 @@ def generate(
     full: Annotated[
         bool,
         typer.Option(
-            "--full/--no-full",
+            "--full",
             help=(
                 "Include every metadata field extracted from each file. By "
                 "default, only the canonical/required fields for the data type "
@@ -378,13 +520,40 @@ def generate(
         ),
     ] = False,
 ) -> None:
-    """Scan a directory, extract per-file metadata, and write a sidecar CSV."""
+    """Scan a directory, extract per-file metadata, and write a sidecar CSV.
+
+    With no flags, prompts interactively for each value. Any flag that is
+    passed on the command line is used as-is and not prompted for.
+    """
     # Configure logging at command entry only — keeps the library importable
     # without imposing a global logging config on consumers.
     logging.basicConfig(
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         level=logging.INFO,
     )
+
+    if directory is None or data_type is None:
+        full_provided = (
+            ctx.get_parameter_source("full") == click.core.ParameterSource.COMMANDLINE
+        )
+        directory, data_type, output_filename, client_sidecar, client_schema, full = (
+            _run_interactive_wizard(
+                directory,
+                data_type,
+                output_filename,
+                client_sidecar,
+                client_schema,
+                full,
+                full_provided,
+            )
+        )
+
+    output_filename = output_filename or "sidecar.csv"
+
+    if not directory:
+        raise typer.BadParameter("Directory is required.")
+    if data_type is None:
+        raise typer.BadParameter("Data type is required.")
 
     try:
         _generate(
