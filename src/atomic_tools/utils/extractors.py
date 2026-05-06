@@ -13,7 +13,10 @@ from atomic_tools.utils.utils import run_exiftool
 
 logger = logging.getLogger(__name__)
 
-# exiftool fields that describe the tool/file-system rather than the asset
+# exiftool fields that describe the tool/file-system rather than the asset.
+# GPSPosition is dropped because exiftool always auto-derives it from
+# GPSLatitude/GPSLongitude; if a client sidecar later provides its own
+# GPSPosition, _split_gps_position will reintroduce it as authoritative.
 _EXIFTOOL_NOISE_FIELDS = {
     "SourceFile",
     "ExifToolVersion",
@@ -27,6 +30,7 @@ _EXIFTOOL_NOISE_FIELDS = {
     "FileType",
     "FileTypeExtension",
     "MIMEType",
+    "GPSPosition",
 }
 
 _PDAL_BIN = "/opt/conda/envs/pdal/bin/pdal"

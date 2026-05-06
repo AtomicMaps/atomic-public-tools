@@ -16,15 +16,15 @@ def test_load_parses_example_json():
     schema = load_client_schema(REPO_ROOT / "schemas" / "example.json")
     assert schema.headerless_columns == (
         "Filename",
-        "__PLACEHOLDER__col2",
-        "__PLACEHOLDER__col3",
-        "__PLACEHOLDER__col4",
+        "CreateDate",
+        "GPSAltitude",
+        "GPSLatitude",
+        "GPSLongitude",
+        "Pitch",
+        "Roll",
+        "Heading",
     )
-    assert dict(schema.column_renames) == {
-        "M21": "__PLACEHOLDER__M21_target",
-        "M31": "__PLACEHOLDER__M31_target",
-        "M41": "__PLACEHOLDER__M41_target",
-    }
+    assert dict(schema.column_renames) == {}
 
 
 def test_load_handles_missing_keys(tmp_path):
