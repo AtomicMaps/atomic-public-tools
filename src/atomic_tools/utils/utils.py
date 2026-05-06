@@ -340,6 +340,56 @@ def get_keys_and_metadata(store: ObstoreBackend, prefix: str) -> dict:
         raise RuntimeError(f"Unexpected error during listing keys with prefix {prefix}: {e}") from e
 
 
+def filter_keys(
+    key_sizes: dict[str, int],
+    include: list | tuple,
+    exclude: list | tuple = (),
+) -> list[str]:
+    """Filter a {key: size} mapping by suffix include/exclude.
+
+    Skips zero-size files, files inside ``*.gdb/`` directories, and adds
+    ``.gdb`` directory roots when ``.gdb`` is in `include`.
+    """
+    if not include:
+        raise ValueError("Must specify at least one file extension to include.")
+
+    inc = tuple(e.lower() for e in include)
+    excl = tuple(p.lower() for p in exclude) if exclude else ()
+    logger.info(f"Filtering for extensions {inc}, excluding {excl}")
+
+    include_gdb = any(x.endswith(".gdb") for x in inc)
+    gdb_roots: set[str] = set()
+    if include_gdb:
+        for k in key_sizes:
+            kl = k.lower()
+            if ".gdb/" in kl:
+                try:
+                    gdb_roots.add(k[: kl.index(".gdb/")] + ".gdb")
+                except Exception:
+                    gdb_roots.add(kl.split(".gdb/", 1)[0] + ".gdb")
+
+    filtered: list[str] = []
+    for k, size in key_sizes.items():
+        kl = k.lower()
+        if ".gdb/" in kl:
+            continue
+        if not kl.endswith(inc):
+            continue
+        if excl and kl.endswith(excl):
+            continue
+        if size == 0:
+            logger.warning(f"Skipping zero-size file: {k}")
+            continue
+        filtered.append(k)
+
+    if include_gdb and gdb_roots:
+        filtered.extend(sorted(gdb_roots))
+
+    result = list(dict.fromkeys(filtered))
+    logger.info(f"Matched {len(result)} file(s) after filtering.")
+    return result
+
+
 def get_object_keys(
     store: ObstoreBackend,
     directory: str,
@@ -349,8 +399,6 @@ def get_object_keys(
     """List object keys whose suffixes match `include`, excluding any matching `exclude`."""
     if not directory.strip():
         raise ValueError("Directory path cannot be empty")
-    if not include:
-        raise ValueError("Must specify at least one file extension to include.")
 
     try:
         key_info = get_keys_and_metadata(store, directory)
@@ -363,41 +411,7 @@ def get_object_keys(
         return []
 
     key_sizes = {k: key_info[k]["size"] for k in key_info}
-    inc = tuple(e.lower() for e in include)
-    excl = tuple(p.lower() for p in exclude) if exclude else ()
-
-    logger.info(f"Filtering for extensions {inc}, excluding {excl}")
-
-    gdb_roots: set = set()
-    for k in key_info:
-        kl = k.lower()
-        if ".gdb/" in kl:
-            try:
-                gdb_roots.add(k[: kl.index(".gdb/")] + ".gdb")
-            except Exception:
-                gdb_roots.add(kl.split(".gdb/", 1)[0] + ".gdb")
-
-    include_gdb = any(x.endswith(".gdb") for x in inc)
-    filtered: list[str] = []
-
-    for k in key_info:
-        kl = k.lower()
-        if ".gdb/" in kl:
-            continue
-        if kl.endswith(inc):
-            if excl and kl.endswith(excl):
-                continue
-            if key_sizes.get(k, 0) == 0:
-                logger.warning(f"Skipping zero-size file: {k}")
-                continue
-            filtered.append(k)
-
-    if include_gdb and gdb_roots:
-        filtered.extend(sorted(gdb_roots))
-
-    result = list(dict.fromkeys(filtered))
-    logger.info(f"Matched {len(result)} file(s) after filtering.")
-    return result
+    return filter_keys(key_sizes, include, exclude)
 
 
 def download(store: ObstoreBackend, key: str, destination_dir: str, buffer_size: int = 5) -> str:

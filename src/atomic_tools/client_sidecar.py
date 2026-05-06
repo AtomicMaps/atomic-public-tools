@@ -7,7 +7,7 @@ import json
 import logging
 import re
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -92,29 +92,26 @@ def _apply_client_renames(df: pd.DataFrame, schema: ClientSchema) -> pd.DataFram
 
 
 def build_global_alias_map(
-    required_field_groups: dict[str, list[list[str]]],
+    field_groups: Iterable[list[str]],
 ) -> dict[str, str]:
-    """Invert the required-field-groups dict into a flat {alias: canonical} map.
-
-    First entry of each group is canonical; remaining entries are aliases that
-    should be renamed to canonical when seen in a client sidecar.
+    """Invert a sequence of ``[canonical, *aliases]`` groups into a flat
+    ``{alias: canonical}`` map.
     """
     alias_to_canonical: dict[str, str] = {}
-    for groups in required_field_groups.values():
-        for group in groups:
-            if not group:
+    for group in field_groups:
+        if not group:
+            continue
+        canonical, *aliases = group
+        for alias in aliases:
+            if alias == canonical:
                 continue
-            canonical, *aliases = group
-            for alias in aliases:
-                if alias == canonical:
-                    continue
-                existing = alias_to_canonical.get(alias)
-                if existing and existing != canonical:
-                    logger.warning(
-                        f"Alias collision: {alias!r} maps to both "
-                        f"{existing!r} and {canonical!r}; using {canonical!r}."
-                    )
-                alias_to_canonical[alias] = canonical
+            existing = alias_to_canonical.get(alias)
+            if existing and existing != canonical:
+                logger.warning(
+                    f"Alias collision: {alias!r} maps to both "
+                    f"{existing!r} and {canonical!r}; using {canonical!r}."
+                )
+            alias_to_canonical[alias] = canonical
     return alias_to_canonical
 
 
@@ -214,7 +211,8 @@ def load_and_clean_client_sidecar(
     df = load_sidecar_df(url, headerless_columns=schema.headerless_columns or None)
     df = _apply_positional_names(df, schema)
     df = _apply_client_renames(df, schema)
-    df = _apply_global_aliases(df, build_global_alias_map(required_field_groups))
+    flat_groups = [g for groups in required_field_groups.values() for g in groups]
+    df = _apply_global_aliases(df, build_global_alias_map(flat_groups))
     _validate_filename_column(df)
     logger.info(
         f"Client sidecar cleaned: {len(df)} row(s), {len(df.columns)} column(s); "

@@ -22,7 +22,6 @@ def test_sidecar_generate_help_lists_options():
     result = runner.invoke(app, ["sidecar", "generate", "--help"])
     assert result.exit_code == 0
     for flag in (
-        "--bucket",
         "--directory",
         "--data-type",
         "--output-filename",
@@ -30,6 +29,7 @@ def test_sidecar_generate_help_lists_options():
         "--client-schema",
     ):
         assert flag in result.stdout
+    assert "--bucket" not in result.stdout
 
 
 def test_version():
