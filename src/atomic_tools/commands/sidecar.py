@@ -234,6 +234,60 @@ def _split_gps_position(meta: dict) -> dict:
     return out
 
 
+def _warn_missing_required_fields(
+    file_metadata: list[tuple[str, dict]],
+    required_field_groups: list[list[str]],
+) -> None:
+    """Emit a loud warning when files lack required fields after the merge.
+
+    A group is "satisfied" for a file if any field in the group is present
+    (non-empty) in that file's metadata. For each unsatisfied group we log a
+    structured WARNING and also print a bright-red message to stderr so the
+    operator notices that the client sidecar needs to be updated.
+    """
+    if not file_metadata or not required_field_groups:
+        return
+
+    def _has_value(meta: dict, field: str) -> bool:
+        s = str(meta.get(field, "")).strip()
+        return bool(s) and s.lower() != "nan"
+
+    missing_by_group: list[tuple[str, list[str], list[str]]] = []
+    for group in required_field_groups:
+        canonical = group[0]
+        missing_files = [
+            filename
+            for filename, meta in file_metadata
+            if not any(_has_value(meta, field) for field in group)
+        ]
+        if missing_files:
+            missing_by_group.append((canonical, list(group), missing_files))
+
+    if not missing_by_group:
+        return
+
+    total = len(file_metadata)
+    logger.warning(
+        "Missing required metadata after client sidecar merge — see details below."
+    )
+
+    header = (
+        f"MISSING REQUIRED METADATA: {len(missing_by_group)} required field(s) "
+        f"are not satisfied for every file. Update the client sidecar to "
+        f"provide values for the listed files."
+    )
+    click.secho(header, fg="bright_red", bold=True, err=True, color=True)
+
+    for canonical, group, missing_files in missing_by_group:
+        accepted = ", ".join(group)
+        sample = missing_files if len(missing_files) <= 5 else missing_files[:5] + ["…"]
+        line = (
+            f"  [{canonical}] missing on {len(missing_files)}/{total} file(s): "
+            f"{sample} (accepted aliases: {accepted})"
+        )
+        click.secho(line, fg="bright_red", err=True, color=True)
+
+
 def _canonicalize_keys(meta: dict, alias_to_canonical: dict[str, str]) -> dict:
     """Rename alias keys in `meta` to their canonical names. If the canonical
     is already present, the alias is dropped; among multiple aliases for the
@@ -389,6 +443,7 @@ def _generate(
 
     logger.info(f"Building sidecar DataFrame for {len(file_metadata)} file(s).")
     required_field_groups = list(_REQUIRED_SIDECAR_FIELD_GROUPS.get(data_type, []))
+    _warn_missing_required_fields(file_metadata, required_field_groups)
     df = build_sidecar_df(
         file_metadata,
         required_field_groups=required_field_groups,

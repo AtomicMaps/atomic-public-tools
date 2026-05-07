@@ -145,7 +145,9 @@ def _apply_global_aliases(df: pd.DataFrame, alias_map: dict[str, str]) -> pd.Dat
     return df
 
 
-def _safe_rename(df: pd.DataFrame, renames: dict[str, str], *, context: str) -> pd.DataFrame:
+def _safe_rename(
+    df: pd.DataFrame, renames: dict[str, str], *, context: str
+) -> pd.DataFrame:
     """Apply a rename, raising if two source columns collide on the same target."""
     target_to_sources: dict[str, list[str]] = defaultdict(list)
     for src, dst in renames.items():
@@ -247,12 +249,13 @@ def _client_meta_from_row(row: pd.Series, file_col: str) -> dict[str, str]:
     """Convert a matched client-CSV row to a meta dict, dropping empties + filename col."""
     meta: dict[str, str] = {}
     for col, val in row.items():
-        if col == file_col:
+        col_name = str(col)
+        if col_name == file_col:
             continue
         s = str(val).strip() if val is not None else ""
         if not s or s.lower() == "nan":
             continue
-        meta[col] = s
+        meta[col_name] = s
     return meta
 
 
@@ -288,13 +291,18 @@ def merge_client_metadata(
     file_metadata: list[tuple[str, dict[str, Any]]],
     client_df: pd.DataFrame,
 ) -> list[tuple[str, dict[str, Any]]]:
-    """Merge cleaned client rows into per-file metadata. Client wins on conflict.
+    """Merge cleaned client rows into per-file metadata. File metadata wins on conflict.
 
     Mutates the dicts inside `file_metadata` in place and returns the same list.
-    Empty cells in the client row do NOT overwrite EXIF values.
+    Client values fill in only fields that are missing or empty on the file;
+    when both sides have a value and they disagree, the file value is kept and
+    a warning is logged. A per-file specific row (matched by filename or
+    suffix-fallback) takes precedence over the client CSV's DEFAULT row.
+    After the merge a summary of which columns were added is logged.
     """
     file_col = client_df.columns[0]
     image_basenames = [name for name, _ in file_metadata]
+    total_files = len(file_metadata)
 
     suffix_index = _build_suffix_match_index(client_df, file_col, image_basenames)
 
@@ -302,21 +310,89 @@ def merge_client_metadata(
     suffix_hits = 0
     no_match = 0
 
+    additions: dict[str, dict[str, int]] = defaultdict(
+        lambda: {"specific": 0, "default": 0}
+    )
+
     for basename, meta in file_metadata:
-        matched, _default = find_sidecar_row(client_df, basename)
+        matched, default_row = find_sidecar_row(client_df, basename)
+        used_suffix = False
         if matched is None:
             matched = suffix_index.get(basename)
-            if matched is None:
-                no_match += 1
-                continue
-            suffix_hits += 1
-        else:
-            primary_hits += 1
+            if matched is not None:
+                used_suffix = True
 
-        meta.update(_client_meta_from_row(matched, file_col))
+        if matched is None and default_row is None:
+            no_match += 1
+            continue
+
+        if matched is not None:
+            if used_suffix:
+                suffix_hits += 1
+            else:
+                primary_hits += 1
+
+        specific_meta = (
+            _client_meta_from_row(matched, file_col) if matched is not None else {}
+        )
+        default_meta = (
+            _client_meta_from_row(default_row, file_col)
+            if default_row is not None
+            else {}
+        )
+
+        for key in set(specific_meta) | set(default_meta):
+            if key in specific_meta:
+                client_val = specific_meta[key]
+                source = "specific"
+            else:
+                client_val = default_meta[key]
+                source = "default"
+
+            file_val = meta.get(key)
+            file_str = str(file_val).strip() if file_val is not None else ""
+            if not file_str:
+                meta[key] = client_val
+                additions[key][source] += 1
+            elif file_str != client_val:
+                logger.warning(
+                    f"Client sidecar disagrees with file metadata for "
+                    f"{basename!r} field {key!r}: file={file_str!r}, "
+                    f"client={client_val!r} ({source}); keeping file value."
+                )
 
     logger.info(
         f"Client sidecar merge: {primary_hits} primary match(es), "
         f"{suffix_hits} suffix-fallback match(es), {no_match} unmatched."
     )
+    _log_addition_summary(additions, total_files)
     return file_metadata
+
+
+def _log_addition_summary(
+    additions: Mapping[str, Mapping[str, int]],
+    total_files: int,
+) -> None:
+    """Log a per-column summary of metadata added by the client merge."""
+    if not additions:
+        logger.info("No metadata columns added from client sidecar.")
+        return
+
+    lines = [f"Added {len(additions)} columns of metadata:"]
+    for key in sorted(additions):
+        counts = additions[key]
+        default_n = counts.get("default", 0)
+        specific_n = counts.get("specific", 0)
+        parts: list[str] = []
+        if default_n:
+            if default_n == total_files:
+                parts.append("Default value added to all files")
+            else:
+                parts.append(f"Default value on {default_n}/{total_files} files")
+        if specific_n:
+            if specific_n == total_files:
+                parts.append("File-specific value added to all files")
+            else:
+                parts.append(f"File-specific value on {specific_n}/{total_files} files")
+        lines.append(f"[{key}] {', '.join(parts)}")
+    logger.info("\n\t".join(lines))

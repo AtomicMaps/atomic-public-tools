@@ -16,6 +16,7 @@ from atomic_tools.client_sidecar import (
 from atomic_tools.commands.sidecar import (
     _REQUIRED_SIDECAR_FIELD_GROUPS,
     _split_gps_position,
+    _warn_missing_required_fields,
     build_sidecar_df,
 )
 from atomic_tools.utils.utils import DataTypeEnum
@@ -155,9 +156,9 @@ def test_headerless_sidecar_with_schema_matches_headered():
         (HEADERLESS_SIDECAR, EXAMPLE_SCHEMA),
     ],
 )
-def test_merge_client_overrides_gps_altitude(client_csv, schema):
+def test_merge_file_metadata_wins_on_disagreement(client_csv, schema, caplog):
     """For 1.jpg the example sidecars set GPSAltitude=1000, EXIF=1100.
-    Client should win.
+    File (EXIF) value wins; a warning is logged about the disagreement.
     """
     file_metadata = _exif_like_metadata()
     client_df = load_and_clean_client_sidecar(
@@ -165,9 +166,14 @@ def test_merge_client_overrides_gps_altitude(client_csv, schema):
         schema_path=schema,
         required_field_groups=_REQUIRED_SIDECAR_FIELD_GROUPS,
     )
-    merge_client_metadata(file_metadata, client_df)
+    with caplog.at_level("WARNING", logger="atomic_tools.client_sidecar"):
+        merge_client_metadata(file_metadata, client_df)
     by_name = dict(file_metadata)
-    assert by_name["1.jpg"]["GPSAltitude"] == "1000 m Above Sea Level"
+    assert by_name["1.jpg"]["GPSAltitude"] == "1100 m Above Sea Level"
+    assert any(
+        "GPSAltitude" in rec.message and "1.jpg" in rec.message
+        for rec in caplog.records
+    )
 
 
 def test_merge_client_empty_cell_preserves_exif():
@@ -180,6 +186,71 @@ def test_merge_client_empty_cell_preserves_exif():
     )
     merge_client_metadata(file_metadata, client_df)
     assert dict(file_metadata)["1.jpg"]["CreateDate"] == "2024:06:15 10:30:00"
+
+
+def test_merge_default_row_fills_missing_and_summary_logged(caplog):
+    """A DEFAULT row in the client CSV fills fields the file is missing, and
+    the per-column summary lists what was added."""
+    file_metadata = [
+        ("1.jpg", {}),  # nothing — should pick up specific row + DEFAULT date
+        ("2.jpeg", {"DateTimeOriginal": "2024:06:15 10:31:00"}),  # already set
+        ("3.jpg", {}),
+    ]
+    client_df = load_and_clean_client_sidecar(
+        url=str(INPUT_SIDECAR),
+        schema_path=None,
+        required_field_groups=_REQUIRED_SIDECAR_FIELD_GROUPS,
+    )
+    with caplog.at_level("INFO", logger="atomic_tools.client_sidecar"):
+        merge_client_metadata(file_metadata, client_df)
+
+    by_name = dict(file_metadata)
+    # 1.jpg's specific row has an empty date cell, so DEFAULT row fills it.
+    # CreateDate gets canonicalized to DateTimeOriginal by the alias map.
+    assert by_name["1.jpg"]["DateTimeOriginal"] == "2024:07:15 10:30:00"
+    # 1.jpg picks up its specific GPSAltitude.
+    assert by_name["1.jpg"]["GPSAltitude"] == "1000 m Above Sea Level"
+
+    summary = next(
+        (rec.message for rec in caplog.records if rec.message.startswith("Added ")),
+        "",
+    )
+    assert "columns of metadata" in summary
+    assert "[DateTimeOriginal]" in summary
+    assert "Default value on 1/3 files" in summary
+    assert "[GPSAltitude]" in summary
+    assert "File-specific value added to all files" in summary
+
+
+def test_warn_missing_required_fields(caplog, capsys):
+    """Files lacking any field from a required group should trigger a single
+    summary warning log AND a detailed bright-red message on stderr."""
+    file_metadata = [
+        ("1.jpg", {"GPSLatitude": "51", "GPSLongitude": "-114"}),
+        ("2.jpg", {"GPSLatitude": "51"}),  # missing GPSLongitude
+    ]
+    groups = [["GPSLatitude"], ["GPSLongitude"]]
+    with caplog.at_level("WARNING", logger="atomic_tools.commands.sidecar"):
+        _warn_missing_required_fields(file_metadata, groups)
+    err = capsys.readouterr().err
+    assert "MISSING REQUIRED METADATA" in err
+    assert "\x1b[" in err  # ANSI escape: bright red
+    assert "GPSLongitude" in err
+    assert "2.jpg" in err
+    warning_records = [
+        rec for rec in caplog.records if rec.name == "atomic_tools.commands.sidecar"
+    ]
+    assert len(warning_records) == 1
+    assert "client sidecar merge" in warning_records[0].message.lower()
+
+
+def test_warn_missing_required_fields_silent_when_all_satisfied(caplog, capsys):
+    file_metadata = [("1.jpg", {"GPSLatitude": "51", "GPSLongitude": "-114"})]
+    groups = [["GPSLatitude"], ["GPSLongitude"]]
+    with caplog.at_level("WARNING", logger="atomic_tools.commands.sidecar"):
+        _warn_missing_required_fields(file_metadata, groups)
+    assert capsys.readouterr().err == ""
+    assert not any("MISSING REQUIRED" in rec.message for rec in caplog.records)
 
 
 def test_split_gps_position_string():
