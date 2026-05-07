@@ -267,7 +267,9 @@ def _warn_missing_required_fields(
         return
 
     total = len(file_metadata)
-    logger.warning("Missing required metadata after client sidecar merge — see details below.")
+    logger.warning(
+        "Missing required metadata after client sidecar merge — see details below."
+    )
 
     header = (
         f"MISSING REQUIRED METADATA: {len(missing_by_group)} required field(s) "
@@ -291,7 +293,9 @@ def _canonicalize_keys(meta: dict, alias_to_canonical: dict[str, str]) -> dict:
     is already present, the alias is dropped; among multiple aliases for the
     same canonical, the first-encountered one wins.
     """
-    out: dict = {key: value for key, value in meta.items() if key not in alias_to_canonical}
+    out: dict = {
+        key: value for key, value in meta.items() if key not in alias_to_canonical
+    }
     for key, value in meta.items():
         if key in alias_to_canonical:
             out.setdefault(alias_to_canonical[key], value)
@@ -343,7 +347,9 @@ def build_sidecar_df(
     if required_field_groups:
         for group in required_field_groups:
             canonical = group[0]
-            all_covered = all(any(field in meta for field in group) for _, meta in file_metadata)
+            all_covered = all(
+                any(field in meta for field in group) for _, meta in file_metadata
+            )
             if not all_covered and canonical not in prepend_cols:
                 prepend_cols.append(canonical)
 
@@ -357,7 +363,9 @@ def build_sidecar_df(
     df = pd.DataFrame(rows, columns=columns)
     df = df.sort_values(by="Filename", kind="stable", ignore_index=True)
 
-    default_row = pd.DataFrame([{"Filename": "DEFAULT", **{col: "" for col in all_cols}}])
+    default_row = pd.DataFrame(
+        [{"Filename": "DEFAULT", **{col: "" for col in all_cols}}]
+    )
     return pd.concat([default_row, df], ignore_index=True)
 
 
@@ -393,7 +401,9 @@ def _generate(
 
     keys = backend.list_keys(include=include, exclude=exclude)
     if not keys:
-        raise RuntimeError(f"No valid files found for '{data_type}' in {backend.display_root}")
+        raise RuntimeError(
+            f"No valid files found for '{data_type}' in {backend.display_root}"
+        )
 
     total = len(keys)
     logger.info(f"Found {total} file(s) to process in {backend.display_root}.")
@@ -500,7 +510,7 @@ def _run_interactive_wizard(
             output_filename = _ask_output_filename()
         if client_sidecar is None:
             client_sidecar = _ask_client_sidecar()
-        if client_schema is None:
+        if client_schema is None and client_sidecar is not None:
             client_schema = _ask_client_schema()
         if not full_provided:
             full = _ask_full()
@@ -582,7 +592,9 @@ def generate(
     )
 
     if directory is None or data_type is None:
-        full_provided = ctx.get_parameter_source("full") == click.core.ParameterSource.COMMANDLINE
+        full_provided = (
+            ctx.get_parameter_source("full") == click.core.ParameterSource.COMMANDLINE
+        )
         directory, data_type, output_filename, client_sidecar, client_schema, full = (
             _run_interactive_wizard(
                 directory,
