@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Sidecar pointer file written at the end of `atomic-tools sidecar` runs
+sidecar_csv_path

@@ -170,10 +170,7 @@ def test_merge_file_metadata_wins_on_disagreement(client_csv, schema, caplog):
         merge_client_metadata(file_metadata, client_df)
     by_name = dict(file_metadata)
     assert by_name["1.jpg"]["GPSAltitude"] == "1100 m Above Sea Level"
-    assert any(
-        "GPSAltitude" in rec.message and "1.jpg" in rec.message
-        for rec in caplog.records
-    )
+    assert any("GPSAltitude" in rec.message and "1.jpg" in rec.message for rec in caplog.records)
 
 
 def test_merge_client_empty_cell_preserves_exif():
@@ -237,9 +234,7 @@ def test_warn_missing_required_fields(caplog, capsys):
     assert "\x1b[" in err  # ANSI escape: bright red
     assert "GPSLongitude" in err
     assert "2.jpg" in err
-    warning_records = [
-        rec for rec in caplog.records if rec.name == "atomic_tools.commands.sidecar"
-    ]
+    warning_records = [rec for rec in caplog.records if rec.name == "atomic_tools.commands.sidecar"]
     assert len(warning_records) == 1
     assert "client sidecar merge" in warning_records[0].message.lower()
 

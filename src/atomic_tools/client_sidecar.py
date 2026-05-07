@@ -145,9 +145,7 @@ def _apply_global_aliases(df: pd.DataFrame, alias_map: dict[str, str]) -> pd.Dat
     return df
 
 
-def _safe_rename(
-    df: pd.DataFrame, renames: dict[str, str], *, context: str
-) -> pd.DataFrame:
+def _safe_rename(df: pd.DataFrame, renames: dict[str, str], *, context: str) -> pd.DataFrame:
     """Apply a rename, raising if two source columns collide on the same target."""
     target_to_sources: dict[str, list[str]] = defaultdict(list)
     for src, dst in renames.items():
@@ -310,9 +308,7 @@ def merge_client_metadata(
     suffix_hits = 0
     no_match = 0
 
-    additions: dict[str, dict[str, int]] = defaultdict(
-        lambda: {"specific": 0, "default": 0}
-    )
+    additions: dict[str, dict[str, int]] = defaultdict(lambda: {"specific": 0, "default": 0})
 
     for basename, meta in file_metadata:
         matched, default_row = find_sidecar_row(client_df, basename)
@@ -332,13 +328,9 @@ def merge_client_metadata(
             else:
                 primary_hits += 1
 
-        specific_meta = (
-            _client_meta_from_row(matched, file_col) if matched is not None else {}
-        )
+        specific_meta = _client_meta_from_row(matched, file_col) if matched is not None else {}
         default_meta = (
-            _client_meta_from_row(default_row, file_col)
-            if default_row is not None
-            else {}
+            _client_meta_from_row(default_row, file_col) if default_row is not None else {}
         )
 
         for key in set(specific_meta) | set(default_meta):

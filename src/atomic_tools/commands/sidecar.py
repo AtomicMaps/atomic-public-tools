@@ -267,9 +267,7 @@ def _warn_missing_required_fields(
         return
 
     total = len(file_metadata)
-    logger.warning(
-        "Missing required metadata after client sidecar merge — see details below."
-    )
+    logger.warning("Missing required metadata after client sidecar merge — see details below.")
 
     header = (
         f"MISSING REQUIRED METADATA: {len(missing_by_group)} required field(s) "
