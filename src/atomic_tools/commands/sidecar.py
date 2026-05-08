@@ -33,6 +33,9 @@ from atomic_tools.utils.utils import (
     DATA_TYPE_INFO,
     DataTypeEnum,
 )
+from atomic_tools.validators.required_fields import (
+    REQUIRED_SIDECAR_FIELD_GROUPS as _REQUIRED_SIDECAR_FIELD_GROUPS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,82 +55,6 @@ _POINT_CLOUD_DATA_TYPES = {DataTypeEnum.point_cloud}
 # Directory where the sidecar-path pointer file is written. None falls back to
 # the current working directory. Holder for a future CLI option.
 SIDECAR_PATH_OUTPUT_DIR: Path | None = None
-
-# Each inner list: [canonical_name, *alternatives].
-# A file "satisfies" a group if it has any field from the group in its metadata.
-# If any file fails to satisfy a group, the canonical field is prepended as a
-# blank column.
-_REQUIRED_SIDECAR_FIELD_GROUPS: dict[str, list[list[str]]] = {
-    DataTypeEnum.oriented_image: [
-        ["GPSLatitude"],
-        ["GPSLongitude"],
-        ["GPSAltitude"],
-        ["CreateDate", "DateTimeOriginal", "ModifyDate", "GPSDateStamp"],
-        [
-            "Pitch",
-            "CameraPitch",
-            "CameraPitchDegree",
-            "GimbalPitchDegree",
-            "PosePitchDegrees",
-            "CameraOrientationNEDPitch",
-            "GPSIMUPitch",
-            "PitchAngle",
-        ],
-        [
-            "Heading",
-            "Yaw",
-            "CameraYaw",
-            "CameraYawDegree",
-            "GimbalYawDegree",
-            "PoseHeadingDegrees",
-            "CameraOrientationNEDYaw",
-            "GPSIMUYaw",
-            "YawAngle",
-            "GPSImgDirection",
-            "imgDirection",
-        ],
-        [
-            "Roll",
-            "CameraRoll",
-            "CameraRollDegree",
-            "GimbalRollDegree",
-            "PoseRollDegrees",
-            "CameraOrientationNEDRoll",
-            "GPSIMURoll",
-            "RollAngle",
-        ],
-    ],
-    DataTypeEnum.spherical_image: [
-        ["GPSLatitude"],
-        ["GPSLongitude"],
-        ["GPSAltitude"],
-        ["CreateDate", "DateTimeOriginal", "ModifyDate", "GPSDateStamp"],
-        ["Pitch", "CameraPitch", "GimbalPitchDegree", "PosePitchDegrees"],
-        ["Heading", "Yaw", "GimbalYawDegree", "PoseHeadingDegrees", "GPSImgDirection"],
-        ["Roll", "CameraRoll", "GimbalRollDegree", "PoseRollDegrees"],
-    ],
-    DataTypeEnum.ortho_image: [
-        ["GPSLatitude"],
-        ["GPSLongitude"],
-        ["GPSAltitude"],
-        ["DateTimeOriginal", "CreateDate", "ModifyDate", "GPSDateStamp"],
-    ],
-    DataTypeEnum.video: [
-        ["CreateDate", "DateTimeOriginal", "ModifyDate", "GPSDateStamp"],
-    ],
-    DataTypeEnum.point_cloud: [
-        ["bounds.minx"],
-        ["bounds.miny"],
-        ["bounds.maxx"],
-        ["bounds.maxy"],
-        ["bounds.minz"],
-        ["bounds.maxz"],
-        ["num_points"],
-        ["creation_year"],
-        ["creation_doy"],
-    ],
-}
-
 
 def _list_local_schemas() -> list[Path]:
     """Return sorted ``*.json`` files from ``./schemas/`` if that dir exists."""

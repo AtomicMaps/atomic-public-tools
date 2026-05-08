@@ -3,6 +3,7 @@ from typing import Annotated
 import typer
 
 from atomic_tools import __version__
+from atomic_tools.commands.lint import lint_app
 from atomic_tools.commands.sidecar import sidecar_app
 
 app = typer.Typer(
@@ -13,6 +14,7 @@ app = typer.Typer(
 )
 
 app.add_typer(sidecar_app, name="sidecar", help="Generate a sidecar CSV from S3.")
+app.add_typer(lint_app, name="lint", help="Validate schema/sidecar files before submission.")
 
 
 def _version_callback(value: bool) -> None:
