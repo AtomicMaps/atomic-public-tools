@@ -1,8 +1,0 @@
-Filename,GPSLatitude,GPSLongitude,GPSAltitude,CreateDate,Pitch,Heading,Roll
-DEFAULT,,,,,,,
-1.jpg,"51 deg 2' 40.92"" N","114 deg 4' 18.84"" W",1100 m Above Sea Level,2024:06:15 10:30:00,-90.0,0.0,0.0
-2.jpeg,"51 deg 3' 0.00"" N","114 deg 4' 30.00"" W",1200 m Above Sea Level,2024:06:15 10:31:00,-85.0,45.0,1.5
-3.jpg,"51 deg 2' 52.80"" N","114 deg 4' 12.00"" W",1150 m Above Sea Level,2024:06:15 10:32:00,-88.0,90.0,-0.5
-Missing_1.jpg,"51 deg 2' 40.92"" N","114 deg 4' 18.84"" W",,,,0.0,0.0
-Missing_2.jpeg,"51 deg 3' 0.00"" N",,1200 m Above Sea Level,,-85.0,,
-Missing_3.jpg,,"114 deg 4' 12.00"" W",,2024:06:15 10:32:00,,90.0,-0.5
