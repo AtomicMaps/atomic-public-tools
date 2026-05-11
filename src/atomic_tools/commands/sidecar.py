@@ -11,6 +11,7 @@ Requires the following external binaries on PATH at runtime (NOT pip-installable
 """
 
 import logging
+import shlex
 import tempfile
 from collections import defaultdict
 from pathlib import Path
@@ -450,6 +451,38 @@ def _generate(
     return sidecar_path
 
 
+def _format_replay_command(
+    directory: str,
+    data_type: DataTypeEnum,
+    output_filename: str,
+    client_sidecar: str | None,
+    client_schema: Path | None,
+    full: bool,
+) -> str:
+    parts = [
+        "am-tools", "sidecar", "generate",
+        "--directory", shlex.quote(directory),
+        "--data-type", data_type.value,
+        "--output-filename", shlex.quote(output_filename),
+    ]
+    if client_sidecar:
+        parts += ["--client-sidecar", shlex.quote(client_sidecar)]
+    if client_schema is not None:
+        parts += ["--client-schema", shlex.quote(str(client_schema))]
+    if full:
+        parts.append("--full")
+    return " ".join(parts)
+
+
+def _echo_replay_command(command: str) -> None:
+    click.secho(
+        "\nEquivalent command (copy & paste to skip the wizard next time):",
+        fg="cyan",
+        err=True,
+    )
+    click.secho(f"  {command}\n", fg="bright_cyan", bold=True, err=True)
+
+
 def _run_interactive_wizard(
     directory: str | None,
     data_type: DataTypeEnum | None,
@@ -556,7 +589,8 @@ def generate(
         level=logging.INFO,
     )
 
-    if directory is None or data_type is None:
+    wizard_ran = directory is None or data_type is None
+    if wizard_ran:
         full_provided = (
             ctx.get_parameter_source("full") == click.core.ParameterSource.COMMANDLINE
         )
@@ -578,6 +612,18 @@ def generate(
         raise typer.BadParameter("Directory is required.")
     if data_type is None:
         raise typer.BadParameter("Data type is required.")
+
+    if wizard_ran:
+        _echo_replay_command(
+            _format_replay_command(
+                directory=directory,
+                data_type=data_type,
+                output_filename=output_filename,
+                client_sidecar=client_sidecar,
+                client_schema=client_schema,
+                full=full,
+            )
+        )
 
     try:
         _generate(

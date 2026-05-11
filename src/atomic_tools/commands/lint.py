@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import shlex
 from pathlib import Path
 from typing import Annotated
 
@@ -56,6 +57,43 @@ def _ask_input_files() -> str | None:
     return answer or None
 
 
+def _echo_replay_command(command: str) -> None:
+    click.secho(
+        "\nEquivalent command (copy & paste to skip the wizard next time):",
+        fg="cyan",
+        err=True,
+    )
+    click.secho(f"  {command}\n", fg="bright_cyan", bold=True, err=True)
+
+
+def _format_schema_replay_command(path: Path) -> str:
+    return " ".join(["am-tools", "lint", "schema", shlex.quote(str(path))])
+
+
+def _format_sidecar_replay_command(
+    path: str,
+    final: bool,
+    datatype: DataTypeEnum,
+    schema: Path | None,
+    input_files: str | None,
+) -> str:
+    parts = [
+        "am-tools",
+        "lint",
+        "sidecar",
+        shlex.quote(path),
+        "--datatype",
+        datatype.value,
+    ]
+    if final:
+        parts.append("--final")
+    if schema is not None:
+        parts += ["--schema", shlex.quote(str(schema))]
+    if input_files:
+        parts += ["--input-files", shlex.quote(input_files)]
+    return " ".join(parts)
+
+
 @lint_app.command("schema")
 def lint_schema_cmd(
     path: Annotated[
@@ -69,11 +107,15 @@ def lint_schema_cmd(
         level=logging.WARNING,
     )
 
+    wizard_ran = path is None
     if path is None:
         try:
             path = _ask_schema_path()
         except KeyboardInterrupt:
             raise typer.Exit(code=130) from None
+
+    if wizard_ran:
+        _echo_replay_command(_format_schema_replay_command(path))
 
     report = lint_schema_file(path)
     typer.echo(report.render())
@@ -138,6 +180,7 @@ def lint_sidecar_cmd(
         level=logging.WARNING,
     )
 
+    # check to see if they provided the fields
     final_provided = (
         ctx.get_parameter_source("final") == click.core.ParameterSource.COMMANDLINE
     )
@@ -145,10 +188,13 @@ def lint_sidecar_cmd(
         ctx.get_parameter_source("schema") == click.core.ParameterSource.COMMANDLINE
     )
     input_files_provided = (
-        ctx.get_parameter_source("input_files") == click.core.ParameterSource.COMMANDLINE
+        ctx.get_parameter_source("input_files")
+        == click.core.ParameterSource.COMMANDLINE
     )
 
-    if path is None or datatype is None:
+    # If the user didn't provide required info via arguments, ask interactively
+    wizard_ran = path is None or datatype is None
+    if wizard_ran:
         try:
             if path is None:
                 path = _ask_sidecar_path()
@@ -167,6 +213,17 @@ def lint_sidecar_cmd(
         raise typer.BadParameter("Sidecar path is required.")
     if datatype is None:
         raise typer.BadParameter("--datatype is required.")
+
+    if wizard_ran:
+        _echo_replay_command(
+            _format_sidecar_replay_command(
+                path=path,
+                final=final,
+                datatype=datatype,
+                schema=schema,
+                input_files=input_files,
+            )
+        )
 
     report = lint_sidecar_file(
         path,

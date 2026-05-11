@@ -50,14 +50,12 @@ DATA_TYPE_INFO: dict = {
         "include": [".tif", ".tiff"],
         "exclude": ["_rgb.tif"],
         "sidecars": [".ecw"],
-        "sub_types": ["rgb", "ir"],
         "footprint_feature_class": "footprints_ortho_image",
     },
     "spherical_image": {
         "include": [".jpg", ".jp2", "jpeg", ".png"],
         "exclude": ["PreviewImage.jpg", "ThumbnailImage.jpg", "annotation.json"],
         "sidecars": [],
-        "sub_types": ["rgb"],
         "footprint_feature_class": "footprints_spherical_image",
     },
     "oriented_image": {
@@ -77,14 +75,12 @@ DATA_TYPE_INFO: dict = {
         "include": [".las", ".laz", "zlas"],
         "exclude": [".copc.las", ".copc.laz"],
         "sidecars": [],
-        "sub_types": ["lidar", "photogrammetry", "terrestrial_lidar", "aerial_lidar"],
         "footprint_feature_class": "footprints_point_cloud",
     },
     "full_motion_video": {
         "include": [".mp4", ".mov", ".ts", ".avi", ".tts"],
         "exclude": [],
         "sidecars": [".gpx", ".kmz", ".srt"],
-        "sub_types": ["rgb", "ir"],
         "footprint_feature_class": "footprints_video",
     },
     "vector": {
@@ -114,7 +110,6 @@ class DataTypeEnum(str, Enum):
     spherical_image = "spherical_image"
     point_cloud = "point_cloud"
     video = "full_motion_video"
-    cad = "cad"
     vector = "vector"
 
 
@@ -183,9 +178,7 @@ def _build_sidecar_index(df: "pd.DataFrame") -> dict[str, Any]:
     candidates = df[stripped != "DEFAULT"]
     candidate_paths = candidates[file_col].str.strip()
     candidate_components = candidate_paths.apply(_split_path_components)
-    candidate_last_components = candidate_components.apply(
-        lambda p: p[-1] if p else ""
-    )
+    candidate_last_components = candidate_components.apply(lambda p: p[-1] if p else "")
     candidate_stems = candidate_last_components.str.rsplit(".", n=1).str[0]
     default_mask = stripped == "DEFAULT"
     default_row = df[default_mask].iloc[0] if default_mask.any() else None
@@ -265,8 +258,8 @@ def _is_path_tail_suffix(a: tuple[str, ...], b: tuple[str, ...]) -> bool:
     if not a or not b:
         return False
     if len(a) <= len(b):
-        return b[-len(a):] == a
-    return a[-len(b):] == b
+        return b[-len(a) :] == a
+    return a[-len(b) :] == b
 
 
 def _path_suffix_match_vectorized(
@@ -420,7 +413,9 @@ def get_keys_and_metadata(store: ObstoreBackend, prefix: str) -> dict:
     ) as e:
         raise RuntimeError(f"Failed to list keys with prefix {prefix}: {e}") from e
     except Exception as e:
-        raise RuntimeError(f"Unexpected error during listing keys with prefix {prefix}: {e}") from e
+        raise RuntimeError(
+            f"Unexpected error during listing keys with prefix {prefix}: {e}"
+        ) from e
 
 
 def filter_keys(
@@ -497,7 +492,9 @@ def get_object_keys(
     return filter_keys(key_sizes, include, exclude)
 
 
-def download(store: ObstoreBackend, key: str, destination_dir: str, buffer_size: int = 5) -> str:
+def download(
+    store: ObstoreBackend, key: str, destination_dir: str, buffer_size: int = 5
+) -> str:
     """Download an object from the store to `destination_dir` in chunks.
 
     Performs a free-space precheck (file_size + buffer_size GB) and a chunked,
@@ -528,7 +525,9 @@ def download(store: ObstoreBackend, key: str, destination_dir: str, buffer_size:
             )
 
         destination_path = storage_path / Path(key).name
-        logger.debug(f"Downloading {key} ({file_size / BYTES_TO_GB:.2f} GB) to {destination_path}")
+        logger.debug(
+            f"Downloading {key} ({file_size / BYTES_TO_GB:.2f} GB) to {destination_path}"
+        )
 
         current_gb = 0
         with open(destination_path, "wb") as local_file:
@@ -536,7 +535,9 @@ def download(store: ObstoreBackend, key: str, destination_dir: str, buffer_size:
                 end = min(start + CHUNK_SIZE, file_size)
 
                 if start >= end:
-                    logger.error(f"Invalid byte range detected: start={start}, end={end} for {key}")
+                    logger.error(
+                        f"Invalid byte range detected: start={start}, end={end} for {key}"
+                    )
                     raise ValueError(f"Invalid byte range: start={start}, end={end}")
 
                 for attempt in range(MAX_RETRIES):
@@ -623,4 +624,6 @@ def upload(
     ) as e:
         raise RuntimeError(f"Failed to upload {source} to {key}: {e}") from e
     except Exception as e:
-        raise RuntimeError(f"Unexpected error during upload {source} to {key}: {e}") from e
+        raise RuntimeError(
+            f"Unexpected error during upload {source} to {key}: {e}"
+        ) from e
