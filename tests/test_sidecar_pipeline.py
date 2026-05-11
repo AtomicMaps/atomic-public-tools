@@ -15,6 +15,7 @@ from atomic_tools.client_sidecar import (
 )
 from atomic_tools.commands.sidecar import (
     _REQUIRED_SIDECAR_FIELD_GROUPS,
+    _disambiguate_filenames,
     _split_gps_position,
     _warn_missing_required_fields,
     build_sidecar_df,
@@ -285,3 +286,150 @@ def test_split_gps_position_overwrites_existing():
 )
 def test_split_gps_position_unchanged_on_bad_input(meta):
     assert _split_gps_position(meta) == meta
+
+
+# ---- disambiguation -----------------------------------------------------
+
+
+def test_disambiguate_unique_basenames_keep_basename():
+    keys = ["a/1.jpg", "b/2.jpg", "c/3.jpg"]
+    assert _disambiguate_filenames(keys) == {
+        "a/1.jpg": "1.jpg",
+        "b/2.jpg": "2.jpg",
+        "c/3.jpg": "3.jpg",
+    }
+
+
+def test_disambiguate_colliding_basenames_add_one_parent():
+    keys = ["a/1.jpg", "b/1.jpg"]
+    assert _disambiguate_filenames(keys) == {
+        "a/1.jpg": "a/1.jpg",
+        "b/1.jpg": "b/1.jpg",
+    }
+
+
+def test_disambiguate_walks_up_until_parents_diverge():
+    """Both files share the immediate parent ``x``, so the algorithm walks up
+    one more level to ``a`` / ``b`` to make the labels unique."""
+    keys = ["a/x/1.jpg", "b/x/1.jpg"]
+    assert _disambiguate_filenames(keys) == {
+        "a/x/1.jpg": "a/x/1.jpg",
+        "b/x/1.jpg": "b/x/1.jpg",
+    }
+
+
+def test_disambiguate_mixed_depth_collision():
+    """Three files with the same basename get a single round of extension —
+    enough to make all three labels unique."""
+    keys = ["a/x/1.jpg", "a/y/1.jpg", "b/x/1.jpg"]
+    out = _disambiguate_filenames(keys)
+    assert len(set(out.values())) == 3
+    assert out["a/y/1.jpg"] == "y/1.jpg"  # uniquely identified at depth 1
+    assert out["a/x/1.jpg"] == "a/x/1.jpg"
+    assert out["b/x/1.jpg"] == "b/x/1.jpg"
+
+
+def test_disambiguate_only_some_basenames_collide():
+    """Only ``1.jpg`` collides; ``2.jpg`` keeps its bare basename."""
+    keys = ["a/1.jpg", "b/1.jpg", "c/2.jpg"]
+    assert _disambiguate_filenames(keys) == {
+        "a/1.jpg": "a/1.jpg",
+        "b/1.jpg": "b/1.jpg",
+        "c/2.jpg": "2.jpg",
+    }
+
+
+def test_disambiguate_root_file_vs_nested():
+    """A bare ``1.jpg`` at the scan root vs ``a/1.jpg`` deeper. The root file
+    has no parent to add — its label stays as the basename, and the nested
+    one gets prefixed."""
+    keys = ["1.jpg", "a/1.jpg"]
+    out = _disambiguate_filenames(keys)
+    assert out == {"1.jpg": "1.jpg", "a/1.jpg": "a/1.jpg"}
+
+
+# ---- merge with disambiguated labels ------------------------------------
+
+
+def test_merge_uses_path_suffix_match_for_disambiguated_labels(tmp_path):
+    """Files have disambiguated labels (``a/1.jpg``, ``b/1.jpg``); a client
+    sidecar whose Filename column gives just ``a/1.jpg`` and ``b/1.jpg``
+    must route to the right file."""
+    csv = tmp_path / "client.csv"
+    csv.write_text(
+        "Filename,GPSAltitude\n"
+        "DEFAULT,500\n"
+        "a/1.jpg,1100\n"
+        "b/1.jpg,1200\n",
+        encoding="utf-8",
+    )
+    file_metadata = [("a/1.jpg", {}), ("b/1.jpg", {})]
+    client_df = load_and_clean_client_sidecar(
+        url=str(csv),
+        schema_path=None,
+        required_field_groups=_REQUIRED_SIDECAR_FIELD_GROUPS,
+    )
+    merge_client_metadata(file_metadata, client_df)
+    by_label = dict(file_metadata)
+    assert by_label["a/1.jpg"]["GPSAltitude"] == "1100"
+    assert by_label["b/1.jpg"]["GPSAltitude"] == "1200"
+
+
+def test_merge_basename_only_client_row_warns_on_ambiguity(tmp_path, caplog):
+    """If the client provides a single row with a basename-only Filename, but
+    multiple disambiguated files share that basename, the row matches both —
+    log a clear warning."""
+    csv = tmp_path / "client.csv"
+    csv.write_text(
+        "Filename,GPSAltitude\n"
+        "1.jpg,9999\n",
+        encoding="utf-8",
+    )
+    file_metadata = [("a/1.jpg", {}), ("b/1.jpg", {})]
+    client_df = load_and_clean_client_sidecar(
+        url=str(csv),
+        schema_path=None,
+        required_field_groups=_REQUIRED_SIDECAR_FIELD_GROUPS,
+    )
+    with caplog.at_level("WARNING", logger="atomic_tools.client_sidecar"):
+        merge_client_metadata(file_metadata, client_df)
+    assert any("ambiguous" in rec.message.lower() for rec in caplog.records)
+
+
+def test_merge_exact_label_wins_over_basename_match(tmp_path):
+    """When client has both ``a/1.jpg`` and a generic ``1.jpg`` row, the file
+    ``a/1.jpg`` must pick the exact-match row, not the basename row."""
+    csv = tmp_path / "client.csv"
+    csv.write_text(
+        "Filename,GPSAltitude\n"
+        "1.jpg,500\n"
+        "a/1.jpg,1100\n",
+        encoding="utf-8",
+    )
+    file_metadata = [("a/1.jpg", {})]
+    client_df = load_and_clean_client_sidecar(
+        url=str(csv),
+        schema_path=None,
+        required_field_groups=_REQUIRED_SIDECAR_FIELD_GROUPS,
+    )
+    merge_client_metadata(file_metadata, client_df)
+    assert dict(file_metadata)["a/1.jpg"]["GPSAltitude"] == "1100"
+
+
+def test_merge_does_not_match_unrelated_paths(tmp_path):
+    """File ``a/1.jpg`` should not pick up a client ``b/1.jpg`` row — the
+    parent components don't match, so it's a different file."""
+    csv = tmp_path / "client.csv"
+    csv.write_text(
+        "Filename,GPSAltitude\n"
+        "b/1.jpg,1200\n",
+        encoding="utf-8",
+    )
+    file_metadata = [("a/1.jpg", {})]
+    client_df = load_and_clean_client_sidecar(
+        url=str(csv),
+        schema_path=None,
+        required_field_groups=_REQUIRED_SIDECAR_FIELD_GROUPS,
+    )
+    merge_client_metadata(file_metadata, client_df)
+    assert "GPSAltitude" not in dict(file_metadata)["a/1.jpg"]

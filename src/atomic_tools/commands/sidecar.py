@@ -12,6 +12,7 @@ Requires the following external binaries on PATH at runtime (NOT pip-installable
 
 import logging
 import tempfile
+from collections import defaultdict
 from pathlib import Path
 from typing import Annotated
 
@@ -32,6 +33,7 @@ from atomic_tools.utils.extractors import (
 from atomic_tools.utils.utils import (
     DATA_TYPE_INFO,
     DataTypeEnum,
+    _split_path_components,
 )
 from atomic_tools.validators.required_fields import (
     REQUIRED_SIDECAR_FIELD_GROUPS as _REQUIRED_SIDECAR_FIELD_GROUPS,
@@ -130,6 +132,34 @@ def _ask_client_schema() -> Path | None:
         ).unsafe_ask()
         return Path(custom).expanduser().resolve()
     return next(p for p in schemas if p.name == selection)
+
+
+def _disambiguate_filenames(keys: list[str]) -> dict[str, str]:
+    """Return a per-key display label, extended with the minimum number of
+    parent directories needed to be unique across ``keys``.
+    """
+    parts_per_key: dict[str, tuple[str, ...]] = {
+        key: _split_path_components(key) for key in keys
+    }
+    depths: dict[str, int] = {key: 1 for key in keys}
+
+    while True:
+        labels = {
+            key: "/".join(parts[-depths[key]:]) for key, parts in parts_per_key.items()
+        }
+        counts: dict[str, int] = defaultdict(int)
+        for label in labels.values():
+            counts[label] += 1
+        collisions = {label for label, n in counts.items() if n > 1}
+        if not collisions:
+            return labels
+        bumped = False
+        for key, label in labels.items():
+            if label in collisions and depths[key] < len(parts_per_key[key]):
+                depths[key] += 1
+                bumped = True
+        if not bumped:
+            return labels
 
 
 def _split_gps_position(meta: dict) -> dict:
@@ -341,22 +371,30 @@ def _generate(
     if not (is_image_or_video or is_point_cloud):
         raise ValueError(f"Unhandled data type for metadata extraction: {data_type}")
 
+    display_labels = _disambiguate_filenames(keys)
+    n_disambiguated = sum(1 for k, v in display_labels.items() if v != Path(k).name)
+    if n_disambiguated:
+        logger.info(
+            f"Disambiguated {n_disambiguated} file(s) whose basenames collided "
+            f"by prepending parent directories."
+        )
+
     file_metadata: list[tuple[str, dict]] = []
     empty_count = 0
 
     for i, key in enumerate(keys, 1):
-        basename = Path(key).name
-        label = "EXIF" if is_image_or_video else "PDAL"
-        logger.info(f"[{i}/{total}] Extracting {label}: {key}")
+        display_label = display_labels[key]
+        tool = "EXIF" if is_image_or_video else "PDAL"
+        logger.info(f"[{i}/{total}] Extracting {tool}: {key}")
         with backend.open_local(key) as local_path:
             if is_image_or_video:
-                meta = extract_exif_metadata(local_path, filename=basename)
+                meta = extract_exif_metadata(local_path, filename=display_label)
             else:
-                meta = extract_pdal_metadata(local_path, filename=basename)
+                meta = extract_pdal_metadata(local_path, filename=display_label)
         if not meta:
             empty_count += 1
-            logger.warning(f"No {label} metadata returned for {key}")
-        file_metadata.append((basename, meta))
+            logger.warning(f"No {tool} metadata returned for {key}")
+        file_metadata.append((display_label, meta))
 
     if empty_count:
         logger.warning(

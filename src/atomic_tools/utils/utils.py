@@ -170,21 +170,32 @@ def run_exiftool(
 _SIDECAR_INDEX_ATTR = "_sidecar_index"
 
 
+def _split_path_components(s: str) -> tuple[str, ...]:
+    """Split a path-like string on '/' (and '\\') into non-empty components."""
+    if not s:
+        return ()
+    return tuple(p for p in s.replace("\\", "/").split("/") if p)
+
+
 def _build_sidecar_index(df: "pd.DataFrame") -> dict[str, Any]:
     file_col = df.columns[0]
     stripped = df[file_col].str.strip()
     candidates = df[stripped != "DEFAULT"]
     candidate_paths = candidates[file_col].str.strip()
-    candidate_basenames = candidate_paths.str.split("/").str[-1]
-    candidate_stems = candidate_basenames.str.rsplit(".", n=1).str[0]
+    candidate_components = candidate_paths.apply(_split_path_components)
+    candidate_last_components = candidate_components.apply(
+        lambda p: p[-1] if p else ""
+    )
+    candidate_stems = candidate_last_components.str.rsplit(".", n=1).str[0]
     default_mask = stripped == "DEFAULT"
     default_row = df[default_mask].iloc[0] if default_mask.any() else None
     return {
         "file_col": file_col,
         "candidates": candidates,
         "candidate_paths": candidate_paths,
-        "candidate_basenames": candidate_basenames,
+        "candidate_basenames": candidate_last_components,
         "candidate_stems": candidate_stems,
+        "candidate_components": candidate_components,
         "default_row": default_row,
     }
 
@@ -245,39 +256,111 @@ def _flexible_match_vectorized(target: str, candidates: pd.Series) -> pd.Series:
     return cond_a | cond_b | cond_c1 | cond_c2
 
 
+def _is_path_tail_suffix(a: tuple[str, ...], b: tuple[str, ...]) -> bool:
+    """True if one tuple's tail equals the other entirely.
+
+    ``("a","1.jpg")`` and ``("1.jpg",)`` match; ``("a","1.jpg")`` and
+    ``("b","1.jpg")`` do not. Empty inputs never match.
+    """
+    if not a or not b:
+        return False
+    if len(a) <= len(b):
+        return b[-len(a):] == a
+    return a[-len(b):] == b
+
+
+def _path_suffix_match_vectorized(
+    target_components: tuple[str, ...],
+    candidate_components: pd.Series,
+    candidate_basenames: pd.Series,
+) -> pd.Series:
+    """Vectorized path-component tail-suffix match.
+
+    See ``_is_path_tail_suffix``. ``candidate_basenames`` (each candidate's
+    last component) lets us prune to candidates sharing the target basename
+    before the per-row tuple compare — tail-suffix requires equal last
+    component, so anything else can't match.
+    """
+    result = pd.Series(False, index=candidate_components.index)
+    if not target_components:
+        return result
+    basename_mask = candidate_basenames.eq(target_components[-1])
+    if not basename_mask.any():
+        return result
+    for idx, parts in candidate_components[basename_mask].items():
+        if _is_path_tail_suffix(target_components, parts):
+            result.loc[idx] = True
+    return result
+
+
+def _parent_path_compatible(
+    target_parents: tuple[str, ...],
+    candidate_parents: tuple[str, ...],
+) -> bool:
+    """Like ``_is_path_tail_suffix`` but treats either side being empty as a match,
+    since the fuzzy branch must accept rows without parent context.
+    """
+    if not target_parents or not candidate_parents:
+        return True
+    return _is_path_tail_suffix(target_parents, candidate_parents)
+
+
 def find_sidecar_row(
     df: "pd.DataFrame",
     path: str,
 ) -> tuple[Optional["pd.Series"], Optional["pd.Series"]]:
     """Locate the file-specific and DEFAULT rows in a sidecar DataFrame.
 
-    Match strategy: full path → basename → flexible (separator-agnostic / prefix)
-    against either basename or stem. Returns (matched_row, default_row); either
-    may be None.
+    Match strategy, in priority order:
+      1. Exact full-path match.
+      2. Path-component tail-suffix match (one path's last components equal
+         the other's, treating ``/`` as separator). Among multiple matches,
+         the candidate with the most components (most specific) wins.
+      3. Flexible (separator-agnostic / prefix) match on basename or stem.
+
+    Returns (matched_row, default_row); either may be None.
     """
     idx = _get_sidecar_index(df)
-    file_col = idx["file_col"]
     candidates = idx["candidates"]
     candidate_paths = idx["candidate_paths"]
     candidate_basenames = idx["candidate_basenames"]
+    candidate_components = idx["candidate_components"]
     default_row = idx["default_row"]
 
-    path_basename = Path(urlparse(path).path).name
-    path_match = candidate_paths.eq(path) | candidate_basenames.eq(path_basename)
+    parsed_path = urlparse(path).path
+    target_components = _split_path_components(parsed_path)
 
-    if not path_match.any():
-        target_stem = Path(path_basename).stem
-        path_match = _flexible_match_vectorized(
-            path_basename, candidate_basenames
-        ) | _flexible_match_vectorized(target_stem, idx["candidate_stems"])
-        if path_match.any():
-            logger.info(
-                f"Matched {path_basename} to sidecar row(s) via flexible matching: "
-                f"{candidates[path_match][file_col].tolist()}"
-            )
+    exact_match = candidate_paths.eq(path)
+    if exact_match.any():
+        return candidates[exact_match].iloc[0], default_row
 
-    matched: pd.Series | None = candidates[path_match].iloc[0] if path_match.any() else None
-    return matched, default_row
+    suffix_match = _path_suffix_match_vectorized(
+        target_components, candidate_components, candidate_basenames
+    )
+    if suffix_match.any():
+        depths = candidate_components[suffix_match].apply(len)
+        return candidates.loc[depths.idxmax()], default_row
+
+    path_basename = Path(parsed_path).name
+    target_stem = Path(path_basename).stem
+    fuzzy_match = _flexible_match_vectorized(
+        path_basename, candidate_basenames
+    ) | _flexible_match_vectorized(target_stem, idx["candidate_stems"])
+    if not fuzzy_match.any():
+        return None, default_row
+
+    target_parents = target_components[:-1]
+    fuzzy_match &= candidate_components.apply(
+        lambda parts: _parent_path_compatible(target_parents, parts[:-1])
+    )
+    if not fuzzy_match.any():
+        return None, default_row
+
+    logger.info(
+        f"Matched {path_basename} to sidecar row(s) via flexible matching: "
+        f"{candidates[fuzzy_match][idx['file_col']].tolist()}"
+    )
+    return candidates[fuzzy_match].iloc[0], default_row
 
 
 def load_sidecar_df(

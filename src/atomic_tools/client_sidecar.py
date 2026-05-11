@@ -299,10 +299,35 @@ def merge_client_metadata(
     After the merge a summary of which columns were added is logged.
     """
     file_col = client_df.columns[0]
-    image_basenames = [name for name, _ in file_metadata]
+    file_labels = [name for name, _ in file_metadata]
     total_files = len(file_metadata)
 
-    suffix_index = _build_suffix_match_index(client_df, file_col, image_basenames)
+    suffix_index = _build_suffix_match_index(client_df, file_col, file_labels)
+
+    # Resolve all matches before merging so we can detect a client row that
+    # ends up matched to multiple files (ambiguous and worth a warning).
+    matched_rows: dict[str, tuple[pd.Series | None, bool]] = {}
+    rows_to_files: dict[Any, list[str]] = defaultdict(list)
+    default_row: pd.Series | None = None
+
+    for label, _ in file_metadata:
+        matched, default_row = find_sidecar_row(client_df, label)
+        used_suffix = False
+        if matched is None:
+            matched = suffix_index.get(label)
+            used_suffix = matched is not None
+        matched_rows[label] = (matched, used_suffix)
+        if matched is not None:
+            rows_to_files[matched.name].append(label)
+
+    for row_idx, files in rows_to_files.items():
+        if len(files) > 1:
+            client_id = str(client_df.iloc[row_idx][file_col]).strip()
+            logger.warning(
+                f"Client sidecar row {client_id!r} is ambiguous — it matches "
+                f"{len(files)} files: {files}. Provide a more specific path "
+                f"in the client sidecar to disambiguate."
+            )
 
     primary_hits = 0
     suffix_hits = 0
@@ -310,14 +335,8 @@ def merge_client_metadata(
 
     additions: dict[str, dict[str, int]] = defaultdict(lambda: {"specific": 0, "default": 0})
 
-    for basename, meta in file_metadata:
-        matched, default_row = find_sidecar_row(client_df, basename)
-        used_suffix = False
-        if matched is None:
-            matched = suffix_index.get(basename)
-            if matched is not None:
-                used_suffix = True
-
+    for label, meta in file_metadata:
+        matched, used_suffix = matched_rows[label]
         if matched is None and default_row is None:
             no_match += 1
             continue
@@ -349,7 +368,7 @@ def merge_client_metadata(
             elif file_str != client_val:
                 logger.warning(
                     f"Client sidecar disagrees with file metadata for "
-                    f"{basename!r} field {key!r}: file={file_str!r}, "
+                    f"{label!r} field {key!r}: file={file_str!r}, "
                     f"client={client_val!r} ({source}); keeping file value."
                 )
 

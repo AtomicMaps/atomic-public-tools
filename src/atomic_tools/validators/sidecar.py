@@ -19,6 +19,8 @@ from atomic_tools.io.storage import from_directory
 from atomic_tools.utils.utils import (
     DATA_TYPE_INFO,
     DataTypeEnum,
+    _is_path_tail_suffix,
+    _split_path_components,
     load_sidecar_df,
 )
 from atomic_tools.validators.report import LintReport
@@ -320,38 +322,50 @@ def _check_file_inventory(
         )
         return
 
-    basenames_to_keys: dict[str, list[str]] = defaultdict(list)
-    for key in keys:
-        basenames_to_keys[Path(key).name].append(key)
-
-    for basename, paths in basenames_to_keys.items():
-        if len(paths) > 1:
-            report.add_warning(
-                f"Input directory contains {len(paths)} files with basename {basename!r}: {paths}.",
-                fix_hint="Sidecar matching is by basename — duplicates may match the wrong row.",
-            )
-
     file_col = df.columns[0]
-    sidecar_basenames = (
-        df[file_col].astype(str).str.strip().str.split("/").str[-1]
-    )
-    non_default_mask = sidecar_basenames != _DEFAULT_ROW_NAME
-    non_default_sidecar_basenames = sidecar_basenames[non_default_mask]
+    sidecar_filenames = df[file_col].astype(str).str.strip()
+    non_default_mask = sidecar_filenames != _DEFAULT_ROW_NAME
 
-    sidecar_basename_to_rows: dict[str, list[int]] = defaultdict(list)
-    for idx, name in non_default_sidecar_basenames.items():
-        if name:
-            sidecar_basename_to_rows[name].append(int(idx))
+    # Bucket by basename so each key only tail-checks rows sharing its
+    # basename — tail-suffix requires equal last component.
+    rows_by_basename: dict[str, list[tuple[int, tuple[str, ...]]]] = defaultdict(list)
+    for idx, name in sidecar_filenames[non_default_mask].items():
+        parts = _split_path_components(name)
+        if parts:
+            rows_by_basename[parts[-1]].append((int(idx), parts))
 
-    for input_basename in basenames_to_keys:
-        rows = sidecar_basename_to_rows.get(input_basename, [])
-        if len(rows) > 1:
+    row_to_keys: dict[int, list[str]] = defaultdict(list)
+    missing: list[str] = []
+    for key in keys:
+        key_parts = _split_path_components(key)
+        if not key_parts:
+            missing.append(key)
+            continue
+        matches = [
+            row_idx
+            for row_idx, parts in rows_by_basename.get(key_parts[-1], [])
+            if _is_path_tail_suffix(key_parts, parts)
+        ]
+        if len(matches) > 1:
             report.add_warning(
-                f"Input file {input_basename!r} matches {len(rows)} sidecar rows: {rows}.",
-                fix_hint="Each file should appear in exactly one sidecar row.",
+                f"Input file {key!r} matches {len(matches)} sidecar rows: {matches}.",
+                fix_hint="Use more specific paths in the sidecar to disambiguate.",
+            )
+            continue
+        if not matches:
+            missing.append(key)
+            continue
+        row_to_keys[matches[0]].append(key)
+
+    for row_idx, files in row_to_keys.items():
+        if len(files) > 1:
+            sidecar_name = sidecar_filenames.loc[row_idx]
+            report.add_warning(
+                f"Sidecar row {row_idx} ({sidecar_name!r}) matches "
+                f"{len(files)} input files: {files}.",
+                fix_hint="Use more specific paths in the sidecar to disambiguate.",
             )
 
-    missing = [bn for bn in basenames_to_keys if bn not in sidecar_basename_to_rows]
     if not missing:
         return
     missing.sort()

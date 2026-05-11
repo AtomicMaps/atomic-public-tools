@@ -189,10 +189,14 @@ def test_input_files_extras_without_default_errors(tmp_path):
     assert any("DEFAULT does not cover" in f.message for f in report.errors())
 
 
-def test_duplicate_basenames_in_input_warns(tmp_path):
+def test_basename_only_sidecar_row_matching_multiple_inputs_warns(tmp_path):
+    """A sidecar row using just a basename matches every input file with that
+    basename. Ambiguous — surface a warning so the operator can supply more
+    specific paths."""
     header = _oriented_image_header()
     rows = [
         ["DEFAULT", "2024:06:15 10:30:00", "1000", "51.0", "-114.0", "-90.0", "0.0", "0.0"],
+        ["dup.jpg", "2024:06:15 10:30:00", "1100", "51.0", "-114.0", "-90.0", "0.0", "0.0"],
     ]
     sidecar = _write_csv(tmp_path, "s.csv", header, rows)
     pic_dir = tmp_path / "pics"
@@ -207,7 +211,37 @@ def test_duplicate_basenames_in_input_warns(tmp_path):
         schema_path=None,
         input_files_path=str(pic_dir),
     )
-    assert any("with basename 'dup.jpg'" in f.message for f in report.warnings())
+    assert any("matches 2 input files" in f.message for f in report.warnings()), [
+        f.message for f in report.warnings()
+    ]
+
+
+def test_disambiguated_paths_in_sidecar_match_unambiguously(tmp_path):
+    """When the sidecar uses disambiguated paths (``sub1/dup.jpg``) instead of
+    bare basenames, each input file matches exactly one row — no warning."""
+    header = _oriented_image_header()
+    rows = [
+        ["DEFAULT", "2024:06:15 10:30:00", "1000", "51.0", "-114.0", "-90.0", "0.0", "0.0"],
+        ["sub1/dup.jpg", "2024:06:15 10:30:00", "1100", "51.0", "-114.0", "-90.0", "0.0", "0.0"],
+        ["sub2/dup.jpg", "2024:06:15 10:31:00", "1200", "51.0", "-114.0", "-90.0", "0.0", "0.0"],
+    ]
+    sidecar = _write_csv(tmp_path, "s.csv", header, rows)
+    pic_dir = tmp_path / "pics"
+    (pic_dir / "sub1").mkdir(parents=True)
+    (pic_dir / "sub2").mkdir(parents=True)
+    (pic_dir / "sub1" / "dup.jpg").write_text("x")
+    (pic_dir / "sub2" / "dup.jpg").write_text("x")
+    report = lint_sidecar_file(
+        str(sidecar),
+        final=True,
+        data_type=DataTypeEnum.oriented_image,
+        schema_path=None,
+        input_files_path=str(pic_dir),
+    )
+    assert not any("matches" in f.message and "input files" in f.message for f in report.warnings()), [
+        f.message for f in report.warnings()
+    ]
+    assert not any("no sidecar row" in f.message for f in report.warnings() + report.errors())
 
 
 def test_multiple_sidecar_rows_for_one_file_warns(tmp_path):
