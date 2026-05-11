@@ -413,9 +413,7 @@ def get_keys_and_metadata(store: ObstoreBackend, prefix: str) -> dict:
     ) as e:
         raise RuntimeError(f"Failed to list keys with prefix {prefix}: {e}") from e
     except Exception as e:
-        raise RuntimeError(
-            f"Unexpected error during listing keys with prefix {prefix}: {e}"
-        ) from e
+        raise RuntimeError(f"Unexpected error during listing keys with prefix {prefix}: {e}") from e
 
 
 def filter_keys(
@@ -492,9 +490,7 @@ def get_object_keys(
     return filter_keys(key_sizes, include, exclude)
 
 
-def download(
-    store: ObstoreBackend, key: str, destination_dir: str, buffer_size: int = 5
-) -> str:
+def download(store: ObstoreBackend, key: str, destination_dir: str, buffer_size: int = 5) -> str:
     """Download an object from the store to `destination_dir` in chunks.
 
     Performs a free-space precheck (file_size + buffer_size GB) and a chunked,
@@ -525,9 +521,7 @@ def download(
             )
 
         destination_path = storage_path / Path(key).name
-        logger.debug(
-            f"Downloading {key} ({file_size / BYTES_TO_GB:.2f} GB) to {destination_path}"
-        )
+        logger.debug(f"Downloading {key} ({file_size / BYTES_TO_GB:.2f} GB) to {destination_path}")
 
         current_gb = 0
         with open(destination_path, "wb") as local_file:
@@ -535,9 +529,7 @@ def download(
                 end = min(start + CHUNK_SIZE, file_size)
 
                 if start >= end:
-                    logger.error(
-                        f"Invalid byte range detected: start={start}, end={end} for {key}"
-                    )
+                    logger.error(f"Invalid byte range detected: start={start}, end={end} for {key}")
                     raise ValueError(f"Invalid byte range: start={start}, end={end}")
 
                 for attempt in range(MAX_RETRIES):
@@ -624,6 +616,4 @@ def upload(
     ) as e:
         raise RuntimeError(f"Failed to upload {source} to {key}: {e}") from e
     except Exception as e:
-        raise RuntimeError(
-            f"Unexpected error during upload {source} to {key}: {e}"
-        ) from e
+        raise RuntimeError(f"Unexpected error during upload {source} to {key}: {e}") from e

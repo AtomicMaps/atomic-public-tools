@@ -211,9 +211,7 @@ def _check_required_values(
                 if len(missing_rows) > _MAX_LISTED_FILES
                 else ""
             )
-            row_summary = (
-                ", ".join(f"row {idx} ({name!r})" for idx, name in sample) + tail
-            )
+            row_summary = ", ".join(f"row {idx} ({name!r})" for idx, name in sample) + tail
             report.add_error(
                 f"{canonical!r} is missing on {len(missing_rows)} row(s) and "
                 f"DEFAULT does not provide a value: {row_summary}",
@@ -397,7 +395,6 @@ def _check_file_inventory(
         report.add_warning(
             f"{len(missing)} input file(s) have no row in this client sidecar: {listing}",
             fix_hint=(
-                "The generator will fill in any missing files automatically; "
-                "this is informational."
+                "The generator will fill in any missing files automatically; this is informational."
             ),
         )

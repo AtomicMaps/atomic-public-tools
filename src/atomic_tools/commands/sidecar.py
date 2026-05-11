@@ -59,6 +59,7 @@ _POINT_CLOUD_DATA_TYPES = {DataTypeEnum.point_cloud}
 # the current working directory. Holder for a future CLI option.
 SIDECAR_PATH_OUTPUT_DIR: Path | None = None
 
+
 def _list_local_schemas() -> list[Path]:
     """Return sorted ``*.json`` files from ``./schemas/`` if that dir exists."""
     schemas_dir = Path.cwd() / "schemas"
@@ -139,15 +140,11 @@ def _disambiguate_filenames(keys: list[str]) -> dict[str, str]:
     """Return a per-key display label, extended with the minimum number of
     parent directories needed to be unique across ``keys``.
     """
-    parts_per_key: dict[str, tuple[str, ...]] = {
-        key: _split_path_components(key) for key in keys
-    }
+    parts_per_key: dict[str, tuple[str, ...]] = {key: _split_path_components(key) for key in keys}
     depths: dict[str, int] = {key: 1 for key in keys}
 
     while True:
-        labels = {
-            key: "/".join(parts[-depths[key]:]) for key, parts in parts_per_key.items()
-        }
+        labels = {key: "/".join(parts[-depths[key] :]) for key, parts in parts_per_key.items()}
         counts: dict[str, int] = defaultdict(int)
         for label in labels.values():
             counts[label] += 1
@@ -225,9 +222,7 @@ def _warn_missing_required_fields(
         return
 
     total = len(file_metadata)
-    logger.warning(
-        "Missing required metadata after client sidecar merge — see details below."
-    )
+    logger.warning("Missing required metadata after client sidecar merge — see details below.")
 
     header = (
         f"MISSING REQUIRED METADATA: {len(missing_by_group)} required field(s) "
@@ -251,9 +246,7 @@ def _canonicalize_keys(meta: dict, alias_to_canonical: dict[str, str]) -> dict:
     is already present, the alias is dropped; among multiple aliases for the
     same canonical, the first-encountered one wins.
     """
-    out: dict = {
-        key: value for key, value in meta.items() if key not in alias_to_canonical
-    }
+    out: dict = {key: value for key, value in meta.items() if key not in alias_to_canonical}
     for key, value in meta.items():
         if key in alias_to_canonical:
             out.setdefault(alias_to_canonical[key], value)
@@ -305,9 +298,7 @@ def build_sidecar_df(
     if required_field_groups:
         for group in required_field_groups:
             canonical = group[0]
-            all_covered = all(
-                any(field in meta for field in group) for _, meta in file_metadata
-            )
+            all_covered = all(any(field in meta for field in group) for _, meta in file_metadata)
             if not all_covered and canonical not in prepend_cols:
                 prepend_cols.append(canonical)
 
@@ -321,9 +312,7 @@ def build_sidecar_df(
     df = pd.DataFrame(rows, columns=columns)
     df = df.sort_values(by="Filename", kind="stable", ignore_index=True)
 
-    default_row = pd.DataFrame(
-        [{"Filename": "DEFAULT", **{col: "" for col in all_cols}}]
-    )
+    default_row = pd.DataFrame([{"Filename": "DEFAULT", **{col: "" for col in all_cols}}])
     return pd.concat([default_row, df], ignore_index=True)
 
 
@@ -359,9 +348,7 @@ def _generate(
 
     keys = backend.list_keys(include=include, exclude=exclude)
     if not keys:
-        raise RuntimeError(
-            f"No valid files found for '{data_type}' in {backend.display_root}"
-        )
+        raise RuntimeError(f"No valid files found for '{data_type}' in {backend.display_root}")
 
     total = len(keys)
     logger.info(f"Found {total} file(s) to process in {backend.display_root}.")
@@ -460,10 +447,15 @@ def _format_replay_command(
     full: bool,
 ) -> str:
     parts = [
-        "am-tools", "sidecar", "generate",
-        "--directory", shlex.quote(directory),
-        "--data-type", data_type.value,
-        "--output-filename", shlex.quote(output_filename),
+        "am-tools",
+        "sidecar",
+        "generate",
+        "--directory",
+        shlex.quote(directory),
+        "--data-type",
+        data_type.value,
+        "--output-filename",
+        shlex.quote(output_filename),
     ]
     if client_sidecar:
         parts += ["--client-sidecar", shlex.quote(client_sidecar)]
@@ -591,9 +583,7 @@ def generate(
 
     wizard_ran = directory is None or data_type is None
     if wizard_ran:
-        full_provided = (
-            ctx.get_parameter_source("full") == click.core.ParameterSource.COMMANDLINE
-        )
+        full_provided = ctx.get_parameter_source("full") == click.core.ParameterSource.COMMANDLINE
         directory, data_type, output_filename, client_sidecar, client_schema, full = (
             _run_interactive_wizard(
                 directory,

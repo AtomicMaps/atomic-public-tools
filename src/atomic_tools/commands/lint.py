@@ -181,15 +181,10 @@ def lint_sidecar_cmd(
     )
 
     # check to see if they provided the fields
-    final_provided = (
-        ctx.get_parameter_source("final") == click.core.ParameterSource.COMMANDLINE
-    )
-    schema_provided = (
-        ctx.get_parameter_source("schema") == click.core.ParameterSource.COMMANDLINE
-    )
+    final_provided = ctx.get_parameter_source("final") == click.core.ParameterSource.COMMANDLINE
+    schema_provided = ctx.get_parameter_source("schema") == click.core.ParameterSource.COMMANDLINE
     input_files_provided = (
-        ctx.get_parameter_source("input_files")
-        == click.core.ParameterSource.COMMANDLINE
+        ctx.get_parameter_source("input_files") == click.core.ParameterSource.COMMANDLINE
     )
 
     # If the user didn't provide required info via arguments, ask interactively

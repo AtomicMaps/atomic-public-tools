@@ -357,10 +357,7 @@ def test_merge_uses_path_suffix_match_for_disambiguated_labels(tmp_path):
     must route to the right file."""
     csv = tmp_path / "client.csv"
     csv.write_text(
-        "Filename,GPSAltitude\n"
-        "DEFAULT,500\n"
-        "a/1.jpg,1100\n"
-        "b/1.jpg,1200\n",
+        "Filename,GPSAltitude\nDEFAULT,500\na/1.jpg,1100\nb/1.jpg,1200\n",
         encoding="utf-8",
     )
     file_metadata = [("a/1.jpg", {}), ("b/1.jpg", {})]
@@ -381,8 +378,7 @@ def test_merge_basename_only_client_row_warns_on_ambiguity(tmp_path, caplog):
     log a clear warning."""
     csv = tmp_path / "client.csv"
     csv.write_text(
-        "Filename,GPSAltitude\n"
-        "1.jpg,9999\n",
+        "Filename,GPSAltitude\n1.jpg,9999\n",
         encoding="utf-8",
     )
     file_metadata = [("a/1.jpg", {}), ("b/1.jpg", {})]
@@ -401,9 +397,7 @@ def test_merge_exact_label_wins_over_basename_match(tmp_path):
     ``a/1.jpg`` must pick the exact-match row, not the basename row."""
     csv = tmp_path / "client.csv"
     csv.write_text(
-        "Filename,GPSAltitude\n"
-        "1.jpg,500\n"
-        "a/1.jpg,1100\n",
+        "Filename,GPSAltitude\n1.jpg,500\na/1.jpg,1100\n",
         encoding="utf-8",
     )
     file_metadata = [("a/1.jpg", {})]
@@ -421,8 +415,7 @@ def test_merge_does_not_match_unrelated_paths(tmp_path):
     parent components don't match, so it's a different file."""
     csv = tmp_path / "client.csv"
     csv.write_text(
-        "Filename,GPSAltitude\n"
-        "b/1.jpg,1200\n",
+        "Filename,GPSAltitude\nb/1.jpg,1200\n",
         encoding="utf-8",
     )
     file_metadata = [("a/1.jpg", {})]

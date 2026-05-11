@@ -76,9 +76,7 @@ def lint_schema_file(path: Path) -> LintReport:
     if not report.has_errors():
         n_headerless = len(data.get("headerless_columns", []) or []) if has_headerless else 0
         n_renames = len(data.get("column_renames", {}) or {}) if has_renames else 0
-        report.add_info(
-            f"Schema OK: {n_headerless} headerless column(s), {n_renames} rename(s)."
-        )
+        report.add_info(f"Schema OK: {n_headerless} headerless column(s), {n_renames} rename(s).")
 
     return report
 

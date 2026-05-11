@@ -238,9 +238,9 @@ def test_disambiguated_paths_in_sidecar_match_unambiguously(tmp_path):
         schema_path=None,
         input_files_path=str(pic_dir),
     )
-    assert not any("matches" in f.message and "input files" in f.message for f in report.warnings()), [
-        f.message for f in report.warnings()
-    ]
+    assert not any(
+        "matches" in f.message and "input files" in f.message for f in report.warnings()
+    ), [f.message for f in report.warnings()]
     assert not any("no sidecar row" in f.message for f in report.warnings() + report.errors())
 
 
@@ -358,7 +358,7 @@ def test_dms_latitude_accepted(tmp_path):
             "1.jpg",
             "2024:06:15 10:30:00",
             "1000",
-            '51 deg 2\' 40.92" N',
+            "51 deg 2' 40.92\" N",
             "-114.0",
             "-90.0",
             "0.0",
