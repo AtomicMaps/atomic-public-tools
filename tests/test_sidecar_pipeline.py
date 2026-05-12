@@ -23,10 +23,10 @@ from atomic_tools.commands.sidecar import (
 from atomic_tools.utils.utils import DataTypeEnum
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-EXAMPLE_DIR = REPO_ROOT / "example fake data"
+EXAMPLE_DIR = REPO_ROOT / "Example-fake-data"
 INPUT_SIDECAR = EXAMPLE_DIR / "input sidecar" / "input_sidecar.csv"
 HEADERLESS_SIDECAR = EXAMPLE_DIR / "input sidecar" / "headerless_sidecar.csv"
-EXAMPLE_SCHEMA = REPO_ROOT / "schemas" / "example.json"
+EXAMPLE_SCHEMA = REPO_ROOT / "schemas" / "column_names_example.json"
 
 ORIENTED_GROUPS = _REQUIRED_SIDECAR_FIELD_GROUPS[DataTypeEnum.oriented_image]
 

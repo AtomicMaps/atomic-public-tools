@@ -36,7 +36,7 @@ def lint_sidecar_file(
     *,
     final: bool,
     data_type: DataTypeEnum,
-    schema_path: Path | None,
+    schema_path: str | Path | None,
     input_files_path: str | None,
 ) -> LintReport:
     report = LintReport()
@@ -66,10 +66,10 @@ def lint_sidecar_file(
             )
             return report
 
-    headerless = schema.headerless_columns if schema and schema.headerless_columns else None
+    column_names = schema.column_names if schema and schema.column_names else None
 
     try:
-        df = load_sidecar_df(sidecar_path, headerless_columns=headerless)
+        df = load_sidecar_df(sidecar_path, column_names=column_names)
     except FileNotFoundError as e:
         report.add_error(f"Sidecar file does not exist: {e}")
         return report

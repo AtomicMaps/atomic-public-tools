@@ -8,13 +8,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 def test_load_returns_empty_when_path_is_none():
     schema = load_client_schema(None)
     assert schema == ClientSchema()
-    assert schema.headerless_columns == ()
-    assert dict(schema.column_renames) == {}
+    assert schema.column_names == ()
+    assert dict(schema.column_name_mapping) == {}
 
 
 def test_load_parses_example_json():
-    schema = load_client_schema(REPO_ROOT / "schemas" / "example.json")
-    assert schema.headerless_columns == (
+    schema = load_client_schema(REPO_ROOT / "schemas" / "column_names_example.json")
+    assert schema.column_names == (
         "Filename",
         "CreateDate",
         "GPSAltitude",
@@ -24,12 +24,12 @@ def test_load_parses_example_json():
         "Roll",
         "Heading",
     )
-    assert dict(schema.column_renames) == {}
+    assert dict(schema.column_name_mapping) == {}
 
 
 def test_load_handles_missing_keys(tmp_path):
     p = tmp_path / "minimal.json"
     p.write_text("{}")
     schema = load_client_schema(p)
-    assert schema.headerless_columns == ()
-    assert dict(schema.column_renames) == {}
+    assert schema.column_names == ()
+    assert dict(schema.column_name_mapping) == {}

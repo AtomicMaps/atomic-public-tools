@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import shlex
-from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 
 import click
@@ -15,6 +14,7 @@ from atomic_tools.commands.sidecar import (
     _ask_client_schema,
     _ask_data_type,
     _ask_verbosity,
+    ask_schema_uri,
 )
 from atomic_tools.utils.utils import DataTypeEnum
 from atomic_tools.validators.schema import lint_schema_file
@@ -31,12 +31,8 @@ lint_app = typer.Typer(
 )
 
 
-def _ask_schema_path() -> Path:
-    answer = questionary.path(
-        "Path to schema JSON:",
-        validate=lambda v: Path(v).expanduser().is_file() or "File not found.",
-    ).unsafe_ask()
-    return Path(answer).expanduser().resolve()
+def _ask_schema_path() -> str:
+    return ask_schema_uri()
 
 
 def _ask_sidecar_path() -> str:
@@ -81,8 +77,8 @@ def _verbosity_prefix(verbosity: VerbosityChoice) -> list[str]:
     return []
 
 
-def _format_schema_replay_command(path: Path, verbosity: VerbosityChoice) -> str:
-    parts = ["am-tools", *_verbosity_prefix(verbosity), "lint", "schema", shlex.quote(str(path))]
+def _format_schema_replay_command(path: str, verbosity: VerbosityChoice) -> str:
+    parts = ["am-tools", *_verbosity_prefix(verbosity), "lint", "schema", shlex.quote(path)]
     return " ".join(parts)
 
 
@@ -90,7 +86,7 @@ def _format_sidecar_replay_command(
     path: str,
     final: bool,
     datatype: DataTypeEnum,
-    schema: Path | None,
+    schema: str | None,
     input_files: str | None,
     verbosity: VerbosityChoice,
 ) -> str:
@@ -106,7 +102,7 @@ def _format_sidecar_replay_command(
     if final:
         parts.append("--final")
     if schema is not None:
-        parts += ["--schema", shlex.quote(str(schema))]
+        parts += ["--schema", shlex.quote(schema)]
     if input_files:
         parts += ["--input-files", shlex.quote(input_files)]
     return " ".join(parts)
@@ -116,8 +112,11 @@ def _format_sidecar_replay_command(
 def lint_schema_cmd(
     ctx: typer.Context,
     path: Annotated[
-        Path | None,
-        typer.Argument(help="Path to a schema JSON file.", show_default=False),
+        str | None,
+        typer.Argument(
+            help="Path or URI to a schema JSON file (local or s3://… / gs://… / az://…).",
+            show_default=False,
+        ),
     ] = None,
 ) -> None:
     """Validate a client schema JSON file."""
@@ -179,15 +178,13 @@ def lint_sidecar_cmd(
         ),
     ] = None,
     schema: Annotated[
-        Path | None,
+        str | None,
         typer.Option(
             "--schema",
-            exists=True,
-            dir_okay=False,
-            readable=True,
             help=(
-                "Optional client schema JSON. Used to apply headerless column "
-                "names + per-client renames before checking. Ignored when --final is set."
+                "Optional client schema JSON (local path or s3://… / gs://… "
+                "/ az://… URI). Used to apply positional column names + "
+                "per-client renames before checking. Ignored when --final is set."
             ),
         ),
     ] = None,

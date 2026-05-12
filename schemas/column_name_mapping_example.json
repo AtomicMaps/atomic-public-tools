@@ -1,0 +1,6 @@
+{
+  "column_name_mapping": {
+    "Col1":"GPSLatitude",
+    "ExampleCol2":"GPSLongitude"
+  }
+}

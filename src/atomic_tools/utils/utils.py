@@ -356,14 +356,35 @@ def find_sidecar_row(
     return candidates[fuzzy_match].iloc[0], default_row
 
 
+def is_remote_uri(uri: str | None) -> bool:
+    """Return True if `uri` has a remote scheme (s3, gs, az, …)."""
+    if not uri:
+        return False
+    return urlparse(uri).scheme.lower() in REMOTE_SCHEME_TO_STORE_TYPE
+
+
+def read_text_uri(uri: str, *, encoding: str = "utf-8") -> str:
+    """Read text content from a local path or remote URI (s3/gs/az)."""
+    parsed = urlparse(uri)
+    store_type = REMOTE_SCHEME_TO_STORE_TYPE.get(parsed.scheme.lower())
+    if store_type:
+        key = parsed.path.lstrip("/")
+        bucket_url = f"{parsed.scheme}://{parsed.netloc}"
+        store = ObjectStore(store_type).from_url(bucket_url)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            downloaded_path = download(store, key, tmp_dir)
+            return Path(downloaded_path).read_text(encoding=encoding)
+    return Path(uri).read_text(encoding=encoding)
+
+
 def load_sidecar_df(
     sidecar_path: str,
     *,
-    headerless_columns: Sequence[str] | None = None,
+    column_names: Sequence[str] | None = None,
 ) -> pd.DataFrame:
     """Load a sidecar CSV (local or remote S3/GCS/Azure) into a DataFrame.
 
-    When `headerless_columns` is given, the CSV is read with no header row and
+    When `column_names` is given, the CSV is read with no header row and
     the supplied names are applied positionally — used for client sidecars that
     ship without column headers.
     """
@@ -372,9 +393,9 @@ def load_sidecar_df(
         "keep_default_na": False,
         "encoding": "utf-8",
     }
-    if headerless_columns is not None:
+    if column_names is not None:
         read_kwargs["header"] = None
-        read_kwargs["names"] = list(headerless_columns)
+        read_kwargs["names"] = list(column_names)
 
     parsed = urlparse(sidecar_path)
     store_type = REMOTE_SCHEME_TO_STORE_TYPE.get(parsed.scheme)

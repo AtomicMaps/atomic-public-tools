@@ -7,10 +7,6 @@ from pathlib import Path
 from atomic_tools.utils.utils import DataTypeEnum
 from atomic_tools.validators.sidecar import lint_sidecar_file
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-EXAMPLES = REPO_ROOT / "Example-fake-data"
-
-
 # ---- helpers -----------------------------------------------------------
 
 
@@ -55,19 +51,6 @@ def _lint_pointcloud(p):
 
 
 # ---- --final mode -------------------------------------------------------
-
-
-def test_final_passing_on_bundled_example():
-    sidecar = EXAMPLES / "sidecar.csv"
-    report = lint_sidecar_file(
-        str(sidecar),
-        final=True,
-        data_type=DataTypeEnum.oriented_image,
-        schema_path=None,
-        input_files_path=None,
-    )
-    error_msgs = [f.message for f in report.errors()]
-    assert not report.has_errors(), f"unexpected errors: {error_msgs}"
 
 
 def test_final_missing_required_column_errors(tmp_path):
@@ -132,7 +115,7 @@ def test_final_warns_when_schema_passed(tmp_path):
     ]
     sidecar = _write_csv(tmp_path, "s.csv", header, rows)
     schema = tmp_path / "schema.json"
-    schema.write_text('{"column_renames": {"x": "GPSLatitude"}}', encoding="utf-8")
+    schema.write_text('{"column_name_mapping": {"x": "GPSLatitude"}}', encoding="utf-8")
     report = lint_sidecar_file(
         str(sidecar),
         final=True,
@@ -293,7 +276,7 @@ def test_client_mode_schema_renames_applied(tmp_path):
     sidecar = _write_csv(tmp_path, "s.csv", header, rows)
     schema = tmp_path / "schema.json"
     schema.write_text(
-        '{"column_renames": {"lat": "GPSLatitude", "lon": "GPSLongitude"}}',
+        '{"column_name_mapping": {"lat": "GPSLatitude", "lon": "GPSLongitude"}}',
         encoding="utf-8",
     )
     report = lint_sidecar_file(

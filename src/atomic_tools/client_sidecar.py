@@ -14,7 +14,7 @@ from typing import Any
 
 import pandas as pd
 
-from atomic_tools.utils.utils import find_sidecar_row, load_sidecar_df
+from atomic_tools.utils.utils import find_sidecar_row, load_sidecar_df, read_text_uri
 
 logger = logging.getLogger(__name__)
 
@@ -24,10 +24,10 @@ logger = logging.getLogger(__name__)
 # A client schema describes how to normalise a client-supplied sidecar CSV
 # before merging:
 #
-#   * headerless_columns — positional column names applied when the client
+#   * column_names — positional column names applied when the client
 #     CSV ships without a header row. Empty / omitted means "the CSV has a
 #     header".
-#   * column_renames — per-client column renames applied AFTER positional
+#   * column_name_mapping — per-client column renames applied AFTER positional
 #     naming and BEFORE the global alias canonicalisation.
 #
 # See ``schemas/example.json`` for an example.
@@ -35,25 +35,27 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class ClientSchema:
-    headerless_columns: tuple[str, ...] = ()
-    column_renames: Mapping[str, str] = field(default_factory=dict)
+    column_names: tuple[str, ...] = ()
+    column_name_mapping: Mapping[str, str] = field(default_factory=dict)
 
 
 _EMPTY_SCHEMA = ClientSchema()
 
 
-def load_client_schema(path: Path | None) -> ClientSchema:
-    """Load a client schema from a JSON file.
+def load_client_schema(path: str | Path | None) -> ClientSchema:
+    """Load a client schema from a JSON file (local path or remote URI).
 
-    Returns the empty schema (no headerless columns, no renames) when ``path``
-    is ``None`` — i.e. when the caller hasn't supplied a schema.
+    `path` may be a local filesystem path or an object-store URI (``s3://…``,
+    ``gs://…``, ``az://…``). Returns the empty schema (no positional column
+    names, no renames) when ``path`` is ``None`` — i.e. when the caller hasn't
+    supplied a schema.
     """
     if path is None:
         return _EMPTY_SCHEMA
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = json.loads(read_text_uri(str(path)))
     return ClientSchema(
-        headerless_columns=tuple(data.get("headerless_columns", ())),
-        column_renames=dict(data.get("column_renames", {})),
+        column_names=tuple(data.get("column_names", ())),
+        column_name_mapping=dict(data.get("column_name_mapping", {})),
     )
 
 
@@ -65,20 +67,20 @@ class SidecarMergeError(RuntimeError):
 
 
 def _apply_positional_names(df: pd.DataFrame, schema: ClientSchema) -> pd.DataFrame:
-    """Validate column count when a headerless schema is in effect.
+    """Validate column count when column_names is in effect.
 
     The actual `header=None, names=…` was applied at read time in
-    `load_sidecar_df` (which received `headerless_columns` from the schema).
+    `load_sidecar_df` (which received `column_names` from the schema).
     Here we just sanity-check that the column count we got matches.
     """
-    if not schema.headerless_columns:
+    if not schema.column_names:
         return df
-    expected = len(schema.headerless_columns)
+    expected = len(schema.column_names)
     actual = df.shape[1]
     if actual != expected:
         raise SidecarMergeError(
             f"Headerless client CSV column count mismatch: schema declares "
-            f"{expected} columns ({list(schema.headerless_columns)}), "
+            f"{expected} columns ({list(schema.column_names)}), "
             f"but CSV has {actual}."
         )
     return df
@@ -86,9 +88,9 @@ def _apply_positional_names(df: pd.DataFrame, schema: ClientSchema) -> pd.DataFr
 
 def _apply_client_renames(df: pd.DataFrame, schema: ClientSchema) -> pd.DataFrame:
     """Apply per-client column renames. Raises on rename-target collisions."""
-    if not schema.column_renames:
+    if not schema.column_name_mapping:
         return df
-    return _safe_rename(df, dict(schema.column_renames), context="per-client renames")
+    return _safe_rename(df, dict(schema.column_name_mapping), context="per-client renames")
 
 
 def build_global_alias_map(
@@ -190,25 +192,24 @@ def _validate_filename_column(df: pd.DataFrame) -> None:
 
 def load_and_clean_client_sidecar(
     url: str,
-    schema_path: Path | None,
+    schema_path: str | Path | None,
     required_field_groups: dict[str, list[list[str]]],
 ) -> pd.DataFrame:
     """Load the client sidecar at `url` and run the cleaning pipeline.
 
-    `schema_path` points to a client-provided JSON schema (see
-    ``schemas/example.json``); when ``None``, no headerless-column naming or
-    per-client renames are applied. `required_field_groups` is injected
-    (rather than imported) to avoid a circular dependency with the sidecar
-    generator.
+    `schema_path` points to a client-provided JSON schema (local path or
+    remote URI); when ``None``, no positional column naming or per-client
+    renames are applied. `required_field_groups` is injected (rather than
+    imported) to avoid a circular dependency with the sidecar generator.
     """
     schema = load_client_schema(schema_path)
     logger.info(
         f"Loading client sidecar {url!r} "
         f"(schema={str(schema_path) if schema_path else 'none'}, "
-        f"headerless={'yes' if schema.headerless_columns else 'no'}, "
-        f"renames={len(schema.column_renames)})"
+        f"headerless={'yes' if schema.column_names else 'no'}, "
+        f"renames={len(schema.column_name_mapping)})"
     )
-    df = load_sidecar_df(url, headerless_columns=schema.headerless_columns or None)
+    df = load_sidecar_df(url, column_names=schema.column_names or None)
     df = _apply_positional_names(df, schema)
     df = _apply_client_renames(df, schema)
     flat_groups = [g for groups in required_field_groups.values() for g in groups]

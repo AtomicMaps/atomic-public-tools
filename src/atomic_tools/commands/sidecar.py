@@ -12,6 +12,7 @@ Requires the following external binaries on PATH at runtime (NOT pip-installable
 
 import logging
 import shlex
+import shutil
 import tempfile
 from collections import defaultdict
 from pathlib import Path
@@ -38,6 +39,7 @@ from atomic_tools.utils.utils import (
     DATA_TYPE_INFO,
     DataTypeEnum,
     _split_path_components,
+    is_remote_uri,
 )
 from atomic_tools.validators.required_fields import (
     REQUIRED_SIDECAR_FIELD_GROUPS as _REQUIRED_SIDECAR_FIELD_GROUPS,
@@ -58,11 +60,6 @@ _IMAGE_DATA_TYPES = {
 }
 _VIDEO_DATA_TYPES = {DataTypeEnum.video}
 _POINT_CLOUD_DATA_TYPES = {DataTypeEnum.point_cloud}
-
-# Directory where the sidecar-path pointer file is written. None falls back to
-# the current working directory. Holder for a future CLI option.
-SIDECAR_PATH_OUTPUT_DIR: Path | None = None
-
 
 def _list_local_schemas() -> list[Path]:
     """Return sorted ``*.json`` files from ``./schemas/`` if that dir exists."""
@@ -108,6 +105,14 @@ def _ask_full() -> bool:
     ).unsafe_ask()
 
 
+def _ask_local_copy() -> bool:
+    return questionary.confirm(
+        "Also save a local copy of the sidecar in this directory "
+        "(so you can inspect it before submitting)?",
+        default=True,
+    ).unsafe_ask()
+
+
 _VERBOSITY_DEFAULT = "Default (warnings only)"
 _VERBOSITY_VERBOSE = "Verbose (info)"
 _VERBOSITY_SILENT = "Silent (errors only)"
@@ -135,11 +140,32 @@ def _ask_client_sidecar() -> str | None:
     return answer or None
 
 
-_SCHEMA_CUSTOM = "Custom path…"
+_SCHEMA_CUSTOM = "Custom path or URI…"
 _SCHEMA_SKIP = "Skip"
 
 
-def _ask_client_schema() -> Path | None:
+def _validate_schema_input(v: str) -> bool | str:
+    v = v.strip()
+    if not v:
+        return "Required."
+    if is_remote_uri(v):
+        return True
+    return Path(v).expanduser().is_file() or "File not found (and not a remote URI)."
+
+
+def ask_schema_uri(prompt: str = "Path or URI to schema JSON:") -> str:
+    """Prompt for a schema path or URI; resolve local paths, pass URIs through."""
+    answer = questionary.text(
+        prompt,
+        instruction="(Local path or s3://… / gs://… / az://… URI)",
+        validate=_validate_schema_input,
+    ).unsafe_ask().strip()
+    if is_remote_uri(answer):
+        return answer
+    return str(Path(answer).expanduser().resolve())
+
+
+def _ask_client_schema() -> str | None:
     schemas = _list_local_schemas()
     choices = [str(p.name) for p in schemas] + [_SCHEMA_CUSTOM, _SCHEMA_SKIP]
     selection = questionary.select(
@@ -150,12 +176,8 @@ def _ask_client_schema() -> Path | None:
     if selection == _SCHEMA_SKIP:
         return None
     if selection == _SCHEMA_CUSTOM:
-        custom = questionary.path(
-            "Path to schema JSON:",
-            validate=lambda v: Path(v).expanduser().is_file() or "File not found.",
-        ).unsafe_ask()
-        return Path(custom).expanduser().resolve()
-    return next(p for p in schemas if p.name == selection)
+        return ask_schema_uri()
+    return str(next(p for p in schemas if p.name == selection))
 
 
 def _disambiguate_filenames(keys: list[str]) -> dict[str, str]:
@@ -343,14 +365,15 @@ def _generate(
     data_type: DataTypeEnum,
     output_filename: str,
     client_sidecar: str | None,
-    client_schema: Path | None,
+    client_schema: str | None,
     full: bool = False,
+    local_copy: bool = False,
 ) -> str:
     logger.info(
         f"Starting sidecar CSV generation — directory={directory!r} "
         f"data_type={data_type} output={output_filename!r} "
         f"client_sidecar={client_sidecar!r} client_schema={client_schema!r} "
-        f"full={full}"
+        f"full={full} local_copy={local_copy}"
     )
 
     if data_type == DataTypeEnum.vector:
@@ -436,26 +459,21 @@ def _generate(
         f"Sidecar DataFrame: {len(df)} row(s) (including DEFAULT), {len(df.columns)} column(s)."
     )
 
+    local_copy_path: Path | None = None
     with tempfile.TemporaryDirectory() as tmp_dir:
         local_csv = Path(tmp_dir) / output_filename
         df.to_csv(local_csv, index=False)
         logger.info(f"Writing sidecar CSV to {backend.display_root}/{output_filename}")
         sidecar_path = backend.write_output(output_filename, local_csv)
+        if local_copy:
+            local_copy_path = Path.cwd() / output_filename
+            shutil.copy2(local_csv, local_copy_path)
 
     logger.info(f"Sidecar CSV written: {sidecar_path}")
-
-    # Best-effort pointer file — failures only warn.
-    pointer_dir = SIDECAR_PATH_OUTPUT_DIR or Path.cwd()
-    pointer_path = pointer_dir / "sidecar_csv_path"
-    try:
-        pointer_dir.mkdir(parents=True, exist_ok=True)
-        pointer_path.write_text(sidecar_path)
-        logger.info(f"Wrote sidecar path pointer to {pointer_path}")
-    except Exception:
-        logger.warning(
-            f"Could not write sidecar path pointer to {pointer_path}. "
-            f"sidecar_csv_path={sidecar_path}"
-        )
+    click.secho(f"\nSidecar written to: {sidecar_path}", fg="green", bold=True, err=True)
+    if local_copy_path is not None:
+        logger.info(f"Local copy written to: {local_copy_path}")
+        click.secho(f"Local copy at: {local_copy_path}", fg="green", bold=True, err=True)
 
     return sidecar_path
 
@@ -465,9 +483,10 @@ def _format_replay_command(
     data_type: DataTypeEnum,
     output_filename: str,
     client_sidecar: str | None,
-    client_schema: Path | None,
+    client_schema: str | None,
     full: bool,
     verbosity: "VerbosityChoice",
+    local_copy: bool,
 ) -> str:
     parts = ["am-tools"]
     if verbosity == "verbose":
@@ -487,9 +506,11 @@ def _format_replay_command(
     if client_sidecar:
         parts += ["--client-sidecar", shlex.quote(client_sidecar)]
     if client_schema is not None:
-        parts += ["--client-schema", shlex.quote(str(client_schema))]
+        parts += ["--client-schema", shlex.quote(client_schema)]
     if full:
         parts.append("--full")
+    if local_copy:
+        parts.append("--local-copy")
     return " ".join(parts)
 
 
@@ -507,15 +528,19 @@ def _run_interactive_wizard(
     data_type: DataTypeEnum | None,
     output_filename: str | None,
     client_sidecar: str | None,
-    client_schema: Path | None,
+    client_schema: str | None,
     full: bool,
     full_provided: bool,
     verbosity: "VerbosityChoice",
     verbosity_provided: bool,
-) -> tuple[str, DataTypeEnum, str | None, str | None, Path | None, bool, "VerbosityChoice"]:
+    local_copy: bool,
+    local_copy_provided: bool,
+) -> tuple[
+    str, DataTypeEnum, str | None, str | None, str | None, bool, "VerbosityChoice", bool
+]:
     """Prompt for any value the user didn't pass on the CLI. Returns the
     final (directory, data_type, output_filename, client_sidecar, client_schema, full,
-    verbosity).
+    verbosity, local_copy).
     """
     questionary.print(
         "Interactive mode — press Ctrl+C at any time to cancel.\n",
@@ -534,6 +559,10 @@ def _run_interactive_wizard(
             client_schema = _ask_client_schema()
         if not full_provided:
             full = _ask_full()
+        if not local_copy_provided and any(
+            is_remote_uri(p) for p in (directory, client_sidecar, client_schema)
+        ):
+            local_copy = _ask_local_copy()
         if not verbosity_provided:
             verbosity = _ask_verbosity()
     except KeyboardInterrupt:
@@ -546,6 +575,7 @@ def _run_interactive_wizard(
         client_schema,
         full,
         verbosity,
+        local_copy,
     )
 
 
@@ -584,16 +614,15 @@ def generate(
         ),
     ] = None,
     client_schema: Annotated[
-        Path | None,
+        str | None,
         typer.Option(
-            exists=True,
-            dir_okay=False,
-            readable=True,
             help=(
-                "Optional path to a client-supplied JSON schema describing how to "
-                "normalise the client sidecar CSV (headerless column names, "
-                "per-client renames). See schemas/example.json. If omitted, the "
-                "client CSV is used as-is with no renames."
+                "Optional client-supplied JSON schema describing how to "
+                "normalise the client sidecar CSV (positional column names, "
+                "per-client renames). Local path or object-store URI "
+                "(s3://bucket/key/schema.json, gs://..., az://...). See "
+                "schemas/column_names_example.json. If omitted, the client "
+                "CSV is used as-is with no renames."
             ),
         ),
     ] = None,
@@ -605,6 +634,19 @@ def generate(
                 "Include every metadata field extracted from each file. By "
                 "default, only the canonical/required fields for the data type "
                 "are kept (plus blank columns for any missing required fields)."
+            ),
+        ),
+    ] = False,
+    local_copy: Annotated[
+        bool,
+        typer.Option(
+            "--local-copy/--no-local-copy",
+            help=(
+                "Also write a copy of the sidecar to the current working "
+                "directory. Useful when the input directory or client sidecar "
+                "is in object storage and you want a local copy to inspect. "
+                "When unset, the wizard prompts only if a remote (s3://, "
+                "gs://, az://) path was given."
             ),
         ),
     ] = False,
@@ -623,6 +665,9 @@ def generate(
     wizard_ran = directory is None or data_type is None
     if wizard_ran:
         full_provided = ctx.get_parameter_source("full") == click.core.ParameterSource.COMMANDLINE
+        local_copy_provided = (
+            ctx.get_parameter_source("local_copy") == click.core.ParameterSource.COMMANDLINE
+        )
         (
             directory,
             data_type,
@@ -631,6 +676,7 @@ def generate(
             client_schema,
             full,
             verbosity_choice,
+            local_copy,
         ) = _run_interactive_wizard(
             directory,
             data_type,
@@ -641,6 +687,8 @@ def generate(
             full_provided,
             verbosity_choice,
             verbosity_provided,
+            local_copy,
+            local_copy_provided,
         )
         logging.getLogger().setLevel(
             level_for(
@@ -666,6 +714,7 @@ def generate(
                 client_schema=client_schema,
                 full=full,
                 verbosity=verbosity_choice,
+                local_copy=local_copy,
             )
         )
 
@@ -677,6 +726,7 @@ def generate(
             client_sidecar=client_sidecar,
             client_schema=client_schema,
             full=full,
+            local_copy=local_copy,
         )
     except Exception:
         logger.exception("Failed to generate sidecar CSV")

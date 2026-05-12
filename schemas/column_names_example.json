@@ -1,5 +1,5 @@
 {
-  "headerless_columns": [
+  "column_names": [
     "Filename",
     "CreateDate",
     "GPSAltitude",
@@ -8,6 +8,5 @@
     "Pitch",
     "Roll",
     "Heading"
-  ],
-  "column_renames": {}
+  ]
 }
