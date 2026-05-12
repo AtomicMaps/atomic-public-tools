@@ -22,6 +22,30 @@ am-tools --help
 
 > Note: `amtools` without the dash also works.
 
+### `am-tools sidecar`
+This command is used to generate a valid sidecar for your data. It is important to note that data will only need a sidecar if the files are missing metadata for some reason but you are still welcome to use this command to validate your data. If the data is missing metadata, warnings will show when runing this command.
+
+The primary use of `am-tools sidecar generate` is to format a client-provided sidecar into the spec that Atomic Flow needs for processing. When you run it, it will prompt you for some information about your sidecar.
+
+- Directory
+    - Where the files are that you want to build a sidecar for. This file can be local or on s3 or some other web object store. For S3, pass the whole s3 path. If the folder has subfolders, all files in the subfolders will also have the sidecar generated for them.
+- Data Type
+    - What type of data are you building a sidecar for? Different data types have different required columns and this handles that. Note: You can only generate a sidecar for one data type at at time. If you have multiple image types in the same folder (oriented images from a drone and spherical images in the same folder for example), the sidecar generation will fail.
+- Output Filename
+    - Waht would you like the sidecar to be named?
+- Client-Supplied Sidecar
+    - If you have your own sidecar data you want to merge in, link to it here. Without providing this information, the generated sidecar will just be made of the metadata already in the files. Sidecars made without client-supplied sidecars merged in are not required for processing because Atomic Flow uses very similar logic to get the file metadata automatically.
+- Client schema
+    - If the client sidecar has no header or needs columns to be renamed, you can provide the schema to do that here. See below for more information on how to format the schema. By default it will look in the `./schemas` folder but you can provide a link to any file or to s3. 
+- Include fields?
+    - By default it only includes sidecar for required fields. However, you can manually have it include all of the fields if you want to see a complete list of metadata fields for your files. This is mostly used for debugging.
+- Verbosity
+    - How much do you want it to talk while doing the work?
+
+After completing the interactive portion, it will show you in blue text a full command you can copy and paste to run it again without having to do the interactive wizard section. 
+
+After the sidecar has been generated, it will tell you where it put the file and it lints the file automatically. Speaking of linting, if you want to lint things manually, there is a command for that.
+
 ### `am-tools lint`
 There are two subcommands in `am-tools lint`:
 
@@ -58,26 +82,70 @@ For `column_name_mapping`, it will look for columns with names on the left side 
 After running `am-tools lint schema`, if any errors are detected, it will tell you how to fix them. This is just a quick check and might not catch errors until we run it with the sidecar. Thankfully, you can lint a sidecar as well.
 
 #### Linting a sidecar
+The command `am-tools lint sidecar` can lint both the client provided sidecar as well as the generated sidecar that `am-tools sidecar generate` builds. The first thing the linter wil ask you after a link to the sidecar is if the sidecar is generated or not. For linting a client provided sidecar, it will skip certain checks because it assumes that the files will have metadata that will be combined with the client sidecar. 
 
-
-### `am-tools sidecar`
-
+For linting the generated sidecar, it will ask for data type. This is used to make sure it has all of the required columns for that data type. There are some basic checks for required fields to make sure the values make sense. If any fields fail this test, the script will tell you possible fixes.
 
 ## Project layout
 
 ```
 src/atomic_tools/
 ├── cli.py              # root Typer app
-├── commands/           # one module per subcommand group
-├── schemas/            # Pydantic models for the canonical metadata shape
-├── formatters/         # per-format normalizers (json/csv/excel)
-└── io/                 # file readers
+├── client_sidecar.py   # load + clean + merge a client-supplied sidecar CSV
+├── commands/           # one module per subcommand group (lint, sidecar)
+├── io/                 # storage backend abstraction (local + s3/gs/az)
+├── utils/              # helpers: exiftool/pdal extractors, object-store I/O
+└── validators/         # schema/sidecar/value validators + lint reports
+schemas/                # example client schema JSONs
+example-fake-data/      # sample images + sidecars for trying the tool
 tests/                  # pytest suite
 ```
 
-## Development
+## In Depth Spec for Sidecars
+`am-tools sidecar generate` produces a sidecar that follows this spec automatically. The details below are mainly useful if you're hand-writing a client sidecar or debugging a generated one.
 
-```bash
-pytest
-ruff check src tests
-```
+### Layout
+
+1. **The first column must be `Filename`.** Each row identifies the file it applies to by basename (e.g. `IMG_001.jpg`). If two files in the batch share a basename, use a path with enough parent directories to disambiguate (`subfolderA/IMG_001.jpg` vs `subfolderB/IMG_001.jpg`).
+2. **The first row after the header must be `DEFAULT`.** Values placed in this row apply to every file that doesn't have its own row or has an empty cell for that column. Resolution order, highest to lowest: value extracted from the file's own metadata → per-file row value → `DEFAULT` row value.
+3. **Column names are case-insensitive but otherwise exact.** Whitespace, punctuation, and spelling all matter (`GPS Latitude` is not `GPSLatitude`).
+4. **Cells may be left blank.** A blank cell means "fall back to the next source" per the resolution order above.
+
+### Required columns by data type
+
+Each data type requires one column from each row below (the canonical name is shown; accepted aliases are listed beneath):
+
+| Data type | Required canonical columns |
+|---|---|
+| `ortho_image` | `Filename`, `GPSLatitude`, `GPSLongitude`, `GPSAltitude`, `DateTimeOriginal` |
+| `oriented_image` | `Filename`, `GPSLatitude`, `GPSLongitude`, `GPSAltitude`, `CreateDate`, `Pitch`, `Heading`, `Roll` |
+| `spherical_image` | `Filename`, `GPSLatitude`, `GPSLongitude`, `GPSAltitude`, `DateTimeOriginal`, `Pitch`, `Heading`, `Roll` |
+| `point_cloud` | `Filename`, `bounds.minx`, `bounds.maxx`, `bounds.miny`, `bounds.maxy`, `bounds.minz`, `bounds.maxz`, `num_points`, `creation_year`, `creation_doy` |
+| `video` | `Filename`, `CreateDate` |
+
+Common aliases that the linter accepts and rewrites to their canonical name:
+- **Dates** — `CreateDate`, `DateTimeOriginal`, `ModifyDate`, `GPSDateStamp` are interchangeable.
+- **Pitch** — `CameraPitch`, `CameraPitchDegree`, `GimbalPitchDegree`, `PosePitchDegrees`, `CameraOrientationNEDPitch`, `GPSIMUPitch`, `PitchAngle`.
+- **Heading** — `Yaw`, `CameraYaw`, `CameraYawDegree`, `GimbalYawDegree`, `PoseHeadingDegrees`, `CameraOrientationNEDYaw`, `GPSIMUYaw`, `YawAngle`, `GPSImgDirection`, `imgDirection`.
+- **Roll** — `CameraRoll`, `CameraRollDegree`, `GimbalRollDegree`, `PoseRollDegrees`, `CameraOrientationNEDRoll`, `GPSIMURoll`, `RollAngle`.
+
+See [`src/atomic_tools/validators/required_fields.py`](src/atomic_tools/validators/required_fields.py) for the authoritative list.
+
+### Value formats
+
+- **GPSLatitude** — decimal in `[-90, 90]` (e.g. `51.0444`) or EXIF DMS (`51 deg 2' 40.92" N`).
+- **GPSLongitude** — decimal in `[-180, 180]` or EXIF DMS.
+- **GPSAltitude** — any finite number. A trailing unit such as `" m Above Sea Level"` is tolerated; the leading number is what's checked.
+- **Dates** — ISO 8601 (`2024-06-15T10:30:00+00:00`, `2024-06-15 10:30:00`, or just `2024-06-15`) or EXIF (`2024:06:15 10:30:00`).
+- **Pitch / Roll** — decimal degrees in `[-180, 180]`.
+- **Heading** — decimal degrees in `[-360, 360]`.
+- **`bounds.*`** — any finite number. `bounds.min<axis>` must be ≤ `bounds.max<axis>` for each of x/y/z.
+- **`num_points`, `creation_year`, `creation_doy`** — finite numbers.
+
+### Normalising a non-conforming client sidecar
+
+If your CSV doesn't already match the spec, supply a schema JSON via `--client-schema`:
+- Use `column_names` if your CSV has no header row.
+- Use `column_name_mapping` to rename columns into their canonical names.
+
+See the *Sidecar Schemas* section above for the schema format. Run `am-tools lint sidecar <your.csv> --schema <schema.json> --datatype <type>` to check it before generating.
