@@ -39,6 +39,7 @@ from atomic_tools.utils.utils import (
 from atomic_tools.validators.required_fields import (
     REQUIRED_SIDECAR_FIELD_GROUPS as _REQUIRED_SIDECAR_FIELD_GROUPS,
 )
+from atomic_tools.validators.sidecar import lint_sidecar_file
 
 logger = logging.getLogger(__name__)
 
@@ -616,7 +617,7 @@ def generate(
         )
 
     try:
-        _generate(
+        sidecar_path = _generate(
             directory=directory,
             data_type=data_type,
             output_filename=output_filename,
@@ -627,3 +628,20 @@ def generate(
     except Exception:
         logger.exception("Failed to generate sidecar CSV")
         raise typer.Exit(code=1) from None
+
+    logger.info("Linting generated sidecar…")
+    try:
+        report = lint_sidecar_file(
+            sidecar_path,
+            final=True,
+            data_type=data_type,
+            schema_path=None,
+            input_files_path=directory,
+        )
+    except Exception:
+        logger.exception("Failed to lint generated sidecar")
+        raise typer.Exit(code=1) from None
+
+    typer.echo(report.render())
+    if report.has_errors():
+        raise typer.Exit(code=1)

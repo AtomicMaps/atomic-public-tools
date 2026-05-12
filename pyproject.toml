@@ -41,6 +41,7 @@ dev = [
 
 [project.scripts]
 am-tools = "atomic_tools.cli:app"
+amtools = "atomic_tools.cli:app"
 
 [project.urls]
 Homepage = "https://github.com/atomicmaps/atomic-public-tools"
