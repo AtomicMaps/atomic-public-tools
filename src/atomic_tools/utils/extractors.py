@@ -5,13 +5,97 @@ path (the storage backend is responsible for materialising remote files
 locally first) and a display filename used in log messages.
 """
 
+import datetime
 import json
 import logging
+import re
 import subprocess
+from typing import TYPE_CHECKING
 
 from atomic_tools.utils.utils import run_exiftool
 
+if TYPE_CHECKING:
+    from timezonefinder import TimezoneFinder
+
 logger = logging.getLogger(__name__)
+
+_DATE_FROM_PATH_PATTERN = re.compile(
+    r"(?:[^0-9]|^)(19[0-9]{2}|20[0-9]{2}|[0-9]{2})(?:\W|_)?(1[0-2]|0[1-9])"
+    r"(?:\W|_)?([012][0-9]|3[01])(?:\W|_)?(\d{6})?(?:\W|_|$)"
+)
+
+# Lazy singleton — TimezoneFinder() loads a binary KD-tree (~400ms) so we
+# build it on first use and reuse across files.
+_TIMEZONE_FINDER: "TimezoneFinder | None" = None
+
+
+def _timezone_finder() -> "TimezoneFinder":
+    global _TIMEZONE_FINDER
+    if _TIMEZONE_FINDER is None:
+        from timezonefinder import TimezoneFinder
+
+        _TIMEZONE_FINDER = TimezoneFinder()
+    return _TIMEZONE_FINDER
+
+
+def infer_date_from_filepath(
+    path: str, lat: float | None, lon: float | None
+) -> datetime.datetime | None:
+    """Extract an acquisition date from a file path as a fallback when EXIF/
+    client-sidecar metadata is missing one.
+
+    Looks for ``YYYYMMDD`` (or ``YYYY*MM*DD``, with optional ``HHMMSS``) in
+    ``path``. When `lat`/`lon` are given, the naive datetime is localised
+    using the file's timezone; otherwise UTC is assumed.
+    """
+    if not path:
+        logger.warning("Path is not set; cannot infer date.")
+        return None
+
+    match = _DATE_FROM_PATH_PATTERN.search(path)
+    if not match:
+        logger.warning(f"No date found in path: {path}")
+        return None
+
+    year = match.group(1)
+    if len(year) == 2:
+        year = "20" + year
+    month = match.group(2)
+    day = match.group(3)
+    date_str = year + month + day
+
+    if match.group(4):
+        date_str += match.group(4)
+        try:
+            naive = datetime.datetime.strptime(date_str, "%Y%m%d%H%M%S")
+        except ValueError:
+            logger.warning(f"Unable to parse date from path: {path}")
+            return None
+    else:
+        naive = datetime.datetime.strptime(date_str, "%Y%m%d")
+
+    if lat is None or lon is None:
+        logger.warning(
+            f"Latitude or longitude not provided (lat: {lat}, lon: {lon}); "
+            "assuming UTC for date parsing."
+        )
+        return naive.replace(tzinfo=datetime.timezone.utc)
+
+    import pytz
+
+    try:
+        tz_str = _timezone_finder().timezone_at(lng=lon, lat=lat)
+        if not tz_str:
+            logger.warning(
+                f"Could not determine timezone for lat: {lat}, lon: {lon}; defaulting to UTC."
+            )
+            return pytz.utc.localize(naive).astimezone(datetime.timezone.utc)
+        tz = pytz.timezone(tz_str)
+        return tz.localize(naive).astimezone(datetime.timezone.utc)
+    except Exception as e:
+        raise ValueError(
+            f"Error determining timezone for lat: {lat}, lon: {lon}: {e}"
+        ) from e
 
 # exiftool fields that describe the tool/file-system rather than the asset.
 # GPSPosition is dropped because exiftool always auto-derives it from

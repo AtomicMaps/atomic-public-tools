@@ -85,7 +85,7 @@ def _format_schema_replay_command(path: str, verbosity: VerbosityChoice) -> str:
 def _format_sidecar_replay_command(
     path: str,
     final: bool,
-    datatype: DataTypeEnum,
+    datatype: DataTypeEnum | None,
     schema: str | None,
     input_files: str | None,
     verbosity: VerbosityChoice,
@@ -96,9 +96,9 @@ def _format_sidecar_replay_command(
         "lint",
         "sidecar",
         shlex.quote(path),
-        "--datatype",
-        datatype.value,
     ]
+    if datatype is not None:
+        parts += ["--datatype", datatype.value]
     if final:
         parts.append("--final")
     if schema is not None:
@@ -214,15 +214,15 @@ def lint_sidecar_cmd(
     )
 
     # If the user didn't provide required info via arguments, ask interactively
-    wizard_ran = path is None or datatype is None
+    wizard_ran = path is None or (datatype is None and not final_provided)
     if wizard_ran:
         try:
             if path is None:
                 path = _ask_sidecar_path()
-            if datatype is None:
-                datatype = _ask_data_type()
             if not final_provided:
                 final = _ask_final()
+            if final and datatype is None:
+                datatype = _ask_data_type()
             if schema is None and not schema_provided:
                 schema = _ask_client_schema()
             if input_files is None and not input_files_provided:
@@ -240,8 +240,8 @@ def lint_sidecar_cmd(
 
     if not path:
         raise typer.BadParameter("Sidecar path is required.")
-    if datatype is None:
-        raise typer.BadParameter("--datatype is required.")
+    if final and datatype is None:
+        raise typer.BadParameter("--datatype is required when --final is set.")
 
     if wizard_ran:
         _echo_replay_command(

@@ -356,6 +356,14 @@ def find_sidecar_row(
     return candidates[fuzzy_match].iloc[0], default_row
 
 
+def has_value(value: Any) -> bool:
+    """Return True when `value` is non-empty and not the literal "nan"."""
+    if value is None:
+        return False
+    s = str(value).strip()
+    return bool(s) and s.lower() != "nan"
+
+
 def is_remote_uri(uri: str | None) -> bool:
     """Return True if `uri` has a remote scheme (s3, gs, az, …)."""
     if not uri:

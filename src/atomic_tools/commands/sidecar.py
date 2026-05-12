@@ -34,13 +34,16 @@ from atomic_tools.io.storage import from_directory
 from atomic_tools.utils.extractors import (
     extract_exif_metadata,
     extract_pdal_metadata,
+    infer_date_from_filepath,
 )
 from atomic_tools.utils.utils import (
     DATA_TYPE_INFO,
     DataTypeEnum,
     _split_path_components,
+    has_value,
     is_remote_uri,
 )
+from atomic_tools.validators.values import to_decimal_degree
 from atomic_tools.validators.required_fields import (
     REQUIRED_SIDECAR_FIELD_GROUPS as _REQUIRED_SIDECAR_FIELD_GROUPS,
 )
@@ -233,6 +236,43 @@ def _split_gps_position(meta: dict) -> dict:
     return out
 
 
+_DATE_ALIASES = {"CreateDate", "DateTimeOriginal", "ModifyDate", "GPSDateStamp"}
+
+
+def _date_group(required_field_groups: list[list[str]]) -> list[str] | None:
+    for group in required_field_groups:
+        if set(group) & _DATE_ALIASES:
+            return group
+    return None
+
+
+def _fill_missing_dates_from_filepath(
+    file_metadata: list[tuple[str, dict]],
+    required_field_groups: list[list[str]],
+    display_to_key: dict[str, str],
+) -> None:
+    """For each file with no date field after merge, infer one from its path."""
+    date_group = _date_group(required_field_groups)
+    if date_group is None:
+        return
+    canonical = date_group[0]
+    for display_label, meta in file_metadata:
+        if any(has_value(meta.get(field)) for field in date_group):
+            continue
+        original = display_to_key.get(display_label, display_label)
+        lat = to_decimal_degree(meta.get("GPSLatitude"))
+        lon = to_decimal_degree(meta.get("GPSLongitude"))
+        inferred = infer_date_from_filepath(original, lat, lon)
+        if inferred is None:
+            continue
+        formatted = inferred.isoformat()
+        meta[canonical] = formatted
+        logger.warning(
+            f"Inferred {canonical} for {display_label!r} from file path: "
+            f"{formatted}. No date was provided by EXIF or the client sidecar."
+        )
+
+
 def _warn_missing_required_fields(
     file_metadata: list[tuple[str, dict]],
     required_field_groups: list[list[str]],
@@ -247,17 +287,13 @@ def _warn_missing_required_fields(
     if not file_metadata or not required_field_groups:
         return
 
-    def _has_value(meta: dict, field: str) -> bool:
-        s = str(meta.get(field, "")).strip()
-        return bool(s) and s.lower() != "nan"
-
     missing_by_group: list[tuple[str, list[str], list[str]]] = []
     for group in required_field_groups:
         canonical = group[0]
         missing_files = [
             filename
             for filename, meta in file_metadata
-            if not any(_has_value(meta, field) for field in group)
+            if not any(has_value(meta.get(field)) for field in group)
         ]
         if missing_files:
             missing_by_group.append((canonical, list(group), missing_files))
@@ -405,6 +441,7 @@ def _generate(
         raise ValueError(f"Unhandled data type for metadata extraction: {data_type}")
 
     display_labels = _disambiguate_filenames(keys)
+    display_to_key = {v: k for k, v in display_labels.items()}
     n_disambiguated = sum(1 for k, v in display_labels.items() if v != Path(k).name)
     if n_disambiguated:
         logger.info(
@@ -447,8 +484,10 @@ def _generate(
         )
         merge_client_metadata(file_metadata, client_df)
 
-    logger.info(f"Building sidecar DataFrame for {len(file_metadata)} file(s).")
     required_field_groups = list(_REQUIRED_SIDECAR_FIELD_GROUPS.get(data_type, []))
+    _fill_missing_dates_from_filepath(file_metadata, required_field_groups, display_to_key)
+
+    logger.info(f"Building sidecar DataFrame for {len(file_metadata)} file(s).")
     _warn_missing_required_fields(file_metadata, required_field_groups)
     df = build_sidecar_df(
         file_metadata,

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections import defaultdict
 from pathlib import Path
-from typing import Any
 
 import pandas as pd
 
@@ -21,6 +20,7 @@ from atomic_tools.utils.utils import (
     DataTypeEnum,
     _is_path_tail_suffix,
     _split_path_components,
+    has_value,
     load_sidecar_df,
 )
 from atomic_tools.validators.report import LintReport
@@ -35,7 +35,7 @@ def lint_sidecar_file(
     sidecar_path: str,
     *,
     final: bool,
-    data_type: DataTypeEnum,
+    data_type: DataTypeEnum | None,
     schema_path: str | Path | None,
     input_files_path: str | None,
 ) -> LintReport:
@@ -48,7 +48,7 @@ def lint_sidecar_file(
         )
         schema_path = None
 
-    if data_type not in REQUIRED_SIDECAR_FIELD_GROUPS:
+    if data_type is not None and data_type not in REQUIRED_SIDECAR_FIELD_GROUPS:
         report.add_error(
             f"Unsupported data type for lint: {data_type}.",
             fix_hint=f"Allowed values: {sorted(REQUIRED_SIDECAR_FIELD_GROUPS.keys())}.",
@@ -95,7 +95,7 @@ def lint_sidecar_file(
         flat_groups = [g for groups in REQUIRED_SIDECAR_FIELD_GROUPS.values() for g in groups]
         df = _apply_global_aliases(df, build_global_alias_map(flat_groups))
 
-    required_groups = REQUIRED_SIDECAR_FIELD_GROUPS[data_type]
+    required_groups = REQUIRED_SIDECAR_FIELD_GROUPS[data_type] if data_type is not None else []
     columns = list(df.columns)
     columns_set = set(columns)
 
@@ -119,19 +119,26 @@ def lint_sidecar_file(
     _check_value_formats(df, columns, default_row_idx, report)
 
     if input_files_path:
-        _check_file_inventory(
-            df=df,
-            data_type=data_type,
-            input_files_path=input_files_path,
-            final=final,
-            default_satisfied=default_satisfied,
-            report=report,
-        )
+        if data_type is None:
+            report.add_info(
+                "Skipped input-files inventory check: --datatype is required to "
+                "know which file extensions to look at."
+            )
+        else:
+            _check_file_inventory(
+                df=df,
+                data_type=data_type,
+                input_files_path=input_files_path,
+                final=final,
+                default_satisfied=default_satisfied,
+                report=report,
+            )
 
     if not report.findings:
         mode = "final" if final else "client"
+        datatype_str = data_type.value if data_type is not None else "unspecified"
         report.add_info(
-            f"Sidecar OK ({mode} mode, datatype={data_type}, "
+            f"Sidecar OK ({mode} mode, datatype={datatype_str}, "
             f"{len(df)} row(s), {len(columns)} column(s))."
         )
 
@@ -146,13 +153,6 @@ def _find_default_row_index(df: pd.DataFrame) -> int | None:
     if matches.empty:
         return None
     return int(matches.index[0])
-
-
-def _has_value(value: Any) -> bool:
-    if value is None:
-        return False
-    s = str(value).strip()
-    return bool(s) and s.lower() != "nan"
 
 
 def _check_required_columns(
@@ -191,7 +191,7 @@ def _check_required_values(
             continue
 
         default_has = default_row is not None and any(
-            _has_value(default_row[f]) for f in present_fields
+            has_value(default_row[f]) for f in present_fields
         )
         default_satisfied[canonical] = default_has
 
@@ -200,7 +200,7 @@ def _check_required_values(
 
         missing_rows: list[tuple[int, str]] = []
         for idx, row in non_default.iterrows():
-            if not any(_has_value(row[f]) for f in present_fields):
+            if not any(has_value(row[f]) for f in present_fields):
                 fname = str(row[file_col]).strip() if file_col else ""
                 missing_rows.append((int(idx), fname))
 
@@ -273,7 +273,7 @@ def _check_bounds_consistency(
             continue
         for idx, row in df.iterrows():
             mn_raw, mx_raw = row[min_col], row[max_col]
-            if not (_has_value(mn_raw) and _has_value(mx_raw)):
+            if not (has_value(mn_raw) and has_value(mx_raw)):
                 continue
             try:
                 mn = float(str(mn_raw).strip())

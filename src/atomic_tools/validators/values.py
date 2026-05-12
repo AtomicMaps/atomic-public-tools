@@ -56,6 +56,19 @@ def _parse_dms(value: str) -> float | None:
     return sign * decimal
 
 
+def to_decimal_degree(value: object) -> float | None:
+    """Parse a coordinate value as decimal or EXIF DMS; returns None when unparseable."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    f = _try_float(s)
+    if f is None:
+        f = _parse_dms(s)
+    return f
+
+
 def _parse_lat_or_lon(value: str, *, lo: float, hi: float, label: str) -> ParseResult:
     s = value.strip()
     if not s:
