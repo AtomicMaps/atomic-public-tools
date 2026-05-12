@@ -1,9 +1,20 @@
+import logging
+
+import pytest
 from typer.testing import CliRunner
 
 from atomic_tools import __version__
 from atomic_tools.cli import app
 
 runner = CliRunner()
+
+
+@pytest.fixture
+def reset_root_logger():
+    root = logging.getLogger()
+    original_level = root.level
+    yield
+    root.setLevel(original_level)
 
 
 def test_root_help():
@@ -57,3 +68,32 @@ def test_version():
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0
     assert __version__ in result.stdout
+
+
+def test_root_help_lists_verbosity_flags():
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "--verbose" in result.stdout
+    assert "--silent" in result.stdout
+    assert "-v" in result.stdout
+    assert "-s" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("args", "expected_level"),
+    [
+        ([], logging.WARNING),
+        (["--verbose"], logging.INFO),
+        (["-v"], logging.INFO),
+        (["--silent"], logging.ERROR),
+        (["-s"], logging.ERROR),
+        (["--verbose", "--silent"], logging.INFO),
+        (["-v", "-s"], logging.INFO),
+    ],
+)
+def test_verbosity_flags_set_root_logger_level(args, expected_level, reset_root_logger):
+    # `lint schema --help` triggers the root callback (which configures logging)
+    # before short-circuiting on the subcommand's --help.
+    result = runner.invoke(app, [*args, "lint", "schema", "--help"])
+    assert result.exit_code == 0
+    assert logging.getLogger().level == expected_level

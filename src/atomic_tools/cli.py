@@ -1,10 +1,45 @@
-from typing import Annotated
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Annotated, Literal
 
 import typer
 
 from atomic_tools import __version__
 from atomic_tools.commands.lint import lint_app
 from atomic_tools.commands.sidecar import sidecar_app
+
+VerbosityChoice = Literal["default", "verbose", "silent"]
+
+_LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+
+
+@dataclass
+class Verbosity:
+    verbose: bool = False
+    silent: bool = False
+
+    @property
+    def level(self) -> int:
+        return level_for(verbose=self.verbose, silent=self.silent)
+
+    @property
+    def choice(self) -> VerbosityChoice:
+        if self.verbose:
+            return "verbose"
+        if self.silent:
+            return "silent"
+        return "default"
+
+
+def level_for(*, verbose: bool, silent: bool) -> int:
+    if verbose:
+        return logging.INFO
+    if silent:
+        return logging.ERROR
+    return logging.WARNING
+
 
 app = typer.Typer(
     name="am-tools",
@@ -25,6 +60,23 @@ def _version_callback(value: bool) -> None:
 
 @app.callback()
 def main(
+    ctx: typer.Context,
+    verbose: Annotated[
+        bool,
+        typer.Option(
+            "--verbose",
+            "-v",
+            help="Increase log verbosity to INFO. Wins over --silent if both are passed.",
+        ),
+    ] = False,
+    silent: Annotated[
+        bool,
+        typer.Option(
+            "--silent",
+            "-s",
+            help="Reduce log output to errors only.",
+        ),
+    ] = False,
     version: Annotated[
         bool,
         typer.Option(
@@ -36,3 +88,7 @@ def main(
     ] = False,
 ) -> None:
     """Root command — see subcommands below."""
+    verbosity = Verbosity(verbose=verbose, silent=silent)
+    logging.basicConfig(format=_LOG_FORMAT, level=verbosity.level)
+    logging.getLogger().setLevel(verbosity.level)
+    ctx.obj = verbosity

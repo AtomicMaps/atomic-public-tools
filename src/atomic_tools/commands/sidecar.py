@@ -15,11 +15,14 @@ import shlex
 import tempfile
 from collections import defaultdict
 from pathlib import Path
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 import click
 import questionary
 import typer
+
+if TYPE_CHECKING:
+    from atomic_tools.cli import VerbosityChoice
 
 from atomic_tools.client_sidecar import (
     build_global_alias_map,
@@ -103,6 +106,24 @@ def _ask_full() -> bool:
         "(No keeps only the canonical fields Flow needs)",
         default=False,
     ).unsafe_ask()
+
+
+_VERBOSITY_DEFAULT = "Default (warnings only)"
+_VERBOSITY_VERBOSE = "Verbose (info)"
+_VERBOSITY_SILENT = "Silent (errors only)"
+
+
+def _ask_verbosity() -> "VerbosityChoice":
+    selection = questionary.select(
+        "Logging verbosity:",
+        choices=[_VERBOSITY_DEFAULT, _VERBOSITY_VERBOSE, _VERBOSITY_SILENT],
+        default=_VERBOSITY_DEFAULT,
+    ).unsafe_ask()
+    if selection == _VERBOSITY_VERBOSE:
+        return "verbose"
+    if selection == _VERBOSITY_SILENT:
+        return "silent"
+    return "default"
 
 
 def _ask_client_sidecar() -> str | None:
@@ -446,9 +467,14 @@ def _format_replay_command(
     client_sidecar: str | None,
     client_schema: Path | None,
     full: bool,
+    verbosity: "VerbosityChoice",
 ) -> str:
-    parts = [
-        "am-tools",
+    parts = ["am-tools"]
+    if verbosity == "verbose":
+        parts.append("--verbose")
+    elif verbosity == "silent":
+        parts.append("--silent")
+    parts += [
         "sidecar",
         "generate",
         "--directory",
@@ -484,9 +510,12 @@ def _run_interactive_wizard(
     client_schema: Path | None,
     full: bool,
     full_provided: bool,
-) -> tuple[str, DataTypeEnum, str | None, str | None, Path | None, bool]:
+    verbosity: "VerbosityChoice",
+    verbosity_provided: bool,
+) -> tuple[str, DataTypeEnum, str | None, str | None, Path | None, bool, "VerbosityChoice"]:
     """Prompt for any value the user didn't pass on the CLI. Returns the
-    final (directory, data_type, output_filename, client_sidecar, client_schema, full).
+    final (directory, data_type, output_filename, client_sidecar, client_schema, full,
+    verbosity).
     """
     questionary.print(
         "Interactive mode — press Ctrl+C at any time to cancel.\n",
@@ -505,9 +534,19 @@ def _run_interactive_wizard(
             client_schema = _ask_client_schema()
         if not full_provided:
             full = _ask_full()
+        if not verbosity_provided:
+            verbosity = _ask_verbosity()
     except KeyboardInterrupt:
         raise typer.Exit(code=130) from None
-    return directory, data_type, output_filename, client_sidecar, client_schema, full
+    return (
+        directory,
+        data_type,
+        output_filename,
+        client_sidecar,
+        client_schema,
+        full,
+        verbosity,
+    )
 
 
 @sidecar_app.command()
@@ -575,25 +614,38 @@ def generate(
     With no flags, prompts interactively for each value. Any flag that is
     passed on the command line is used as-is and not prompted for.
     """
-    # Configure logging at command entry only — keeps the library importable
-    # without imposing a global logging config on consumers.
-    logging.basicConfig(
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        level=logging.INFO,
-    )
+    from atomic_tools.cli import Verbosity, level_for
+
+    verbosity_state: Verbosity = ctx.ensure_object(Verbosity)
+    verbosity_choice = verbosity_state.choice
+    verbosity_provided = verbosity_state.verbose or verbosity_state.silent
 
     wizard_ran = directory is None or data_type is None
     if wizard_ran:
         full_provided = ctx.get_parameter_source("full") == click.core.ParameterSource.COMMANDLINE
-        directory, data_type, output_filename, client_sidecar, client_schema, full = (
-            _run_interactive_wizard(
-                directory,
-                data_type,
-                output_filename,
-                client_sidecar,
-                client_schema,
-                full,
-                full_provided,
+        (
+            directory,
+            data_type,
+            output_filename,
+            client_sidecar,
+            client_schema,
+            full,
+            verbosity_choice,
+        ) = _run_interactive_wizard(
+            directory,
+            data_type,
+            output_filename,
+            client_sidecar,
+            client_schema,
+            full,
+            full_provided,
+            verbosity_choice,
+            verbosity_provided,
+        )
+        logging.getLogger().setLevel(
+            level_for(
+                verbose=verbosity_choice == "verbose",
+                silent=verbosity_choice == "silent",
             )
         )
 
@@ -613,6 +665,7 @@ def generate(
                 client_sidecar=client_sidecar,
                 client_schema=client_schema,
                 full=full,
+                verbosity=verbosity_choice,
             )
         )
 

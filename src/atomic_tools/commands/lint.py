@@ -5,16 +5,23 @@ from __future__ import annotations
 import logging
 import shlex
 from pathlib import Path
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 import click
 import questionary
 import typer
 
-from atomic_tools.commands.sidecar import _ask_client_schema, _ask_data_type
+from atomic_tools.commands.sidecar import (
+    _ask_client_schema,
+    _ask_data_type,
+    _ask_verbosity,
+)
 from atomic_tools.utils.utils import DataTypeEnum
 from atomic_tools.validators.schema import lint_schema_file
 from atomic_tools.validators.sidecar import lint_sidecar_file
+
+if TYPE_CHECKING:
+    from atomic_tools.cli import VerbosityChoice
 
 logger = logging.getLogger(__name__)
 
@@ -66,8 +73,17 @@ def _echo_replay_command(command: str) -> None:
     click.secho(f"  {command}\n", fg="bright_cyan", bold=True, err=True)
 
 
-def _format_schema_replay_command(path: Path) -> str:
-    return " ".join(["am-tools", "lint", "schema", shlex.quote(str(path))])
+def _verbosity_prefix(verbosity: VerbosityChoice) -> list[str]:
+    if verbosity == "verbose":
+        return ["--verbose"]
+    if verbosity == "silent":
+        return ["--silent"]
+    return []
+
+
+def _format_schema_replay_command(path: Path, verbosity: VerbosityChoice) -> str:
+    parts = ["am-tools", *_verbosity_prefix(verbosity), "lint", "schema", shlex.quote(str(path))]
+    return " ".join(parts)
 
 
 def _format_sidecar_replay_command(
@@ -76,9 +92,11 @@ def _format_sidecar_replay_command(
     datatype: DataTypeEnum,
     schema: Path | None,
     input_files: str | None,
+    verbosity: VerbosityChoice,
 ) -> str:
     parts = [
         "am-tools",
+        *_verbosity_prefix(verbosity),
         "lint",
         "sidecar",
         shlex.quote(path),
@@ -96,26 +114,36 @@ def _format_sidecar_replay_command(
 
 @lint_app.command("schema")
 def lint_schema_cmd(
+    ctx: typer.Context,
     path: Annotated[
         Path | None,
         typer.Argument(help="Path to a schema JSON file.", show_default=False),
     ] = None,
 ) -> None:
     """Validate a client schema JSON file."""
-    logging.basicConfig(
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        level=logging.WARNING,
-    )
+    from atomic_tools.cli import Verbosity, level_for
+
+    verbosity_state: Verbosity = ctx.ensure_object(Verbosity)
+    verbosity_choice = verbosity_state.choice
+    verbosity_provided = verbosity_state.verbose or verbosity_state.silent
 
     wizard_ran = path is None
     if path is None:
         try:
             path = _ask_schema_path()
+            if not verbosity_provided:
+                verbosity_choice = _ask_verbosity()
         except KeyboardInterrupt:
             raise typer.Exit(code=130) from None
+        logging.getLogger().setLevel(
+            level_for(
+                verbose=verbosity_choice == "verbose",
+                silent=verbosity_choice == "silent",
+            )
+        )
 
     if wizard_ran:
-        _echo_replay_command(_format_schema_replay_command(path))
+        _echo_replay_command(_format_schema_replay_command(path, verbosity_choice))
 
     report = lint_schema_file(path)
     typer.echo(report.render())
@@ -175,10 +203,11 @@ def lint_sidecar_cmd(
     ] = None,
 ) -> None:
     """Validate a sidecar CSV (client or generated)."""
-    logging.basicConfig(
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        level=logging.WARNING,
-    )
+    from atomic_tools.cli import Verbosity, level_for
+
+    verbosity_state: Verbosity = ctx.ensure_object(Verbosity)
+    verbosity_choice = verbosity_state.choice
+    verbosity_provided = verbosity_state.verbose or verbosity_state.silent
 
     # check to see if they provided the fields
     final_provided = ctx.get_parameter_source("final") == click.core.ParameterSource.COMMANDLINE
@@ -201,8 +230,16 @@ def lint_sidecar_cmd(
                 schema = _ask_client_schema()
             if input_files is None and not input_files_provided:
                 input_files = _ask_input_files()
+            if not verbosity_provided:
+                verbosity_choice = _ask_verbosity()
         except KeyboardInterrupt:
             raise typer.Exit(code=130) from None
+        logging.getLogger().setLevel(
+            level_for(
+                verbose=verbosity_choice == "verbose",
+                silent=verbosity_choice == "silent",
+            )
+        )
 
     if not path:
         raise typer.BadParameter("Sidecar path is required.")
@@ -217,6 +254,7 @@ def lint_sidecar_cmd(
                 datatype=datatype,
                 schema=schema,
                 input_files=input_files,
+                verbosity=verbosity_choice,
             )
         )
 
