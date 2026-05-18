@@ -32,7 +32,7 @@ The primary use of `am-tools sidecar generate` is to format a client-provided si
 - Data Type
     - What type of data are you building a sidecar for? Different data types have different required columns and this handles that. Note: You can only generate a sidecar for one data type at at time. If you have multiple image types in the same folder (oriented images from a drone and spherical images in the same folder for example), the sidecar generation will fail.
 - Output Filename
-    - Waht would you like the sidecar to be named?
+    - What would you like the sidecar to be named?
 - Client-Supplied Sidecar
     - If you have your own sidecar data you want to merge in, link to it here. Without providing this information, the generated sidecar will just be made of the metadata already in the files. Sidecars made without client-supplied sidecars merged in are not required for processing because Atomic Flow uses very similar logic to get the file metadata automatically.
 - Client schema
