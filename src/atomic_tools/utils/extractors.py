@@ -93,9 +93,8 @@ def infer_date_from_filepath(
         tz = pytz.timezone(tz_str)
         return tz.localize(naive).astimezone(datetime.timezone.utc)
     except Exception as e:
-        raise ValueError(
-            f"Error determining timezone for lat: {lat}, lon: {lon}: {e}"
-        ) from e
+        raise ValueError(f"Error determining timezone for lat: {lat}, lon: {lon}: {e}") from e
+
 
 # exiftool fields that describe the tool/file-system rather than the asset.
 # GPSPosition is dropped because exiftool always auto-derives it from

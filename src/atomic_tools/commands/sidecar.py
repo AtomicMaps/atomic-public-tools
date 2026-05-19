@@ -43,11 +43,11 @@ from atomic_tools.utils.utils import (
     has_value,
     is_remote_uri,
 )
-from atomic_tools.validators.values import to_decimal_degree
 from atomic_tools.validators.required_fields import (
     REQUIRED_SIDECAR_FIELD_GROUPS as _REQUIRED_SIDECAR_FIELD_GROUPS,
 )
 from atomic_tools.validators.sidecar import lint_sidecar_file
+from atomic_tools.validators.values import to_decimal_degree
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +63,7 @@ _IMAGE_DATA_TYPES = {
 }
 _VIDEO_DATA_TYPES = {DataTypeEnum.video}
 _POINT_CLOUD_DATA_TYPES = {DataTypeEnum.point_cloud}
+
 
 def _list_local_schemas() -> list[Path]:
     """Return sorted ``*.json`` files from ``./schemas/`` if that dir exists."""
@@ -158,11 +159,15 @@ def _validate_schema_input(v: str) -> bool | str:
 
 def ask_schema_uri(prompt: str = "Path or URI to schema JSON:") -> str:
     """Prompt for a schema path or URI; resolve local paths, pass URIs through."""
-    answer = questionary.text(
-        prompt,
-        instruction="(Local path or s3://… / gs://… / az://… URI)",
-        validate=_validate_schema_input,
-    ).unsafe_ask().strip()
+    answer = (
+        questionary.text(
+            prompt,
+            instruction="(Local path or s3://… / gs://… / az://… URI)",
+            validate=_validate_schema_input,
+        )
+        .unsafe_ask()
+        .strip()
+    )
     if is_remote_uri(answer):
         return answer
     return str(Path(answer).expanduser().resolve())
@@ -537,7 +542,7 @@ def _format_replay_command(
         "generate",
         "--directory",
         shlex.quote(directory),
-        "--data-type",
+        "--datatype",
         data_type.value,
         "--output-filename",
         shlex.quote(output_filename),
@@ -574,9 +579,7 @@ def _run_interactive_wizard(
     verbosity_provided: bool,
     local_copy: bool,
     local_copy_provided: bool,
-) -> tuple[
-    str, DataTypeEnum, str | None, str | None, str | None, bool, "VerbosityChoice", bool
-]:
+) -> tuple[str, DataTypeEnum, str | None, str | None, str | None, bool, "VerbosityChoice", bool]:
     """Prompt for any value the user didn't pass on the CLI. Returns the
     final (directory, data_type, output_filename, client_sidecar, client_schema, full,
     verbosity, local_copy).
@@ -633,6 +636,8 @@ def generate(
     data_type: Annotated[
         DataTypeEnum | None,
         typer.Option(
+            "--datatype",
+            "--data-type",
             help="Data type of the input data (e.g. 'oriented_image', 'point_cloud').",
             case_sensitive=False,
         ),
@@ -737,6 +742,13 @@ def generate(
         )
 
     output_filename = output_filename or "sidecar.csv"
+    basename = Path(output_filename).name
+    if basename != output_filename:
+        logger.warning(
+            f"--output-filename ignored directory portion of {output_filename!r}; "
+            f"writing as {basename!r} in the input directory."
+        )
+        output_filename = basename
 
     if not directory:
         raise typer.BadParameter("Directory is required.")

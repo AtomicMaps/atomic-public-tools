@@ -6,12 +6,25 @@ The main tool of this repo is the the library `am-tools`. It is designed to vali
 
 ## Install
 
+### Prerequisites
+
+`am-tools` shells out to two external tools for metadata extraction. Install them before running `pip install`:
+
+- **exiftool** — required for image and video metadata.
+    - macOS: `brew install exiftool`
+    - Ubuntu/Debian: `sudo apt install libimage-exiftool-perl`
+    - Windows: download from https://exiftool.org/
+- **pdal** — required only if you generate sidecars for point clouds.
+    - macOS / Linux: `conda install -c conda-forge pdal` (the tool currently looks for `/opt/conda/envs/pdal/bin/pdal`)
+
+### Python package
+
 Requires Python 3.10+. In terminal or command prompt, open this folder and run the following command.
 
 ```bash
 pip install -e ".[dev]"
 ```
-This will install both `am-tools` as well as all requirements for `am-tools`. 
+This will install both `am-tools` as well as all requirements for `am-tools`.
 
 ## Usage
 To use the library, open this folder in your terminal. The base command is:
@@ -36,13 +49,13 @@ The primary use of `am-tools sidecar generate` is to format a client-provided si
 - Client-Supplied Sidecar
     - If you have your own sidecar data you want to merge in, link to it here. Without providing this information, the generated sidecar will just be made of the metadata already in the files. Sidecars made without client-supplied sidecars merged in are not required for processing because Atomic Flow uses very similar logic to get the file metadata automatically.
 - Client schema
-    - If the client sidecar has no header or needs columns to be renamed, you can provide the schema to do that here. See below for more information on how to format the schema. By default it will look in the `./schemas` folder but you can provide a link to any file or to s3. 
+    - If the client sidecar has no header or needs columns to be renamed, you can provide the schema to do that here. See below for more information on how to format the schema. By default it will look in the `./schemas` folder but you can provide a link to any file or to s3.
 - Include fields?
     - By default it only includes sidecar for required fields. However, you can manually have it include all of the fields if you want to see a complete list of metadata fields for your files. This is mostly used for debugging.
 - Verbosity
     - How much do you want it to talk while doing the work?
 
-After completing the interactive portion, it will show you in blue text a full command you can copy and paste to run it again without having to do the interactive wizard section. 
+After completing the interactive portion, it will show you in blue text a full command you can copy and paste to run it again without having to do the interactive wizard section.
 
 After the sidecar has been generated, it will tell you where it put the file and it lints the file automatically. Speaking of linting, if you want to lint things manually, there is a command for that.
 
@@ -65,7 +78,7 @@ When you run `am-tools lint schema` it will prompt you to give a path to your sc
   ]
 }
 ```
-or 
+or
 ```json
 {
   "column_name_mapping": {
@@ -75,14 +88,14 @@ or
 }
 ```
 
-**If you include the `column_names` section, it will assume that there is no header row. If there is a header row and you give it a schema with this section, it will read your header as the first row of data and break everything.** 
+**If you include the `column_names` section, it will assume that there is no header row. If there is a header row and you give it a schema with this section, it will read your header as the first row of data and break everything.**
 
-For `column_name_mapping`, it will look for columns with names on the left side of the colon and rename them to the right side of the colon. You don't need to put in a mapping for every column, just the ones you want to rename. 
+For `column_name_mapping`, it will look for columns with names on the left side of the colon and rename them to the right side of the colon. You don't need to put in a mapping for every column, just the ones you want to rename.
 
 After running `am-tools lint schema`, if any errors are detected, it will tell you how to fix them. This is just a quick check and might not catch errors until we run it with the sidecar. Thankfully, you can lint a sidecar as well.
 
 #### Linting a sidecar
-The command `am-tools lint sidecar` can lint both the client provided sidecar as well as the generated sidecar that `am-tools sidecar generate` builds. The first thing the linter wil ask you after a link to the sidecar is if the sidecar is generated or not. For linting a client provided sidecar, it will skip certain checks because it assumes that the files will have metadata that will be combined with the client sidecar. 
+The command `am-tools lint sidecar` can lint both the client provided sidecar as well as the generated sidecar that `am-tools sidecar generate` builds. The first thing the linter wil ask you after a link to the sidecar is if the sidecar is generated or not. For linting a client provided sidecar, it will skip certain checks because it assumes that the files will have metadata that will be combined with the client sidecar.
 
 For linting the generated sidecar, it will ask for data type. This is used to make sure it has all of the required columns for that data type. There are some basic checks for required fields to make sure the values make sense. If any fields fail this test, the script will tell you possible fixes.
 

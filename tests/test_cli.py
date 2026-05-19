@@ -35,7 +35,7 @@ def test_sidecar_generate_help_lists_options():
     assert result.exit_code == 0
     for flag in (
         "--directory",
-        "--data-type",
+        "--datatype",
         "--output-filename",
         "--client-sidecar",
         "--client-schema",
