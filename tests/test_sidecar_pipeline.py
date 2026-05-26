@@ -15,8 +15,10 @@ from atomic_tools.client_sidecar import (
 )
 from atomic_tools.commands.sidecar import (
     _ALL_SIDECAR_FIELD_GROUPS,
+    _add_spatial_reference_column,
     _disambiguate_filenames,
     _fill_missing_dates_from_filepath,
+    _reproject_dataframe,
     _split_gps_position,
     _warn_missing_required_fields,
     build_sidecar_df,
@@ -106,6 +108,87 @@ def test_build_sidecar_df_full_includes_extra_fields():
     assert "ExtraField" in df.columns
     df_filtered = build_sidecar_df(_exif_like_metadata(), required_field_groups=ORIENTED_GROUPS)
     assert "ExtraField" not in df_filtered.columns
+
+
+def _projected_metadata() -> list[tuple[str, dict]]:
+    """Metadata whose lat/lon columns hold UTM zone 12N (EPSG:32612) X/Y."""
+    return [
+        (
+            "a.jpg",
+            {
+                "CreateDate": "2024:06:15 10:30:00",
+                "GPSAltitude": "1100 m Above Sea Level",
+                "GPSLongitude": "500000.0",  # X / easting (central meridian)
+                "GPSLatitude": "5650300.0",  # Y / northing
+                "GimbalPitchDegree": -90.0,
+                "GimbalYawDegree": 0.0,
+                "GimbalRollDegree": 0.0,
+            },
+        ),
+        (
+            "b.jpg",
+            {
+                "CreateDate": "2024:06:15 10:31:00",
+                # No altitude → 2D transform, altitude untouched.
+                "GPSLongitude": "501000.0",
+                "GPSLatitude": "5651000.0",
+                "GimbalPitchDegree": -85.0,
+                "GimbalYawDegree": 45.0,
+                "GimbalRollDegree": 1.5,
+            },
+        ),
+    ]
+
+
+def test_reproject_dataframe_image_coordinates():
+    df = build_sidecar_df(_projected_metadata(), required_field_groups=ORIENTED_GROUPS)
+    _reproject_dataframe(df, "EPSG:32612")
+
+    # DEFAULT row stays blank.
+    default = df[df["Filename"] == "DEFAULT"].iloc[0]
+    assert default["GPSLongitude"] == ""
+    assert default["GPSLatitude"] == ""
+
+    # File rows are now decimal degrees in WGS84 range, with a cleaned altitude.
+    row_a = df[df["Filename"] == "a.jpg"].iloc[0]
+    assert -180.0 <= float(row_a["GPSLongitude"]) <= 180.0
+    assert -90.0 <= float(row_a["GPSLatitude"]) <= 90.0
+    assert float(row_a["GPSLongitude"]) == pytest.approx(-111.0, abs=0.5)
+    assert 50.0 < float(row_a["GPSLatitude"]) < 52.0
+    assert float(row_a["GPSAltitude"]) == pytest.approx(1100.0, abs=5.0)
+
+    # Row without altitude: lon/lat reprojected, altitude left blank.
+    row_b = df[df["Filename"] == "b.jpg"].iloc[0]
+    assert -180.0 <= float(row_b["GPSLongitude"]) <= 180.0
+    assert row_b["GPSAltitude"] == ""
+
+
+def test_reproject_dataframe_skips_unparseable_rows():
+    metadata = _projected_metadata()
+    metadata[1][1]["GPSLongitude"] = ""  # blank → skipped
+    metadata[1][1]["GPSLatitude"] = ""
+    df = build_sidecar_df(metadata, required_field_groups=ORIENTED_GROUPS)
+    _reproject_dataframe(df, "EPSG:32612")
+
+    row_b = df[df["Filename"] == "b.jpg"].iloc[0]
+    assert row_b["GPSLongitude"] == ""
+    assert row_b["GPSLatitude"] == ""
+
+
+def test_add_spatial_reference_column_point_cloud():
+    pc_groups = _ALL_SIDECAR_FIELD_GROUPS[DataTypeEnum.point_cloud]
+    metadata = [
+        ("cloud.las", {"num_points": "1000", "bounds.minx": "0", "bounds.miny": "0"}),
+    ]
+    df = build_sidecar_df(metadata, required_field_groups=pc_groups)
+    _add_spatial_reference_column(df, "EPSG:2956")
+
+    assert "spatial_reference" in df.columns
+    default = df[df["Filename"] == "DEFAULT"].iloc[0]
+    assert default["spatial_reference"] == "EPSG:2956"
+    # File rows carry no spatial_reference value (it lives in DEFAULT).
+    file_row = df[df["Filename"] == "cloud.las"].iloc[0]
+    assert file_row["spatial_reference"] == ""
 
 
 def test_load_input_sidecar_headered():

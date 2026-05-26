@@ -44,6 +44,13 @@ def test_sidecar_generate_help_lists_options():
     assert "--bucket" not in result.stdout
 
 
+def test_sidecar_generate_help_lists_spatial_reference():
+    # Wide terminal so Rich doesn't truncate the long flag name.
+    result = runner.invoke(app, ["sidecar", "generate", "--help"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0
+    assert "--spatial-reference" in result.stdout
+
+
 def test_lint_help_lists_subcommands():
     result = runner.invoke(app, ["lint", "--help"])
     assert result.exit_code == 0

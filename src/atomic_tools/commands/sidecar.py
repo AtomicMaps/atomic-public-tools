@@ -32,6 +32,7 @@ from atomic_tools.client_sidecar import (
 )
 from atomic_tools.io.storage import from_directory
 from atomic_tools.utils.aws_errors import find_auth_error, print_help_block
+from atomic_tools.utils.coordinates import transform_coordinates
 from atomic_tools.utils.extractors import (
     extract_exif_metadata,
     extract_pdal_metadata,
@@ -51,7 +52,7 @@ from atomic_tools.validators.required_fields import (
     REQUIRED_SIDECAR_FIELD_GROUPS as _REQUIRED_SIDECAR_FIELD_GROUPS,
 )
 from atomic_tools.validators.sidecar import lint_sidecar_file
-from atomic_tools.validators.values import to_decimal_degree
+from atomic_tools.validators.values import parse_elevation, to_decimal_degree
 
 logger = logging.getLogger(__name__)
 
@@ -202,6 +203,19 @@ def _ask_client_schema() -> str | None:
     if selection == _SCHEMA_CUSTOM:
         return ask_schema_uri()
     return str(next(p for p in schemas if p.name == selection))
+
+
+def _ask_spatial_reference() -> str | None:
+    answer = questionary.text(
+        "Optional spatial reference (CRS) of the source coordinates:",
+        instruction=(
+            "(e.g. 'EPSG:32612' or '32612'. For images/videos lat/lon/altitude "
+            "are reprojected to EPSG:4326; for point clouds it's recorded as a "
+            "column. Press Enter to skip)"
+        ),
+    ).unsafe_ask()
+    answer = answer.strip()
+    return answer or None
 
 
 def _disambiguate_filenames(keys: list[str]) -> dict[str, str]:
@@ -417,6 +431,33 @@ def build_sidecar_df(
     return pd.concat([default_row, df], ignore_index=True)
 
 
+def _add_spatial_reference_column(df, spatial_reference: str) -> None:
+    """Add a 'spatial_reference' column, populated only on the DEFAULT row."""
+    df["spatial_reference"] = ""
+    df.loc[df["Filename"] == "DEFAULT", "spatial_reference"] = spatial_reference
+
+
+def _reproject_dataframe(df, in_srs: str) -> None:
+    """Reproject GPSLongitude/GPSLatitude (and GPSAltitude as Z) from `in_srs`
+    to EPSG:4326 in place, skipping the DEFAULT row and unparseable coordinates.
+    """
+    for idx in df.index:
+        if df.at[idx, "Filename"] == "DEFAULT":
+            continue
+        lon = to_decimal_degree(df.at[idx, "GPSLongitude"])
+        lat = to_decimal_degree(df.at[idx, "GPSLatitude"])
+        if lon is None or lat is None:
+            continue  # leave blank/unparseable rows untouched
+        z = parse_elevation(df.at[idx, "GPSAltitude"]) if "GPSAltitude" in df.columns else None
+        if z is None:
+            nx, ny = transform_coordinates(lon, lat, in_srs, 4326)
+        else:
+            nx, ny, nz = transform_coordinates(lon, lat, in_srs, 4326, z=z)
+            df.at[idx, "GPSAltitude"] = str(nz)
+        df.at[idx, "GPSLongitude"] = str(nx)
+        df.at[idx, "GPSLatitude"] = str(ny)
+
+
 def _generate(
     directory: str,
     data_type: DataTypeEnum,
@@ -425,13 +466,27 @@ def _generate(
     client_schema: str | None,
     full: bool = False,
     local_copy: bool = False,
+    spatial_reference: str | None = None,
 ) -> str:
     logger.info(
         f"Starting sidecar CSV generation — directory={directory!r} "
         f"data_type={data_type} output={output_filename!r} "
         f"client_sidecar={client_sidecar!r} client_schema={client_schema!r} "
-        f"full={full} local_copy={local_copy}"
+        f"full={full} local_copy={local_copy} spatial_reference={spatial_reference!r}"
     )
+
+    if spatial_reference:
+        # Fail fast on an unparseable CRS before doing any extraction work.
+        from pyproj import CRS
+        from pyproj.exceptions import CRSError
+
+        try:
+            CRS(spatial_reference)
+        except CRSError:
+            raise ValueError(
+                f"--spatial-reference value {spatial_reference!r} is not a valid "
+                "spatial reference (try e.g. 'EPSG:32612' or '32612')."
+            ) from None
 
     if data_type == DataTypeEnum.vector:
         raise NotImplementedError(
@@ -523,6 +578,16 @@ def _generate(
         f"Sidecar DataFrame: {len(df)} row(s) (including DEFAULT), {len(df.columns)} column(s)."
     )
 
+    if spatial_reference:
+        if is_point_cloud:
+            logger.info(
+                f"Recording spatial_reference={spatial_reference!r} in the DEFAULT row."
+            )
+            _add_spatial_reference_column(df, spatial_reference)
+        elif is_image_or_video:
+            logger.info(f"Reprojecting coordinates from {spatial_reference!r} to EPSG:4326.")
+            _reproject_dataframe(df, spatial_reference)
+
     local_copy_path: Path | None = None
     with tempfile.TemporaryDirectory() as tmp_dir:
         local_csv = Path(tmp_dir) / output_filename
@@ -551,6 +616,7 @@ def _format_replay_command(
     full: bool,
     verbosity: "VerbosityChoice",
     local_copy: bool,
+    spatial_reference: str | None,
 ) -> str:
     parts = ["am-tools"]
     if verbosity == "verbose":
@@ -575,6 +641,8 @@ def _format_replay_command(
         parts.append("--full")
     if local_copy:
         parts.append("--local-copy")
+    if spatial_reference:
+        parts += ["--spatial-reference", shlex.quote(spatial_reference)]
     return " ".join(parts)
 
 
@@ -599,10 +667,13 @@ def _run_interactive_wizard(
     verbosity_provided: bool,
     local_copy: bool,
     local_copy_provided: bool,
-) -> tuple[str, DataTypeEnum, str | None, str | None, str | None, bool, "VerbosityChoice", bool]:
+    spatial_reference: str | None,
+) -> tuple[
+    str, DataTypeEnum, str | None, str | None, str | None, bool, "VerbosityChoice", bool, str | None
+]:
     """Prompt for any value the user didn't pass on the CLI. Returns the
     final (directory, data_type, output_filename, client_sidecar, client_schema, full,
-    verbosity, local_copy).
+    verbosity, local_copy, spatial_reference).
     """
     questionary.print(
         "Interactive mode — press Ctrl+C at any time to cancel.\n",
@@ -619,6 +690,8 @@ def _run_interactive_wizard(
             client_sidecar = _ask_client_sidecar()
         if client_schema is None and client_sidecar is not None:
             client_schema = _ask_client_schema()
+        if spatial_reference is None:
+            spatial_reference = _ask_spatial_reference()
         if not full_provided:
             full = _ask_full()
         if not local_copy_provided and any(
@@ -638,6 +711,7 @@ def _run_interactive_wizard(
         full,
         verbosity,
         local_copy,
+        spatial_reference,
     )
 
 
@@ -719,6 +793,20 @@ def generate(
             ),
         ),
     ] = False,
+    spatial_reference: Annotated[
+        str | None,
+        typer.Option(
+            "--spatial-reference",
+            "--spatial_reference",
+            help=(
+                "CRS of the source coordinates (e.g. 'EPSG:32612' or '32612'). "
+                "For images/videos, lat/lon (and altitude) are treated as X/Y/Z "
+                "in this CRS and reprojected to EPSG:4326. For point clouds, a "
+                "'spatial_reference' column is added with this value in the "
+                "DEFAULT row."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Scan a directory, extract per-file metadata, and write a sidecar CSV.
 
@@ -746,6 +834,7 @@ def generate(
             full,
             verbosity_choice,
             local_copy,
+            spatial_reference,
         ) = _run_interactive_wizard(
             directory,
             data_type,
@@ -758,6 +847,7 @@ def generate(
             verbosity_provided,
             local_copy,
             local_copy_provided,
+            spatial_reference,
         )
         logging.getLogger().setLevel(
             level_for(
@@ -791,6 +881,7 @@ def generate(
                 full=full,
                 verbosity=verbosity_choice,
                 local_copy=local_copy,
+                spatial_reference=spatial_reference,
             )
         )
 
@@ -803,6 +894,7 @@ def generate(
             client_schema=client_schema,
             full=full,
             local_copy=local_copy,
+            spatial_reference=spatial_reference,
         )
     except Exception as e:
         _fail("Failed to generate sidecar CSV", e)

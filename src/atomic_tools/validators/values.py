@@ -69,6 +69,20 @@ def to_decimal_degree(value: object) -> float | None:
     return f
 
 
+def parse_elevation(value: object) -> float | None:
+    """Extract a clean elevation float from a string like '1000 m Above Sea Level'.
+
+    Returns None when the value is absent or has no leading number.
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    m = _LEADING_NUM_RE.match(s)
+    return float(m.group(1)) if m else None
+
+
 def _parse_lat_or_lon(value: str, *, lo: float, hi: float, label: str) -> ParseResult:
     s = value.strip()
     if not s:
