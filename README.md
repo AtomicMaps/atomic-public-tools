@@ -63,6 +63,8 @@ The primary use of `am-tools sidecar generate` is to format a client-provided si
     - You can link to a single CSV, or to a **directory**. When you give a directory, every CSV in a subfolder *below* that directory is merged into a single sidecar. The directory itself is deliberately **not** scanned — that's where the generated sidecar gets written, so scanning it would pick up the output. This lets you keep one client CSV per subfolder (for example, one per flight or per delivery) and merge them all in one run. All of the CSVs are assumed to share the same format/schema; if one of them has a different number of columns, the run stops and tells you exactly which file is the odd one out.
 - Client schema
     - If the client sidecar has no header or needs columns to be renamed, you can provide the schema to do that here. See below for more information on how to format the schema. By default it will look in the `./schemas` folder but you can provide a link to any file or to s3.
+- Spatial Reference
+    - If you know the spatial reference of your data and it isnt `EPSG:4326` (WGS:84), input it here to reproject your data to `EPSG:4326`. This is especially useful for pointclouds which will fail if we don't know the spatial reference.
 - Include fields?
     - By default it only includes sidecar for required fields. However, you can manually have it include all of the fields if you want to see a complete list of metadata fields for your files. This is mostly used for debugging.
 - Verbosity
