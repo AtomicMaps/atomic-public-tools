@@ -60,6 +60,7 @@ The primary use of `am-tools sidecar generate` is to format a client-provided si
     - What would you like the sidecar to be named?
 - Client-Supplied Sidecar
     - If you have your own sidecar data you want to merge in, link to it here. Without providing this information, the generated sidecar will just be made of the metadata already in the files. Sidecars made without client-supplied sidecars merged in are not required for processing because Atomic Flow uses very similar logic to get the file metadata automatically.
+    - You can link to a single CSV, or to a **directory**. When you give a directory, every CSV in a subfolder *below* that directory is merged into a single sidecar. The directory itself is deliberately **not** scanned — that's where the generated sidecar gets written, so scanning it would pick up the output. This lets you keep one client CSV per subfolder (for example, one per flight or per delivery) and merge them all in one run. All of the CSVs are assumed to share the same format/schema; if one of them has a different number of columns, the run stops and tells you exactly which file is the odd one out.
 - Client schema
     - If the client sidecar has no header or needs columns to be renamed, you can provide the schema to do that here. See below for more information on how to format the schema. By default it will look in the `./schemas` folder but you can provide a link to any file or to s3.
 - Include fields?

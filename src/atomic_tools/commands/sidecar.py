@@ -151,7 +151,10 @@ def _ask_verbosity() -> "VerbosityChoice":
 def _ask_client_sidecar() -> str | None:
     answer = questionary.text(
         "Optional client-supplied sidecar CSV to merge in:",
-        instruction="(Local path or s3:// URI; press Enter to skip)",
+        instruction=(
+            "(Local path or s3:// URI to a CSV, or a directory whose "
+            "subfolders hold the CSVs to merge; press Enter to skip)"
+        ),
     ).unsafe_ask()
     answer = answer.strip()
     return answer or None
@@ -667,10 +670,15 @@ def generate(
         str | None,
         typer.Option(
             help=(
-                "Optional path to a client-supplied sidecar CSV. May be an "
+                "Optional path to client-supplied sidecar data. May be an "
                 "object-store URI (s3://bucket/key/file.csv) or a local path. "
-                "Values are merged into the generated sidecar; client values "
-                "win on conflict."
+                "Point it at a single CSV, or at a directory: when it's a "
+                "directory, every CSV in a subdirectory BELOW it is merged into "
+                "one (the directory itself is not scanned, since the generated "
+                "sidecar is written there). All merged CSVs must share the same "
+                "schema (column count); a mismatch aborts and names the bad "
+                "file. Values are merged into the generated sidecar; client "
+                "values win on conflict."
             ),
         ),
     ] = None,

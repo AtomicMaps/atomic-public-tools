@@ -11,12 +11,22 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import pandas as pd
 
-from atomic_tools.utils.utils import find_sidecar_row, load_sidecar_df, read_text_uri
+from atomic_tools.utils.object_store import REMOTE_SCHEME_TO_STORE_TYPE, ObjectStore
+from atomic_tools.utils.utils import (
+    find_sidecar_row,
+    get_object_keys,
+    is_remote_uri,
+    load_sidecar_df,
+    read_text_uri,
+)
 
 logger = logging.getLogger(__name__)
+
+_CSV_SUFFIX = ".csv"
 
 
 # ---- Schema ----------------------------------------------------------------
@@ -190,12 +200,129 @@ def _validate_filename_column(df: pd.DataFrame) -> None:
 # ---- Top-level: load + clean ----------------------------------------------
 
 
+def _is_sidecar_directory(url: str) -> bool:
+    """Return True when `url` points at a directory of sidecars rather than a file.
+
+    For object-store URIs we can't cheaply stat the target, so a URI is treated
+    as a directory unless it ends in ``.csv``. Local paths are checked directly.
+    """
+    if is_remote_uri(url):
+        return not url.rstrip("/").lower().endswith(_CSV_SUFFIX)
+    return Path(url).expanduser().is_dir()
+
+
+def _list_sidecar_csvs_below(url: str) -> list[str]:
+    """Return loadable paths/URIs for every ``.csv`` in a subdirectory of `url`.
+
+    CSVs sitting directly in `url` are skipped: that top level is where the
+    generated sidecar is written, so it must never be picked up as an input.
+    Only files nested at least one directory deeper are returned, sorted.
+    """
+    if is_remote_uri(url):
+        parsed = urlparse(url)
+        scheme = parsed.scheme.lower()
+        store_type = REMOTE_SCHEME_TO_STORE_TYPE[scheme]
+        prefix = parsed.path.strip("/")
+        store = ObjectStore(store_type).from_url(f"{scheme}://{parsed.netloc}")
+        keys = get_object_keys(store, prefix, include=[_CSV_SUFFIX], exclude=[])
+        results: list[str] = []
+        for key in keys:
+            rel = key[len(prefix) :].lstrip("/") if prefix else key
+            if "/" not in rel:
+                continue  # directly under the top level — skip it
+            results.append(f"{scheme}://{parsed.netloc}/{key}")
+        return sorted(results)
+
+    root = Path(url).expanduser()
+    results = []
+    for path in root.rglob("*"):
+        if path.suffix.lower() != _CSV_SUFFIX or not path.is_file():
+            continue
+        if path.parent == root:
+            continue  # top-level CSV — that's where the output goes
+        results.append(str(path))
+    return sorted(results)
+
+
+def _load_single_sidecar(url: str, schema: ClientSchema) -> pd.DataFrame:
+    """Read one client sidecar CSV and apply positional naming/count validation."""
+    df = load_sidecar_df(url, column_names=schema.column_names or None)
+    return _apply_positional_names(df, schema)
+
+
+def _dedupe_default_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Collapse multiple ``DEFAULT`` rows (one per merged sidecar) to the first.
+
+    Merging several sidecars can produce several DEFAULT rows, which would
+    otherwise trip the duplicate-filename check. Keep the first and drop the rest.
+    """
+    if df.shape[1] == 0:
+        return df
+    file_col = df.columns[0]
+    is_default = df[file_col].fillna("").astype(str).str.strip() == "DEFAULT"
+    if is_default.sum() <= 1:
+        return df
+    logger.warning(
+        f"Found {int(is_default.sum())} DEFAULT rows across the merged sidecars; "
+        f"keeping the first and dropping the rest."
+    )
+    default_positions = list(df.index[is_default])
+    drop_idx = default_positions[1:]
+    return df.drop(index=drop_idx).reset_index(drop=True)
+
+
+def _load_and_merge_sidecar_dir(url: str, schema: ClientSchema) -> pd.DataFrame:
+    """Load every sidecar CSV below `url`, verify a shared schema, and concatenate.
+
+    The first CSV (sorted by path) defines the reference schema. Any sidecar
+    whose columns differ from it is reported by name and aborts the run.
+    """
+    csv_paths = _list_sidecar_csvs_below(url)
+    if not csv_paths:
+        raise SidecarMergeError(
+            f"No sidecar CSVs found in any subdirectory of {url!r}. Place each "
+            f"client sidecar in a subfolder — the top-level folder is reserved "
+            f"for the generated sidecar and is not scanned."
+        )
+    logger.info(f"Merging {len(csv_paths)} client sidecar CSV(s) from subdirectories of {url!r}.")
+
+    frames: list[pd.DataFrame] = []
+    reference_cols: list[str] | None = None
+    reference_path: str | None = None
+    for path in csv_paths:
+        try:
+            df = _load_single_sidecar(path, schema)
+        except SidecarMergeError as e:
+            raise SidecarMergeError(f"Client sidecar {path!r} is malformed: {e}") from e
+        cols = list(df.columns)
+        if reference_cols is None:
+            reference_cols, reference_path = cols, path
+        elif cols != reference_cols:
+            raise SidecarMergeError(
+                f"Client sidecar {path!r} has a different format than "
+                f"{reference_path!r}: expected {len(reference_cols)} column(s) "
+                f"{reference_cols}, but found {len(cols)} column(s) {cols}. All "
+                f"sidecars under a directory must share the same schema."
+            )
+        logger.info(f"  loaded {path!r}: {len(df)} row(s).")
+        frames.append(df)
+
+    combined = pd.concat(frames, ignore_index=True)
+    return _dedupe_default_rows(combined)
+
+
 def load_and_clean_client_sidecar(
     url: str,
     schema_path: str | Path | None,
     required_field_groups: dict[str, list[list[str]]],
 ) -> pd.DataFrame:
-    """Load the client sidecar at `url` and run the cleaning pipeline.
+    """Load the client sidecar(s) at `url` and run the cleaning pipeline.
+
+    `url` may point at a single CSV (local path or remote URI) or at a
+    directory. When it's a directory, every ``.csv`` in a *subdirectory* below
+    it is merged into one frame (the top level itself is not scanned, since the
+    generated sidecar is written there); all such CSVs must share the same
+    schema or the run aborts naming the offending file.
 
     `schema_path` points to a client-provided JSON schema (local path or
     remote URI); when ``None``, no positional column naming or per-client
@@ -209,8 +336,10 @@ def load_and_clean_client_sidecar(
         f"headerless={'yes' if schema.column_names else 'no'}, "
         f"renames={len(schema.column_name_mapping)})"
     )
-    df = load_sidecar_df(url, column_names=schema.column_names or None)
-    df = _apply_positional_names(df, schema)
+    if _is_sidecar_directory(url):
+        df = _load_and_merge_sidecar_dir(url, schema)
+    else:
+        df = _load_single_sidecar(url, schema)
     df = _apply_client_renames(df, schema)
     flat_groups = [g for groups in required_field_groups.values() for g in groups]
     df = _apply_global_aliases(df, build_global_alias_map(flat_groups))
