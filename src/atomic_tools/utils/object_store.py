@@ -11,6 +11,8 @@ from botocore.session import (  # noqa: F401  # used by ObjectStore.from_session
 from obstore.auth.boto3 import Boto3CredentialProvider
 from obstore.store import AzureStore, GCSStore, S3Store
 
+from atomic_tools.utils.aws_errors import S3CredentialsMissingError
+
 logger = logging.getLogger(__name__)
 
 # Instances returned by boto/obstore bindings; accepted by obstore.head/put/sign/etc.
@@ -187,6 +189,9 @@ class ObjectStore:
                 region_name=self.config.get("region_name"),
                 profile_name=self.config.get("profile_name"),
             )
+
+        if session.get_credentials() is None:
+            raise S3CredentialsMissingError(profile=session.profile_name)
 
         store = self._initialize_store("from_session", session=session, bucket=bucket)
         self.store = store

@@ -22,6 +22,12 @@ from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlparse
 
+from obstore.exceptions import PermissionDeniedError, UnauthenticatedError
+
+from atomic_tools.utils.aws_errors import (
+    S3PermissionDeniedError,
+    current_profile,
+)
 from atomic_tools.utils.object_store import (
     REMOTE_SCHEME_TO_STORE_TYPE,
     ObjectStore,
@@ -111,23 +117,53 @@ class ObjectStoreBackend(StorageBackend):
     def display_root(self) -> str:
         return f"{self._scheme}://{self._bucket}/{self._prefix}"
 
+    def _reraise_if_auth(self, error: BaseException, operation: str) -> None:
+        """Translate an obstore auth failure into ``S3PermissionDeniedError``.
+
+        `utils.py` wraps obstore errors as ``RuntimeError(...) from <obstore exc>``,
+        so we walk both the error itself and ``__cause__``.
+        """
+        candidates: list[BaseException] = [error]
+        if error.__cause__ is not None:
+            candidates.append(error.__cause__)
+        for candidate in candidates:
+            if isinstance(candidate, (PermissionDeniedError, UnauthenticatedError)):
+                raise S3PermissionDeniedError(
+                    profile=current_profile(),
+                    bucket=self._bucket,
+                    prefix=self._prefix,
+                    operation=operation,
+                ) from error
+
     def list_keys(self, include: Sequence[str], exclude: Sequence[str]) -> list[str]:
-        return get_object_keys(
-            store=self._store,
-            directory=self._prefix,
-            include=list(include),
-            exclude=list(exclude),
-        )
+        try:
+            return get_object_keys(
+                store=self._store,
+                directory=self._prefix,
+                include=list(include),
+                exclude=list(exclude),
+            )
+        except RuntimeError as e:
+            self._reraise_if_auth(e, operation="list")
+            raise
 
     @contextmanager
     def open_local(self, key: str) -> Iterator[str]:
         with tempfile.TemporaryDirectory() as tmp_dir:
-            local_path = download(self._store, key, tmp_dir)
+            try:
+                local_path = download(self._store, key, tmp_dir)
+            except RuntimeError as e:
+                self._reraise_if_auth(e, operation="download")
+                raise
             yield local_path
 
     def write_output(self, filename: str, source: Path) -> str:
         output_key = f"{self._prefix}/{filename}" if self._prefix else filename
-        upload(self._store, key=output_key, source=str(source))
+        try:
+            upload(self._store, key=output_key, source=str(source))
+        except RuntimeError as e:
+            self._reraise_if_auth(e, operation="upload")
+            raise
         return f"{self._scheme}://{self._bucket}/{output_key}"
 
 

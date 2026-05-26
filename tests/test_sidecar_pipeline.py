@@ -14,8 +14,9 @@ from atomic_tools.client_sidecar import (
     merge_client_metadata,
 )
 from atomic_tools.commands.sidecar import (
-    _REQUIRED_SIDECAR_FIELD_GROUPS,
+    _ALL_SIDECAR_FIELD_GROUPS,
     _disambiguate_filenames,
+    _fill_missing_dates_from_filepath,
     _split_gps_position,
     _warn_missing_required_fields,
     build_sidecar_df,
@@ -28,7 +29,7 @@ INPUT_SIDECAR = EXAMPLE_DIR / "input sidecar" / "input_sidecar.csv"
 HEADERLESS_SIDECAR = EXAMPLE_DIR / "input sidecar" / "headerless_sidecar.csv"
 EXAMPLE_SCHEMA = REPO_ROOT / "schemas" / "column_names_example.json"
 
-ORIENTED_GROUPS = _REQUIRED_SIDECAR_FIELD_GROUPS[DataTypeEnum.oriented_image]
+ORIENTED_GROUPS = _ALL_SIDECAR_FIELD_GROUPS[DataTypeEnum.oriented_image]
 
 
 def _exif_like_metadata() -> list[tuple[str, dict]]:
@@ -111,7 +112,7 @@ def test_load_input_sidecar_headered():
     df = load_and_clean_client_sidecar(
         url=str(INPUT_SIDECAR),
         schema_path=None,
-        required_field_groups=_REQUIRED_SIDECAR_FIELD_GROUPS,
+        required_field_groups=_ALL_SIDECAR_FIELD_GROUPS,
     )
     # 4 rows: DEFAULT + 3 file rows
     assert len(df) == 4
@@ -126,12 +127,12 @@ def test_headerless_sidecar_with_schema_matches_headered():
     headered = load_and_clean_client_sidecar(
         url=str(INPUT_SIDECAR),
         schema_path=None,
-        required_field_groups=_REQUIRED_SIDECAR_FIELD_GROUPS,
+        required_field_groups=_ALL_SIDECAR_FIELD_GROUPS,
     )
     headerless = load_and_clean_client_sidecar(
         url=str(HEADERLESS_SIDECAR),
         schema_path=EXAMPLE_SCHEMA,
-        required_field_groups=_REQUIRED_SIDECAR_FIELD_GROUPS,
+        required_field_groups=_ALL_SIDECAR_FIELD_GROUPS,
     )
 
     # Headerless input has no DEFAULT row, so 3 rows vs 4.
@@ -165,7 +166,7 @@ def test_merge_file_metadata_wins_on_disagreement(client_csv, schema, caplog):
     client_df = load_and_clean_client_sidecar(
         url=str(client_csv),
         schema_path=schema,
-        required_field_groups=_REQUIRED_SIDECAR_FIELD_GROUPS,
+        required_field_groups=_ALL_SIDECAR_FIELD_GROUPS,
     )
     with caplog.at_level("WARNING", logger="atomic_tools.client_sidecar"):
         merge_client_metadata(file_metadata, client_df)
@@ -180,7 +181,7 @@ def test_merge_client_empty_cell_preserves_exif():
     client_df = load_and_clean_client_sidecar(
         url=str(INPUT_SIDECAR),
         schema_path=None,
-        required_field_groups=_REQUIRED_SIDECAR_FIELD_GROUPS,
+        required_field_groups=_ALL_SIDECAR_FIELD_GROUPS,
     )
     merge_client_metadata(file_metadata, client_df)
     assert dict(file_metadata)["1.jpg"]["CreateDate"] == "2024:06:15 10:30:00"
@@ -197,15 +198,15 @@ def test_merge_default_row_fills_missing_and_summary_logged(caplog):
     client_df = load_and_clean_client_sidecar(
         url=str(INPUT_SIDECAR),
         schema_path=None,
-        required_field_groups=_REQUIRED_SIDECAR_FIELD_GROUPS,
+        required_field_groups=_ALL_SIDECAR_FIELD_GROUPS,
     )
     with caplog.at_level("INFO", logger="atomic_tools.client_sidecar"):
         merge_client_metadata(file_metadata, client_df)
 
     by_name = dict(file_metadata)
     # 1.jpg's specific row has an empty date cell, so DEFAULT row fills it.
-    # CreateDate gets canonicalized to DateTimeOriginal by the alias map.
-    assert by_name["1.jpg"]["DateTimeOriginal"] == "2024:07:15 10:30:00"
+    # The date aliases canonicalize to CreateDate.
+    assert by_name["1.jpg"]["CreateDate"] == "2024:07:15 10:30:00"
     # 1.jpg picks up its specific GPSAltitude.
     assert by_name["1.jpg"]["GPSAltitude"] == "1000 m Above Sea Level"
 
@@ -214,7 +215,7 @@ def test_merge_default_row_fills_missing_and_summary_logged(caplog):
         "",
     )
     assert "columns of metadata" in summary
-    assert "[DateTimeOriginal]" in summary
+    assert "[CreateDate]" in summary
     assert "Default value on 1/3 files" in summary
     assert "[GPSAltitude]" in summary
     assert "File-specific value added to all files" in summary
@@ -238,6 +239,27 @@ def test_warn_missing_required_fields(caplog, capsys):
     warning_records = [rec for rec in caplog.records if rec.name == "atomic_tools.commands.sidecar"]
     assert len(warning_records) == 1
     assert "client sidecar merge" in warning_records[0].message.lower()
+
+
+def test_fill_missing_dates_from_filepath_warns(caplog):
+    """When a file has no date after merge, generation infers one from the
+    filename and logs a warning saying so."""
+    file_metadata = [("img.jpg", {"GPSLatitude": "51.0", "GPSLongitude": "-114.0"})]
+    display_to_key = {"img.jpg": "trip/20240615_103000/img.jpg"}
+    with caplog.at_level("WARNING", logger="atomic_tools.commands.sidecar"):
+        _fill_missing_dates_from_filepath(file_metadata, ORIENTED_GROUPS, display_to_key)
+    meta = dict(file_metadata)["img.jpg"]
+    assert meta.get("CreateDate"), "expected a date inferred from the filename"
+    assert any("from file path" in rec.message for rec in caplog.records)
+
+
+def test_fill_missing_dates_skips_when_date_already_present():
+    file_metadata = [("img.jpg", {"CreateDate": "2024:06:15 10:30:00"})]
+    _fill_missing_dates_from_filepath(
+        file_metadata, ORIENTED_GROUPS, {"img.jpg": "20240101/img.jpg"}
+    )
+    # Existing date untouched — no filename inference overrides it.
+    assert dict(file_metadata)["img.jpg"]["CreateDate"] == "2024:06:15 10:30:00"
 
 
 def test_warn_missing_required_fields_silent_when_all_satisfied(caplog, capsys):
@@ -364,7 +386,7 @@ def test_merge_uses_path_suffix_match_for_disambiguated_labels(tmp_path):
     client_df = load_and_clean_client_sidecar(
         url=str(csv),
         schema_path=None,
-        required_field_groups=_REQUIRED_SIDECAR_FIELD_GROUPS,
+        required_field_groups=_ALL_SIDECAR_FIELD_GROUPS,
     )
     merge_client_metadata(file_metadata, client_df)
     by_label = dict(file_metadata)
@@ -385,7 +407,7 @@ def test_merge_basename_only_client_row_warns_on_ambiguity(tmp_path, caplog):
     client_df = load_and_clean_client_sidecar(
         url=str(csv),
         schema_path=None,
-        required_field_groups=_REQUIRED_SIDECAR_FIELD_GROUPS,
+        required_field_groups=_ALL_SIDECAR_FIELD_GROUPS,
     )
     with caplog.at_level("WARNING", logger="atomic_tools.client_sidecar"):
         merge_client_metadata(file_metadata, client_df)
@@ -404,7 +426,7 @@ def test_merge_exact_label_wins_over_basename_match(tmp_path):
     client_df = load_and_clean_client_sidecar(
         url=str(csv),
         schema_path=None,
-        required_field_groups=_REQUIRED_SIDECAR_FIELD_GROUPS,
+        required_field_groups=_ALL_SIDECAR_FIELD_GROUPS,
     )
     merge_client_metadata(file_metadata, client_df)
     assert dict(file_metadata)["a/1.jpg"]["GPSAltitude"] == "1100"
@@ -422,7 +444,7 @@ def test_merge_does_not_match_unrelated_paths(tmp_path):
     client_df = load_and_clean_client_sidecar(
         url=str(csv),
         schema_path=None,
-        required_field_groups=_REQUIRED_SIDECAR_FIELD_GROUPS,
+        required_field_groups=_ALL_SIDECAR_FIELD_GROUPS,
     )
     merge_client_metadata(file_metadata, client_df)
     assert "GPSAltitude" not in dict(file_metadata)["a/1.jpg"]

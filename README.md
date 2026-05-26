@@ -16,6 +16,7 @@ The main tool of this repo is the the library `am-tools`. It is designed to vali
     - Windows: download from https://exiftool.org/
 - **pdal** — required only if you generate sidecars for point clouds.
     - macOS / Linux: `conda install -c conda-forge pdal` (the tool currently looks for `/opt/conda/envs/pdal/bin/pdal`)
+- **AWS CLI** — required only if you point `--directory` (or a client sidecar/schema) at an `s3://` URI. Install from https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html and see the *Authenticating with AWS* section below.
 
 ### Python package
 
@@ -25,6 +26,17 @@ Requires Python 3.10+. In terminal or command prompt, open this folder and run t
 pip install -e ".[dev]"
 ```
 This will install both `am-tools` as well as all requirements for `am-tools`.
+
+## Authenticating with AWS
+
+When `--directory` (or `--client-sidecar`, `--client-schema`) is an `s3://` URI, `am-tools` uses your local AWS credentials via `boto3`. The recommended setup is AWS SSO through the AWS CLI:
+
+1. Install the AWS CLI: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html
+2. Configure an SSO profile and sign in. For a walkthrough of the one-time `~/.aws/config` setup, see: https://dev.to/slsbytheodo/understand-the-aws-sso-login-configuration-4am7
+3. Run `aws sso login --profile <your-profile>` whenever your session expires.
+4. Set `AWS_PROFILE=<your-profile>` (or rely on the `default` profile) before running `am-tools`.
+
+If credentials are missing or insufficient, `am-tools` prints a bright-red help block after the stack trace telling you exactly what to do next — whether that's installing the AWS CLI, running `aws sso login`, or asking your administrator to grant a specific S3 IAM action.
 
 ## Usage
 To use the library, open this folder in your terminal. The base command is:
@@ -126,15 +138,19 @@ tests/                  # pytest suite
 
 ### Required columns by data type
 
-Each data type requires one column from each row below (the canonical name is shown; accepted aliases are listed beneath):
+Each data type requires one column from each required row below (the canonical name is shown; accepted aliases are listed beneath). Optional columns are used when present but never block processing:
 
-| Data type | Required canonical columns |
-|---|---|
-| `ortho_image` | `Filename`, `GPSLatitude`, `GPSLongitude`, `GPSAltitude`, `DateTimeOriginal` |
-| `oriented_image` | `Filename`, `GPSLatitude`, `GPSLongitude`, `GPSAltitude`, `CreateDate`, `Pitch`, `Heading`, `Roll` |
-| `spherical_image` | `Filename`, `GPSLatitude`, `GPSLongitude`, `GPSAltitude`, `DateTimeOriginal`, `Pitch`, `Heading`, `Roll` |
-| `point_cloud` | `Filename`, `bounds.minx`, `bounds.maxx`, `bounds.miny`, `bounds.maxy`, `bounds.minz`, `bounds.maxz`, `num_points`, `creation_year`, `creation_doy` |
-| `video` | `Filename`, `CreateDate` |
+| Data type | Required canonical columns | Optional columns |
+|---|---|---|
+| `ortho_image` | `Filename`, `GPSLatitude`, `GPSLongitude`, `GPSAltitude` | `CreateDate` |
+| `oriented_image` | `Filename`, `GPSLatitude`, `GPSLongitude`, `GPSAltitude` | `CreateDate`, `Pitch`, `Heading`, `Roll` |
+| `spherical_image` | `Filename`, `GPSLatitude`, `GPSLongitude`, `GPSAltitude`, `Pitch`, `Heading`, `Roll` | `CreateDate` |
+| `point_cloud` | `Filename`, `bounds.minx`, `bounds.maxx`, `bounds.miny`, `bounds.maxy`, `bounds.minz`, `bounds.maxz`, `num_points`, `creation_year`, `creation_doy` | — |
+| `video` | `Filename` | `CreateDate` |
+
+Notes on optional columns:
+- **Orientation** — If an `oriented_image` is missing `Pitch`, `Heading`, or `Roll`, it will appear in Lens without orientation but still processes successfully.
+- **Dates** — `CreateDate` is optional: if omitted, Lens will try to find the acquisition date from the filename. Processing fails only if no date can be found in the metadata *or* the filename.
 
 Common aliases that the linter accepts and rewrites to their canonical name:
 - **Dates** — `CreateDate`, `DateTimeOriginal`, `ModifyDate`, `GPSDateStamp` are interchangeable.

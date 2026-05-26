@@ -53,7 +53,9 @@ def _lint_pointcloud(p):
 # ---- --final mode -------------------------------------------------------
 
 
-def test_final_missing_required_column_errors(tmp_path):
+def test_final_missing_orientation_columns_warns_not_errors(tmp_path):
+    """Pitch/Heading/Roll are optional for oriented_image: their absence warns
+    but still succeeds (the image renders in Lens without orientation)."""
     header = ["Filename", "CreateDate", "GPSAltitude", "GPSLatitude", "GPSLongitude"]
     rows = [
         ["DEFAULT", "", "", "", ""],
@@ -64,6 +66,48 @@ def test_final_missing_required_column_errors(tmp_path):
         str(p),
         final=True,
         data_type=DataTypeEnum.oriented_image,
+        schema_path=None,
+        input_files_path=None,
+    )
+    assert not report.has_errors(), [f.message for f in report.errors()]
+    warning_text = " ".join(f.message for f in report.warnings())
+    assert "Pitch" in warning_text
+    assert "Heading" in warning_text
+    assert "Roll" in warning_text
+
+
+def test_final_missing_date_column_errors(tmp_path):
+    """CreateDate is documented as optional but stays required in the final
+    sidecar: a missing date column still errors."""
+    header = ["Filename", "GPSAltitude", "GPSLatitude", "GPSLongitude", "Pitch", "Roll", "Heading"]
+    rows = [
+        ["DEFAULT", "", "", "", "", "", ""],
+        ["1.jpg", "1000", "51.0", "-114.0", "-90.0", "0.0", "0.0"],
+    ]
+    p = _write_csv(tmp_path, "s.csv", header, rows)
+    report = lint_sidecar_file(
+        str(p),
+        final=True,
+        data_type=DataTypeEnum.oriented_image,
+        schema_path=None,
+        input_files_path=None,
+    )
+    assert report.has_errors()
+    assert any("CreateDate" in f.message for f in report.errors())
+
+
+def test_spherical_missing_orientation_columns_still_errors(tmp_path):
+    """Orientation stays required for spherical_image (unchanged)."""
+    header = ["Filename", "CreateDate", "GPSAltitude", "GPSLatitude", "GPSLongitude"]
+    rows = [
+        ["DEFAULT", "", "", "", ""],
+        ["1.jpg", "2024:06:15 10:30:00", "1000", "51.0", "-114.0"],
+    ]
+    p = _write_csv(tmp_path, "s.csv", header, rows)
+    report = lint_sidecar_file(
+        str(p),
+        final=True,
+        data_type=DataTypeEnum.spherical_image,
         schema_path=None,
         input_files_path=None,
     )

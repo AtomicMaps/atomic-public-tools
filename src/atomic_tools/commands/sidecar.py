@@ -16,7 +16,7 @@ import shutil
 import tempfile
 from collections import defaultdict
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, NoReturn
 
 import click
 import questionary
@@ -31,6 +31,7 @@ from atomic_tools.client_sidecar import (
     merge_client_metadata,
 )
 from atomic_tools.io.storage import from_directory
+from atomic_tools.utils.aws_errors import find_auth_error, print_help_block
 from atomic_tools.utils.extractors import (
     extract_exif_metadata,
     extract_pdal_metadata,
@@ -42,6 +43,9 @@ from atomic_tools.utils.utils import (
     _split_path_components,
     has_value,
     is_remote_uri,
+)
+from atomic_tools.validators.required_fields import (
+    ALL_SIDECAR_FIELD_GROUPS as _ALL_SIDECAR_FIELD_GROUPS,
 )
 from atomic_tools.validators.required_fields import (
     REQUIRED_SIDECAR_FIELD_GROUPS as _REQUIRED_SIDECAR_FIELD_GROUPS,
@@ -63,6 +67,15 @@ _IMAGE_DATA_TYPES = {
 }
 _VIDEO_DATA_TYPES = {DataTypeEnum.video}
 _POINT_CLOUD_DATA_TYPES = {DataTypeEnum.point_cloud}
+
+
+def _fail(message: str, exc: Exception) -> NoReturn:
+    """Log a failure, surface AWS auth help if applicable, and exit non-zero."""
+    logger.exception(message)
+    auth_err = find_auth_error(exc)
+    if auth_err is not None:
+        print_help_block(auth_err)
+    raise typer.Exit(code=1) from None
 
 
 def _list_local_schemas() -> list[Path]:
@@ -485,18 +498,22 @@ def _generate(
         client_df = load_and_clean_client_sidecar(
             url=client_url,
             schema_path=client_schema,
-            required_field_groups=_REQUIRED_SIDECAR_FIELD_GROUPS,
+            required_field_groups=_ALL_SIDECAR_FIELD_GROUPS,
         )
         merge_client_metadata(file_metadata, client_df)
 
+    # All groups (required + optional) drive canonicalization, column selection,
+    # the DataFrame build, and date inference; only the loud "missing required
+    # metadata" warning is restricted to truly-required groups.
+    field_groups = _ALL_SIDECAR_FIELD_GROUPS.get(data_type, [])
     required_field_groups = list(_REQUIRED_SIDECAR_FIELD_GROUPS.get(data_type, []))
-    _fill_missing_dates_from_filepath(file_metadata, required_field_groups, display_to_key)
+    _fill_missing_dates_from_filepath(file_metadata, field_groups, display_to_key)
 
     logger.info(f"Building sidecar DataFrame for {len(file_metadata)} file(s).")
     _warn_missing_required_fields(file_metadata, required_field_groups)
     df = build_sidecar_df(
         file_metadata,
-        required_field_groups=required_field_groups,
+        required_field_groups=field_groups,
         full=full,
     )
     logger.info(
@@ -779,9 +796,8 @@ def generate(
             full=full,
             local_copy=local_copy,
         )
-    except Exception:
-        logger.exception("Failed to generate sidecar CSV")
-        raise typer.Exit(code=1) from None
+    except Exception as e:
+        _fail("Failed to generate sidecar CSV", e)
 
     logger.info("Linting generated sidecar…")
     try:
@@ -792,9 +808,8 @@ def generate(
             schema_path=None,
             input_files_path=directory,
         )
-    except Exception:
-        logger.exception("Failed to lint generated sidecar")
-        raise typer.Exit(code=1) from None
+    except Exception as e:
+        _fail("Failed to lint generated sidecar", e)
 
     typer.echo(report.render())
     if report.has_errors():

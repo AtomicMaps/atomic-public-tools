@@ -15,6 +15,7 @@ from atomic_tools.client_sidecar import (
     load_client_schema,
 )
 from atomic_tools.io.storage import from_directory
+from atomic_tools.utils.aws_errors import S3AuthError
 from atomic_tools.utils.utils import (
     DATA_TYPE_INFO,
     DataTypeEnum,
@@ -24,7 +25,11 @@ from atomic_tools.utils.utils import (
     load_sidecar_df,
 )
 from atomic_tools.validators.report import LintReport
-from atomic_tools.validators.required_fields import REQUIRED_SIDECAR_FIELD_GROUPS
+from atomic_tools.validators.required_fields import (
+    ALL_SIDECAR_FIELD_GROUPS,
+    OPTIONAL_SIDECAR_FIELD_GROUPS,
+    REQUIRED_SIDECAR_FIELD_GROUPS,
+)
 from atomic_tools.validators.values import VALIDATORS
 
 _MAX_LISTED_FILES = 20
@@ -48,10 +53,10 @@ def lint_sidecar_file(
         )
         schema_path = None
 
-    if data_type is not None and data_type not in REQUIRED_SIDECAR_FIELD_GROUPS:
+    if data_type is not None and data_type not in ALL_SIDECAR_FIELD_GROUPS:
         report.add_error(
             f"Unsupported data type for lint: {data_type}.",
-            fix_hint=f"Allowed values: {sorted(REQUIRED_SIDECAR_FIELD_GROUPS.keys())}.",
+            fix_hint=f"Allowed values: {sorted(ALL_SIDECAR_FIELD_GROUPS.keys())}.",
         )
         return report
 
@@ -92,10 +97,11 @@ def lint_sidecar_file(
                 fix_hint="Run `am-tools lint schema <path>` to diagnose the schema file.",
             )
             return report
-        flat_groups = [g for groups in REQUIRED_SIDECAR_FIELD_GROUPS.values() for g in groups]
+        flat_groups = [g for groups in ALL_SIDECAR_FIELD_GROUPS.values() for g in groups]
         df = _apply_global_aliases(df, build_global_alias_map(flat_groups))
 
-    required_groups = REQUIRED_SIDECAR_FIELD_GROUPS[data_type] if data_type is not None else []
+    required_groups = REQUIRED_SIDECAR_FIELD_GROUPS.get(data_type, []) if data_type else []
+    optional_groups = OPTIONAL_SIDECAR_FIELD_GROUPS.get(data_type, []) if data_type else []
     columns = list(df.columns)
     columns_set = set(columns)
 
@@ -109,6 +115,7 @@ def lint_sidecar_file(
     default_satisfied: dict[str, bool] = {}
     if final:
         _check_required_columns(required_groups, columns_set, report)
+        _check_optional_columns(optional_groups, columns_set, report)
         default_satisfied = _check_required_values(
             df, required_groups, columns_set, default_row_idx, report
         )
@@ -167,6 +174,30 @@ def _check_required_columns(
             report.add_error(
                 f"Required column for {canonical!r} is missing.",
                 fix_hint=f"Add a column named {canonical!r} (accepted aliases: {aliases}).",
+            )
+
+
+def _check_optional_columns(
+    optional_groups: list[list[str]],
+    columns_set: set[str],
+    report: LintReport,
+) -> None:
+    """Warn (don't error) when an optional column group is entirely absent.
+
+    Present-but-blank values in an optional column are allowed and not flagged;
+    any values that *are* present get format-checked by ``_check_value_formats``.
+    """
+    for group in optional_groups:
+        if not any(field in columns_set for field in group):
+            canonical = group[0]
+            aliases = ", ".join(group)
+            report.add_warning(
+                f"Optional column for {canonical!r} is not present.",
+                fix_hint=(
+                    f"Add {canonical!r} (accepted aliases: {aliases}) if available. "
+                    "Images missing orientation (Pitch/Heading/Roll) will appear in "
+                    "Lens without orientation but still process successfully."
+                ),
             )
 
 
@@ -306,6 +337,12 @@ def _check_file_inventory(
     try:
         backend = from_directory(input_files_path)
         keys = backend.list_keys(include=include, exclude=exclude)
+    except S3AuthError as e:
+        report.add_error(
+            f"Could not enumerate input files at {input_files_path}: {e}",
+            fix_hint=e.help_text(),
+        )
+        return
     except (FileNotFoundError, NotADirectoryError, ValueError, RuntimeError) as e:
         report.add_error(
             f"Could not enumerate input files at {input_files_path}: {e}",
