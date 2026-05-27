@@ -74,6 +74,39 @@ After completing the interactive portion, it will show you in blue text a full c
 
 After the sidecar has been generated, it will tell you where it put the file and it lints the file automatically. Speaking of linting, if you want to lint things manually, there is a command for that.
 
+#### Reformatting a local sidecar
+You can use `sidecar generate` to reformat a sidecar you already have locally into the Atomic Flow schema. The command scans the directory of data files and merges your CSV into the metadata it extracts, so point `--directory` at the folder that holds the actual files and `--client-sidecar` at your CSV. All flags below also accept `s3://`, `gs://`, and `az://` URIs.
+
+**Reformat a local sidecar to the AM schema.** Provide a `--client-schema` to rename your columns into their canonical names (see *Sidecar Schemas* below):
+
+```bash
+am-tools sidecar generate \
+  --directory ./data \
+  --datatype oriented_image \
+  --client-sidecar ./my_sidecar.csv \
+  --client-schema ./schemas/my_schema.json
+```
+
+**Reformat and reproject from an input EPSG.** If your sidecar coordinates are not already in `EPSG:4326` (WGS84), add `--spatial-reference`. For images/videos the lat/lon (and altitude) are treated as X/Y/Z in that CRS and reprojected to `EPSG:4326`; for point clouds the value is recorded in a `spatial_reference` column instead:
+
+```bash
+am-tools sidecar generate \
+  --directory ./data \
+  --datatype oriented_image \
+  --client-sidecar ./my_sidecar.csv \
+  --spatial-reference EPSG:32612
+```
+
+**Reformat and merge two local sidecars.** When `--client-sidecar` is a **directory** instead of a single file, every CSV in a subfolder *below* that directory is merged into one sidecar (the directory itself is not scanned, since that is where the generated sidecar gets written). Put each CSV in its own subfolder and point `--client-sidecar` at the parent — all of them must share the same column schema:
+
+```bash
+# sidecars/flight-a/a.csv  and  sidecars/flight-b/b.csv  are merged
+am-tools sidecar generate \
+  --directory ./data \
+  --datatype oriented_image \
+  --client-sidecar ./sidecars
+```
+
 ### `am-tools lint`
 There are two subcommands in `am-tools lint`:
 

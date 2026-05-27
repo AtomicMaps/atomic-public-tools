@@ -50,13 +50,11 @@ DATA_TYPE_INFO: dict = {
         "include": [".tif", ".tiff"],
         "exclude": ["_rgb.tif"],
         "sidecars": [".ecw"],
-        "footprint_feature_class": "footprints_ortho_image",
     },
     "spherical_image": {
         "include": [".jpg", ".jp2", "jpeg", ".png"],
         "exclude": ["PreviewImage.jpg", "ThumbnailImage.jpg", "annotation.json"],
         "sidecars": [],
-        "footprint_feature_class": "footprints_spherical_image",
     },
     "oriented_image": {
         "include": [".jpg", ".jp2", "jpeg", ".png"],
@@ -69,19 +67,16 @@ DATA_TYPE_INFO: dict = {
         ],
         "sidecars": [],
         "sub_types": ["rgb", "ir", "thermal"],
-        "footprint_feature_class": "footprints_oriented_imagery",
     },
     "point_cloud": {
         "include": [".las", ".laz", "zlas"],
         "exclude": [".copc.las", ".copc.laz"],
         "sidecars": [],
-        "footprint_feature_class": "footprints_point_cloud",
     },
     "full_motion_video": {
         "include": [".mp4", ".mov", ".ts", ".avi", ".tts"],
         "exclude": [],
         "sidecars": [".gpx", ".kmz", ".srt"],
-        "footprint_feature_class": "footprints_video",
     },
     "vector": {
         "include": [".gdb", ".gdb.zip", ".gpkg", ".geojson", ".shp"],

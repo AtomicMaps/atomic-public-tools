@@ -30,6 +30,17 @@ _DMS_RE = re.compile(
 
 _LEADING_NUM_RE = re.compile(r"^\s*([+-]?\d+(?:\.\d+)?)")
 
+_DATETIME_FORMATS = (
+    "%Y:%m:%d %H:%M:%S%z",
+    "%Y:%m:%d %H:%M:%S",
+    "%Y-%m-%d %H:%M:%S%z",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y:%m:%d",
+    "%Y-%m-%d",
+)
+
+_CURRENT_YEAR = datetime.now().year
+
 
 def _try_float(value: str) -> float | None:
     s = value.strip()
@@ -120,16 +131,6 @@ def parse_altitude(value: str) -> ParseResult:
     return True, None
 
 
-_DATETIME_FORMATS = (
-    "%Y:%m:%d %H:%M:%S%z",
-    "%Y:%m:%d %H:%M:%S",
-    "%Y-%m-%d %H:%M:%S%z",
-    "%Y-%m-%d %H:%M:%S",
-    "%Y:%m:%d",
-    "%Y-%m-%d",
-)
-
-
 def parse_datetime(value: str) -> ParseResult:
     s = value.strip()
     if not s:
@@ -182,9 +183,6 @@ def parse_bound(value: str) -> ParseResult:
     if not math.isfinite(f):
         return False, "bound is not finite"
     return True, None
-
-
-_CURRENT_YEAR = datetime.now().year
 
 
 def _int_range_parser(label: str, lo: int, hi: int) -> Validator:

@@ -89,6 +89,14 @@ class S3CredentialsMissingError(S3AuthError):
             "See the one-time AWS SSO setup walkthrough at:"
         )
         lines.append(f"  {_SSO_GUIDE_URL}")
+        lines.append("")
+        lines.append("Or, to authenticate with an access key directly:")
+        lines.append(f"  aws configure --profile {profile}")
+        lines.append(
+            "  This stores your AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY in "
+            f"~/.aws/credentials under the {profile!r} profile. You can also "
+            "export those two variables in your shell environment instead."
+        )
         return "\n".join(lines)
 
 
