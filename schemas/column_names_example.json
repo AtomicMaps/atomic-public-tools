@@ -1,0 +1,12 @@
+{
+  "column_names": [
+    "Filename",
+    "CreateDate",
+    "GPSAltitude",
+    "GPSLatitude",
+    "GPSLongitude",
+    "Pitch",
+    "Roll",
+    "Heading"
+  ]
+}
