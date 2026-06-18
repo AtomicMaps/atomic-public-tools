@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import click
 import numpy as np
 
 from atomic_tools.validators.constants import DEFAULT_ROW_NAME, MAX_LISTED_FILES
@@ -78,23 +79,85 @@ def _truncated_listing(items: list[str]) -> str:
     return ", ".join(shown) + tail
 
 
-def _render_histogram(values: np.ndarray, unit: str) -> str:
-    """Return a text bar histogram of ``values`` using ``numpy.histogram``."""
+def _sd_outliers(values: np.ndarray, *, high_only: bool) -> tuple[np.ndarray, float, float]:
+    """Return ``(mask, center, std)`` flagging files more than 2 SD from the median.
+
+    Single source of truth for the outlier threshold and stats, shared by the
+    histogram coloring, the per-histogram listing, and the warning. The center
+    is the median (see module docstring). ``high_only`` flags only the upper
+    tail (distance, which can't go negative); otherwise both tails are flagged.
+    ``mask`` is all-False when the values don't vary.
+    """
+    center = float(np.median(values))
+    std = float(values.std(ddof=1))
+    if std == 0.0:
+        return np.zeros(values.shape, dtype=bool), center, std
+    cutoff = _SD_THRESHOLD * std
+    deviations = values - center if high_only else np.abs(values - center)
+    return deviations > cutoff, center, std
+
+
+def _outlier_details(
+    names: list[str], values: np.ndarray, value_mask: np.ndarray, unit: str
+) -> list[str]:
+    """Return ``"'name' (value unit)"`` for each file flagged in ``value_mask``."""
     unit_suffix = f" {unit}" if unit else ""
+    return [
+        f"{names[i]!r} ({values[i]:,.1f}{unit_suffix})" for i in np.nonzero(value_mask)[0]
+    ]
+
+
+def _outlier_bin_mask(values: np.ndarray, edges: np.ndarray, value_mask: np.ndarray) -> np.ndarray:
+    """Return a per-bin bool mask of which bins hold any value flagged in ``value_mask``."""
+    bin_mask = np.zeros(len(edges) - 1, dtype=bool)
+    if value_mask.any():
+        # Map each outlier value to its bin; clip so the topmost edge (a closed
+        # bound in np.histogram) lands in the last bin rather than one past it.
+        bins = np.clip(np.digitize(values[value_mask], edges) - 1, 0, len(edges) - 2)
+        bin_mask[bins] = True
+    return bin_mask
+
+
+def _format_outlier_listing(details: list[str]) -> str:
+    """Return a ``\\n``-prefixed block listing the outlier ``details``, or "" if none."""
+    if not details:
+        return ""
+    lines = ["  outlier file(s) >2 SD from median:", *(f"    {d}" for d in details)]
+    return "\n" + "\n".join(lines)
+
+
+def _render_histogram(values: np.ndarray, unit: str, value_mask: np.ndarray) -> str:
+    """Return a text bar histogram of ``values`` using ``numpy.histogram``.
+
+    Bins containing files flagged in ``value_mask`` (>2 SD from the median) are
+    printed in red.
+    """
     if np.ptp(values) == 0:
         # All identical — a histogram would just be degenerate near-zero-width
         # bins. Report the single shared value instead.
+        unit_suffix = f" {unit}" if unit else ""
         return f"  all {values.size} files at {values[0]:,.1f}{unit_suffix}"
     counts, edges = np.histogram(values, bins=_HISTOGRAM_BINS)
+    outlier_bins = _outlier_bin_mask(values, edges, value_mask)
     peak = int(counts.max()) or 1
-    width = max(len(f"{e:,.0f}") for e in edges)
+    # Use the fewest decimals that keep every bound label distinct, so adjacent
+    # buckets don't print identical bounds after rounding.
+    precision = 0
+    while len({f"{e:,.{precision}f}" for e in edges}) < len(edges):
+        precision += 1
+    width = max(len(f"{e:,.{precision}f}") for e in edges)
     lines = []
     for i, count in enumerate(counts):
-        bar = "#" * round(_BAR_WIDTH * int(count) / peak)
-        lines.append(
-            f"  [{edges[i]:>{width},.0f} - {edges[i + 1]:>{width},.0f}] {unit}  "
-            f"{bar} {int(count)}"
+        bar = "█" * round(_BAR_WIDTH * int(count) / peak)
+        label = f"{bar} {int(count)}" if count else ""
+        line = (
+            f"  [{edges[i]:>{width},.{precision}f} - "
+            f"{edges[i + 1]:>{width},.{precision}f}] {unit}  "
+            f"{label}"
         )
+        if outlier_bins[i]:
+            line = click.style(line, fg="red")
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -174,19 +237,22 @@ def _analyze_coordinates(
         return
 
     distances = _haversine_miles(lat_arr, lon_arr, center_lat, center_lon)
+    outlier_mask, center, std = _sd_outliers(distances, high_only=True)
+    details = _outlier_details(names, distances, outlier_mask, "mi")
     report.add_info(
         f"Batch center (median): {center_lat:.5f}, {center_lon:.5f} "
         f"({len(names)} geolocated files). Distance from center (miles):\n"
-        + _render_histogram(distances, "mi")
+        + _render_histogram(distances, "mi", outlier_mask)
+        + _format_outlier_listing(details)
     )
 
     _flag_sd_outliers(
-        names=names,
-        values=distances,
+        details=details,
+        center=center,
+        std=std,
         report=report,
         label="distance from center",
         unit="mi",
-        high_only=True,
     )
 
 
@@ -211,54 +277,46 @@ def _analyze_altitude(
         return
 
     alt_arr = np.array(alts)
+    outlier_mask, center, std = _sd_outliers(alt_arr, high_only=False)
+    details = _outlier_details(names, alt_arr, outlier_mask, "")
     report.add_info(
         f"Altitude distribution across {len(names)} files (units as provided):\n"
-        + _render_histogram(alt_arr, "")
+        + _render_histogram(alt_arr, "", outlier_mask)
+        + _format_outlier_listing(details)
     )
 
     _flag_sd_outliers(
-        names=names,
-        values=alt_arr,
+        details=details,
+        center=center,
+        std=std,
         report=report,
         label="altitude",
         unit="",
-        high_only=False,
     )
 
 
 def _flag_sd_outliers(
     *,
-    names: list[str],
-    values: np.ndarray,
+    details: list[str],
+    center: float,
+    std: float,
     report: LintReport,
     label: str,
     unit: str,
-    high_only: bool,
 ) -> None:
-    """Warn about files more than 2 SD from the median of ``values``.
+    """Warn about the outlier ``details`` built by :func:`_outlier_details`.
 
-    The center is the median (not the mean) so a single wild value doesn't pull
-    the reference toward itself and mask the outlier we're trying to surface.
-    ``high_only`` flags only the upper tail (used for distance, which can't be
-    negative); otherwise both tails are flagged (used for altitude).
+    The same ``details`` feed the per-histogram listing and the red histogram
+    bins, so the warning, listing, and coloring all reference the same set.
     """
-    center = float(np.median(values))
-    std = float(values.std(ddof=1))
-    if std == 0.0:
-        return
-
-    cutoff = _SD_THRESHOLD * std
-    deviations = values - center if high_only else np.abs(values - center)
-    outlier_idx = np.nonzero(deviations > cutoff)[0]
-    if outlier_idx.size == 0:
+    if not details:
         return
 
     unit_suffix = f" {unit}" if unit else ""
-    detail = [f"{names[i]!r} ({values[i]:,.1f}{unit_suffix})" for i in outlier_idx]
     report.add_warning(
-        f"{outlier_idx.size} file(s) are more than 2 SD from the median {label} "
+        f"{len(details)} file(s) are more than 2 SD from the median {label} "
         f"(median {center:,.1f}{unit_suffix}, SD {std:,.1f}{unit_suffix}): "
-        + _truncated_listing(detail),
+        + _truncated_listing(details),
         fix_hint=(
             "Far outliers often indicate a malformed coordinate or altitude; double-check them."
         ),

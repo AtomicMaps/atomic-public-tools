@@ -13,6 +13,7 @@ Requires the following external binaries on PATH at runtime (NOT pip-installable
 import logging
 import shlex
 import shutil
+import sys
 import tempfile
 from collections import defaultdict
 from pathlib import Path
@@ -21,6 +22,7 @@ from typing import TYPE_CHECKING, Annotated, NoReturn
 import click
 import questionary
 import typer
+from tqdm import tqdm
 
 if TYPE_CHECKING:
     from atomic_tools.cli import VerbosityChoice
@@ -557,20 +559,32 @@ def _generate(
 
     file_metadata: list[tuple[str, dict]] = []
     empty_count = 0
+    tool = "EXIF" if is_image_or_video else "PDAL"
 
-    for i, key in enumerate(keys, 1):
-        display_label = display_labels[key]
-        tool = "EXIF" if is_image_or_video else "PDAL"
-        logger.info(f"[{i}/{total}] Extracting {tool}: {key}")
-        with backend.open_local(key) as local_path:
-            if is_image_or_video:
-                meta = extract_exif_metadata(local_path, filename=display_label)
-            else:
-                meta = extract_pdal_metadata(local_path, filename=display_label)
-        if not meta:
-            empty_count += 1
-            logger.warning(f"No {tool} metadata returned for {key}")
-        file_metadata.append((display_label, meta))
+    # Progress bar renders to stderr only when attached to a TTY; on a pipe or
+    # in a log file tqdm suppresses it (``disable=None``), so non-interactive
+    # runs stay clean. The "<looked-at>/<total>" count is shown by default; the
+    # postfix shows the file currently being processed.
+    with tqdm(
+        keys,
+        desc=f"Extracting {tool} metadata",
+        unit="file",
+        file=sys.stderr,
+        disable=None,
+    ) as progress_keys:
+        for i, key in enumerate(progress_keys, 1):
+            progress_keys.set_postfix_str(Path(key).name if key else "")
+            display_label = display_labels[key]
+            logger.info(f"[{i}/{total}] Extracting {tool}: {key}")
+            with backend.open_local(key) as local_path:
+                if is_image_or_video:
+                    meta = extract_exif_metadata(local_path, filename=display_label)
+                else:
+                    meta = extract_pdal_metadata(local_path, filename=display_label)
+            if not meta:
+                empty_count += 1
+                logger.warning(f"No {tool} metadata returned for {key}")
+            file_metadata.append((display_label, meta))
 
     if empty_count:
         logger.warning(

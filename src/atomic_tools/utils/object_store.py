@@ -31,6 +31,22 @@ REMOTE_SCHEME_TO_STORE_TYPE: dict[str, str] = {
 }
 
 
+def store_for_bucket(scheme: str, bucket: str) -> ObstoreBackend:
+    """Build an authenticated object store rooted at `bucket`.
+
+    For S3 this uses a boto3-backed session (``init_session``) so local AWS
+    profiles/env credentials are honored — matching the write path in
+    ``io/storage.py``. obstore's ``from_url`` attaches no credential provider,
+    so it falls back to obstore's native chain, which ends at the EC2 instance
+    metadata service (``169.254.169.254``) and hangs when run off-EC2.
+    """
+    store_type = REMOTE_SCHEME_TO_STORE_TYPE[scheme.lower()]
+    factory = ObjectStore(store_type)
+    if store_type == "s3":
+        return factory.init_session(bucket=bucket)
+    return factory.from_env(bucket=bucket)
+
+
 def normalize_bucket(bucket: str) -> str:
     """Strip the ``s3://`` scheme and any trailing slash from a bucket name."""
     if not bucket:
@@ -170,6 +186,31 @@ class ObjectStore:
         self._record_backend_init()
         return cast(S3Store, store)
 
+    def _resolve_bucket_region(self, session: "BotocoreSession", bucket: str) -> str | None:
+        """Determine the region a bucket lives in.
+
+        obstore defaults to ``us-east-1`` when no region is configured, which
+        produces an unfollowable region redirect (``BareRedirect``) for buckets
+        in other regions when the active profile has no region set. Asking S3
+        directly via ``get_bucket_location`` is authoritative and works
+        cross-region, so prefer it and fall back to the session's own region.
+        """
+        try:
+            location = session.client("s3").get_bucket_location(
+                Bucket=normalize_bucket(bucket)
+            )["LocationConstraint"]
+            # ``us-east-1`` is reported as an empty LocationConstraint.
+            return location or "us-east-1"
+        except Exception as e:  # noqa: BLE001 - best-effort; fall back below
+            logger.warning(
+                "Could not resolve region for bucket %r (%s); "
+                "falling back to session region %r",
+                bucket,
+                e,
+                session.region_name,
+            )
+            return session.region_name
+
     def init_session(self, bucket: str) -> S3Store:
         if not self.store_type or self.store_type != "s3":
             raise ValueError(
@@ -193,7 +234,12 @@ class ObjectStore:
         if session.get_credentials() is None:
             raise S3CredentialsMissingError(profile=session.profile_name)
 
-        store = self._initialize_store("from_session", session=session, bucket=bucket)
+        region = self.config.get("region_name") or self._resolve_bucket_region(session, bucket)
+        region_kwargs = {"region": region} if region else {}
+
+        store = self._initialize_store(
+            "from_session", session=session, bucket=bucket, **region_kwargs
+        )
         self.store = store
         self._record_backend_init()
         return cast(S3Store, store)

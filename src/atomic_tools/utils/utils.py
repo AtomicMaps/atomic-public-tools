@@ -35,8 +35,8 @@ from obstore.exceptions import (
 
 from atomic_tools.utils.object_store import (
     REMOTE_SCHEME_TO_STORE_TYPE,
-    ObjectStore,
     ObstoreBackend,
+    store_for_bucket,
 )
 
 logger = logging.getLogger(__name__)
@@ -372,8 +372,7 @@ def read_text_uri(uri: str, *, encoding: str = "utf-8") -> str:
     store_type = REMOTE_SCHEME_TO_STORE_TYPE.get(parsed.scheme.lower())
     if store_type:
         key = parsed.path.lstrip("/")
-        bucket_url = f"{parsed.scheme}://{parsed.netloc}"
-        store = ObjectStore(store_type).from_url(bucket_url)
+        store = store_for_bucket(parsed.scheme, parsed.netloc)
         with tempfile.TemporaryDirectory() as tmp_dir:
             downloaded_path = download(store, key, tmp_dir)
             return Path(downloaded_path).read_text(encoding=encoding)
@@ -404,11 +403,10 @@ def load_sidecar_df(
     store_type = REMOTE_SCHEME_TO_STORE_TYPE.get(parsed.scheme)
     if store_type:
         key = parsed.path.lstrip("/")
-        # obstore's from_url("s3://bucket/key/...") roots the store at
-        # bucket/key/..., which would prepend the key a second time on get.
-        # So root the store at the bucket and pass `key` separately.
-        bucket_url = f"{parsed.scheme}://{parsed.netloc}"
-        store = ObjectStore(store_type).from_url(bucket_url)
+        # Root the store at the bucket and pass `key` separately: obstore roots
+        # a store at whatever URL it's given, so a bucket+key URL would prepend
+        # the key a second time on get.
+        store = store_for_bucket(parsed.scheme, parsed.netloc)
         with tempfile.TemporaryDirectory() as tmp_dir:
             downloaded_path = download(store, key, tmp_dir)
             return pd.read_csv(downloaded_path, **read_kwargs)
@@ -438,6 +436,17 @@ def get_keys_and_metadata(store: ObstoreBackend, prefix: str) -> dict:
         raise RuntimeError(f"Failed to list keys with prefix {prefix}: {e}") from e
     except Exception as e:
         raise RuntimeError(f"Unexpected error during listing keys with prefix {prefix}: {e}") from e
+
+
+def _is_preview_image(key: str) -> bool:
+    """True if `key`'s filename stem ends with ``_PreviewImage`` (any extension).
+
+    Preview images are auxiliary renders that should never be treated as
+    primary assets, regardless of their file extension (e.g.
+    ``IMG_001_PreviewImage.jpg``, ``IMG_001_PreviewImage.png``).
+    """
+    stem = key.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    return stem.lower().endswith("_previewimage")
 
 
 def filter_keys(
@@ -474,6 +483,8 @@ def filter_keys(
         if ".gdb/" in kl:
             continue
         if not kl.endswith(inc):
+            continue
+        if _is_preview_image(kl):
             continue
         if excl and kl.endswith(excl):
             continue
