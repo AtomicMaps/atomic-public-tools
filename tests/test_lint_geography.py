@@ -80,7 +80,7 @@ def test_distance_histogram_rendered(tmp_path):
     p = _write_csv(tmp_path, "s.csv", _header(), _clustered_rows(5))
     report = _lint(p)
     assert any(
-        "Batch centroid" in f.message and "Distance from centroid" in f.message
+        "Batch center" in f.message and "Distance from center" in f.message
         for f in report.infos()
     ), _messages(report)
 
@@ -92,7 +92,7 @@ def test_distance_outlier_over_2sd_flagged(tmp_path):
     p = _write_csv(tmp_path, "s.csv", _header(), rows)
     report = _lint(p)
     assert any(
-        "2 SD from the mean distance" in f.message and "far.jpg" in f.message
+        "2 SD from the median distance" in f.message and "far.jpg" in f.message
         for f in report.warnings()
     ), _messages(report)
 
@@ -119,7 +119,7 @@ def test_altitude_histogram_and_outlier(tmp_path):
     report = _lint(p)
     assert any("Altitude distribution" in f.message for f in report.infos()), _messages(report)
     assert any(
-        "2 SD from the mean altitude" in f.message for f in report.warnings()
+        "2 SD from the median altitude" in f.message for f in report.warnings()
     ), _messages(report)
 
 
@@ -142,5 +142,6 @@ def test_no_coord_columns_is_noop(tmp_path):
     p = _write_csv(tmp_path, "s.csv", header, rows)
     report = _lint(p)
     assert not any(
-        "centroid" in f.message or "Altitude distribution" in f.message for f in report.findings
+        "Batch center" in f.message or "Altitude distribution" in f.message
+        for f in report.findings
     ), _messages(report)

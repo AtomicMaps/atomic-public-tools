@@ -150,8 +150,8 @@ For linting the generated sidecar, it will ask for data type. This is used to ma
 Whenever the sidecar has latitude and longitude columns, the linter also runs a batch-level spatial check to help catch coordinates that parse fine but are wrong relative to the rest of the batch (a dropped decimal, a flipped sign, an altitude in the wrong units):
 
 - Files whose coordinates fall outside the US are listed (an approximate bounding-box check — ignore it if your data is legitimately abroad).
-- The batch centroid is computed and a histogram shows how many files fall into each distance-from-centroid bin (in miles), so outliers stand out.
-- Files lying more than 2 standard deviations from the mean distance are listed individually.
+- The batch's median center is computed and a histogram shows how many files fall into each distance-from-center bin (in miles), so outliers stand out.
+- Files lying more than 2 standard deviations from the median distance are listed individually.
 - The same distribution histogram and 2-SD outlier list are produced for altitude.
 
 These are reported as warnings (and informational histograms), so they never block submission on their own — they're there to help you spot bad rows.

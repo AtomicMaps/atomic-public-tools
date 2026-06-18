@@ -7,8 +7,8 @@ relative to the rest of the batch — a decimal point dropped, a sign flipped,
 or an altitude in the wrong units — by looking at the batch as a whole:
 
 * points that fall outside the US (approximate bounding boxes),
-* a histogram of each file's distance (miles) from the batch centroid,
-* files lying more than 2 standard deviations from the mean distance,
+* a histogram of each file's distance (miles) from the batch median center,
+* files lying more than 2 standard deviations from the median distance,
 * the same distance/SD analysis applied to altitude.
 
 Uses ``numpy`` only, which clients already have via pandas, so no extra
@@ -63,7 +63,7 @@ def _haversine_miles(
     center_lat: float,
     center_lon: float,
 ) -> np.ndarray:
-    """Great-circle distance (miles) from each ``(lat, lon)`` to the centroid."""
+    """Great-circle distance (miles) from each ``(lat, lon)`` to the center point."""
     lat1, lon1, lat2, lon2 = map(np.radians, (lat, lon, center_lat, center_lon))
     dlat = lat2 - lat1
     dlon = lon2 - lon1
@@ -161,20 +161,22 @@ def _analyze_coordinates(
             ),
         )
 
-    centroid_lat = float(lat_arr.mean())
-    centroid_lon = float(lon_arr.mean())
+    # Median rather than mean so a single wild outlier doesn't drag the center
+    # toward itself and mask the very thing we're trying to surface.
+    center_lat = float(np.median(lat_arr))
+    center_lon = float(np.median(lon_arr))
 
     if len(names) < 2:
         report.add_info(
             f"Only 1 geolocated file; skipped distance distribution "
-            f"(point at {centroid_lat:.5f}, {centroid_lon:.5f})."
+            f"(point at {center_lat:.5f}, {center_lon:.5f})."
         )
         return
 
-    distances = _haversine_miles(lat_arr, lon_arr, centroid_lat, centroid_lon)
+    distances = _haversine_miles(lat_arr, lon_arr, center_lat, center_lon)
     report.add_info(
-        f"Batch centroid: {centroid_lat:.5f}, {centroid_lon:.5f} "
-        f"({len(names)} geolocated files). Distance from centroid (miles):\n"
+        f"Batch center (median): {center_lat:.5f}, {center_lon:.5f} "
+        f"({len(names)} geolocated files). Distance from center (miles):\n"
         + _render_histogram(distances, "mi")
     )
 
@@ -182,7 +184,7 @@ def _analyze_coordinates(
         names=names,
         values=distances,
         report=report,
-        label="distance from centroid",
+        label="distance from center",
         unit="mi",
         high_only=True,
     )
@@ -233,18 +235,20 @@ def _flag_sd_outliers(
     unit: str,
     high_only: bool,
 ) -> None:
-    """Warn about files more than 2 SD from the mean of ``values``.
+    """Warn about files more than 2 SD from the median of ``values``.
 
+    The center is the median (not the mean) so a single wild value doesn't pull
+    the reference toward itself and mask the outlier we're trying to surface.
     ``high_only`` flags only the upper tail (used for distance, which can't be
     negative); otherwise both tails are flagged (used for altitude).
     """
-    mean = float(values.mean())
+    center = float(np.median(values))
     std = float(values.std(ddof=1))
     if std == 0.0:
         return
 
     cutoff = _SD_THRESHOLD * std
-    deviations = values - mean if high_only else np.abs(values - mean)
+    deviations = values - center if high_only else np.abs(values - center)
     outlier_idx = np.nonzero(deviations > cutoff)[0]
     if outlier_idx.size == 0:
         return
@@ -252,8 +256,8 @@ def _flag_sd_outliers(
     unit_suffix = f" {unit}" if unit else ""
     detail = [f"{names[i]!r} ({values[i]:,.1f}{unit_suffix})" for i in outlier_idx]
     report.add_warning(
-        f"{outlier_idx.size} file(s) are more than 2 SD from the mean {label} "
-        f"(mean {mean:,.1f}{unit_suffix}, SD {std:,.1f}{unit_suffix}): "
+        f"{outlier_idx.size} file(s) are more than 2 SD from the median {label} "
+        f"(median {center:,.1f}{unit_suffix}, SD {std:,.1f}{unit_suffix}): "
         + _truncated_listing(detail),
         fix_hint=(
             "Far outliers often indicate a malformed coordinate or altitude; double-check them."
