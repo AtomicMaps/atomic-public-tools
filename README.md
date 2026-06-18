@@ -147,6 +147,21 @@ The command `am-tools lint sidecar` can lint both the client provided sidecar as
 
 For linting the generated sidecar, it will ask for data type. This is used to make sure it has all of the required columns for that data type. There are some basic checks for required fields to make sure the values make sense. If any fields fail this test, the script will tell you possible fixes.
 
+Whenever the sidecar has latitude and longitude columns, the linter also runs a batch-level spatial check to help catch coordinates that parse fine but are wrong relative to the rest of the batch (a dropped decimal, a flipped sign, an altitude in the wrong units):
+
+- Files whose coordinates fall outside the US are listed (an approximate bounding-box check — ignore it if your data is legitimately abroad).
+- The batch centroid is computed and a histogram shows how many files fall into each distance-from-centroid bin (in miles), so outliers stand out.
+- Files lying more than 2 standard deviations from the mean distance are listed individually.
+- The same distribution histogram and 2-SD outlier list are produced for altitude.
+
+These are reported as warnings (and informational histograms), so they never block submission on their own — they're there to help you spot bad rows.
+
+When a sidecar lint finishes with any errors or warnings, the tool offers to save a CSV report of just the rows that are missing required data. The report has one row per file with a gap and one column per required field, with `MISSING` marking the fields that file lacks (a field counts as present if it's filled on the row or on the `DEFAULT` row). When it asks for a path, pressing Enter without typing one saves the report into the current directory and prints a link to the saved file. You can also write this report non-interactively with `--report <path>`:
+
+```
+am-tools lint sidecar my_sidecar.csv --final --datatype oriented_image --report missing.csv
+```
+
 ## Project layout
 
 ```

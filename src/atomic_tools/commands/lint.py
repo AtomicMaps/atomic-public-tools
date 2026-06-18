@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import shlex
+import sys
+from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 
 import click
@@ -17,6 +20,7 @@ from atomic_tools.commands.sidecar import (
     ask_schema_uri,
 )
 from atomic_tools.utils.utils import DataTypeEnum
+from atomic_tools.validators.report import LintReport
 from atomic_tools.validators.schema import lint_schema_file
 from atomic_tools.validators.sidecar import lint_sidecar_file
 
@@ -67,6 +71,64 @@ def _echo_replay_command(command: str) -> None:
         err=True,
     )
     click.secho(f"  {command}\n", fg="bright_cyan", bold=True, err=True)
+
+
+def _default_report_name(sidecar_path: str) -> str:
+    base = os.path.basename(sidecar_path.rstrip("/")) or "sidecar"
+    stem = os.path.splitext(base)[0]
+    return f"{stem}_lint_report.csv"
+
+
+def _write_missing_data_report(report: LintReport, report_path: str) -> None:
+    table = report.missing_data
+    if table is None:
+        click.secho(
+            "Cannot write a missing-data report without a datatype "
+            "(it determines which fields are required). Re-run with --datatype.",
+            fg="yellow",
+            err=True,
+        )
+        return
+    saved = Path(report_path).expanduser().resolve()
+    try:
+        table.write_csv(str(saved))
+    except OSError as e:
+        click.secho(f"Could not write report to {saved}: {e}", fg="red", err=True)
+        return
+    click.secho(
+        f"Saved missing-data report ({len(table.rows)} row(s)) to {saved.as_uri()}",
+        fg="green",
+        err=True,
+    )
+
+
+def _maybe_offer_missing_data_report(report: LintReport, *, sidecar_path: str) -> None:
+    """When a lint failed or warned, offer to save the missing-data rows to CSV.
+
+    Only fires for an interactive TTY; scripted runs use the ``--report`` flag.
+    """
+    table = report.missing_data
+    if table is None or table.is_empty():
+        return
+    if not (report.has_errors() or report.warnings()):
+        return
+    if not sys.stdin.isatty():
+        return
+    default_target = Path.cwd() / _default_report_name(sidecar_path)
+    try:
+        if not questionary.confirm(
+            f"Save a CSV report of the {len(table.rows)} row(s) missing required data?",
+            default=True,
+        ).unsafe_ask():
+            return
+        report_path = questionary.text(
+            "Path for the report CSV:",
+            instruction=f"(Press Enter to save to the current directory: {default_target})",
+            default="",
+        ).unsafe_ask()
+    except KeyboardInterrupt:
+        return
+    _write_missing_data_report(report, (report_path or "").strip() or str(default_target))
 
 
 def _verbosity_prefix(verbosity: VerbosityChoice) -> list[str]:
@@ -198,6 +260,16 @@ def lint_sidecar_cmd(
             ),
         ),
     ] = None,
+    report_out: Annotated[
+        str | None,
+        typer.Option(
+            "--report",
+            help=(
+                "Write a CSV of the rows missing required data (one column per "
+                "required field) to this path. Skips the interactive prompt."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Validate a sidecar CSV (client or generated)."""
     from atomic_tools.cli import Verbosity, level_for
@@ -263,4 +335,10 @@ def lint_sidecar_cmd(
         input_files_path=input_files,
     )
     typer.echo(report.render())
+
+    if report_out is not None:
+        _write_missing_data_report(report, report_out)
+    else:
+        _maybe_offer_missing_data_report(report, sidecar_path=path)
+
     raise typer.Exit(code=report.exit_code())

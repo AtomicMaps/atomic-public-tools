@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass, field
 from typing import Literal
 
 import click
 
 Level = Literal["error", "warning", "info"]
+
+# Cell value written for a required field a row is missing. Present fields are
+# left blank so gaps are easy to spot when the CSV is opened in a spreadsheet.
+MISSING_MARKER = "MISSING"
 
 
 @dataclass(frozen=True)
@@ -19,8 +24,35 @@ class LintFinding:
 
 
 @dataclass
+class MissingDataReport:
+    """Per-row matrix of which required fields a sidecar row is missing.
+
+    Only rows missing at least one required field are kept. ``field_columns``
+    are the canonical required-field names; each row maps every field column to
+    ``MISSING_MARKER`` (absent) or ``""`` (present, on the row or via DEFAULT).
+    """
+
+    filename_column: str
+    field_columns: list[str]
+    rows: list[dict[str, str]] = field(default_factory=list)
+
+    def is_empty(self) -> bool:
+        return not self.rows
+
+    def write_csv(self, path: str) -> None:
+        header = [self.filename_column, *self.field_columns]
+        with open(path, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=header)
+            writer.writeheader()
+            writer.writerows(self.rows)
+
+
+@dataclass
 class LintReport:
     findings: list[LintFinding] = field(default_factory=list)
+    # Populated by the sidecar linter when a datatype (and thus a set of
+    # required fields) is known. None when there's nothing to tabulate.
+    missing_data: MissingDataReport | None = None
 
     def add_error(
         self,
