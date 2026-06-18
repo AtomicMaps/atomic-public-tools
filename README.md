@@ -147,6 +147,14 @@ The command `am-tools lint sidecar` can lint both the client provided sidecar as
 
 For linting the generated sidecar, it will ask for data type. This is used to make sure it has all of the required columns for that data type. There are some basic checks for required fields to make sure the values make sense. If any fields fail this test, the script will tell you possible fixes.
 
+##### Orientation data for oriented images
+When the data type is `oriented_image` (either chosen in the wizard or passed with `--datatype oriented_image`), the wizard asks whether you want to ignore missing orientation data (`Pitch`/`Heading`/`Roll`). **By default — unless you explicitly opt to ignore it — missing orientation is treated as an error.** Choosing to ignore it (or passing `--ignore-missing-orientation`) downgrades it to a warning; the images still process and appear in Lens, just without orientation. The same option is available on `am-tools sidecar generate`, where it controls the automatic lint that runs on the generated sidecar. To skip the prompt non-interactively:
+
+```
+am-tools lint sidecar my_sidecar.csv --final --datatype oriented_image --ignore-missing-orientation
+am-tools sidecar generate --directory ./imgs --datatype oriented_image --ignore-missing-orientation
+```
+
 Whenever the sidecar has latitude and longitude columns, the linter also runs a batch-level spatial check to help catch coordinates that parse fine but are wrong relative to the rest of the batch (a dropped decimal, a flipped sign, an altitude in the wrong units):
 
 - Files whose coordinates fall outside the US are listed (an approximate bounding-box check — ignore it if your data is legitimately abroad).

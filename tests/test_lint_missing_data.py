@@ -27,12 +27,15 @@ def _header() -> list[str]:
 
 
 def _lint_final(p: Path):
+    # Ignore orientation so these tests stay focused on GPS/date coverage; the
+    # orientation-as-required default is exercised in test_lint_sidecar.py.
     return lint_sidecar_file(
         str(p),
         final=True,
         data_type=DataTypeEnum.oriented_image,
         schema_path=None,
         input_files_path=None,
+        ignore_missing_orientation=True,
     )
 
 

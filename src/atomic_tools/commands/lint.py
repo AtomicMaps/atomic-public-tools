@@ -16,6 +16,7 @@ import typer
 from atomic_tools.commands.sidecar import (
     _ask_client_schema,
     _ask_data_type,
+    _ask_ignore_missing_orientation,
     _ask_verbosity,
     ask_schema_uri,
 )
@@ -151,6 +152,7 @@ def _format_sidecar_replay_command(
     schema: str | None,
     input_files: str | None,
     verbosity: VerbosityChoice,
+    ignore_missing_orientation: bool,
 ) -> str:
     parts = [
         "am-tools",
@@ -167,6 +169,8 @@ def _format_sidecar_replay_command(
         parts += ["--schema", shlex.quote(schema)]
     if input_files:
         parts += ["--input-files", shlex.quote(input_files)]
+    if ignore_missing_orientation:
+        parts.append("--ignore-missing-orientation")
     return " ".join(parts)
 
 
@@ -270,6 +274,18 @@ def lint_sidecar_cmd(
             ),
         ),
     ] = None,
+    ignore_missing_orientation: Annotated[
+        bool,
+        typer.Option(
+            "--ignore-missing-orientation",
+            help=(
+                "Only meaningful for --datatype oriented_image with --final. By "
+                "default, missing orientation (Pitch/Heading/Roll) is an error; "
+                "pass this to downgrade it to a warning (the images still process, "
+                "appearing in Lens without orientation)."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Validate a sidecar CSV (client or generated)."""
     from atomic_tools.cli import Verbosity, level_for
@@ -284,6 +300,10 @@ def lint_sidecar_cmd(
     input_files_provided = (
         ctx.get_parameter_source("input_files") == click.core.ParameterSource.COMMANDLINE
     )
+    ignore_orientation_provided = (
+        ctx.get_parameter_source("ignore_missing_orientation")
+        == click.core.ParameterSource.COMMANDLINE
+    )
 
     # If the user didn't provide required info via arguments, ask interactively
     wizard_ran = path is None or (datatype is None and not final_provided)
@@ -295,6 +315,12 @@ def lint_sidecar_cmd(
                 final = _ask_final()
             if final and datatype is None:
                 datatype = _ask_data_type()
+            if (
+                final
+                and datatype == DataTypeEnum.oriented_image
+                and not ignore_orientation_provided
+            ):
+                ignore_missing_orientation = _ask_ignore_missing_orientation()
             if schema is None and not schema_provided:
                 schema = _ask_client_schema()
             if input_files is None and not input_files_provided:
@@ -324,6 +350,7 @@ def lint_sidecar_cmd(
                 schema=schema,
                 input_files=input_files,
                 verbosity=verbosity_choice,
+                ignore_missing_orientation=ignore_missing_orientation,
             )
         )
 
@@ -333,6 +360,7 @@ def lint_sidecar_cmd(
         data_type=datatype,
         schema_path=schema,
         input_files_path=input_files,
+        ignore_missing_orientation=ignore_missing_orientation,
     )
     typer.echo(report.render())
 

@@ -42,6 +42,7 @@ def lint_sidecar_file(
     data_type: DataTypeEnum | None,
     schema_path: str | Path | None,
     input_files_path: str | None,
+    ignore_missing_orientation: bool = False,
 ) -> LintReport:
     report = LintReport()
 
@@ -101,6 +102,12 @@ def lint_sidecar_file(
 
     required_groups = REQUIRED_SIDECAR_FIELD_GROUPS.get(data_type, []) if data_type else []
     optional_groups = OPTIONAL_SIDECAR_FIELD_GROUPS.get(data_type, []) if data_type else []
+    if data_type == DataTypeEnum.oriented_image and not ignore_missing_orientation:
+        # Orientation (Pitch/Heading/Roll) is optional-by-default for oriented
+        # images, but unless the caller opts to ignore it we promote it to
+        # required so missing orientation is an error rather than a warning.
+        required_groups = [*required_groups, *optional_groups]
+        optional_groups = []
     columns = list(df.columns)
     columns_set = set(columns)
 

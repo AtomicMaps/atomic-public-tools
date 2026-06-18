@@ -107,6 +107,18 @@ def _ask_data_type() -> DataTypeEnum:
     return DataTypeEnum(choice)
 
 
+def _ask_ignore_missing_orientation() -> bool:
+    return questionary.confirm(
+        "Ignore missing orientation data (Pitch/Heading/Roll)?",
+        instruction=(
+            "(No — the default — treats a missing orientation field as an error; "
+            "Yes downgrades it to a warning so the images still process, "
+            "appearing in Lens without orientation)"
+        ),
+        default=False,
+    ).unsafe_ask()
+
+
 def _ask_output_filename() -> str:
     return questionary.text(
         "Output filename:",
@@ -641,6 +653,7 @@ def _format_replay_command(
     verbosity: "VerbosityChoice",
     local_copy: bool,
     spatial_reference: str | None,
+    ignore_missing_orientation: bool,
 ) -> str:
     parts = ["am-tools"]
     if verbosity == "verbose":
@@ -667,6 +680,8 @@ def _format_replay_command(
         parts.append("--local-copy")
     if spatial_reference:
         parts += ["--spatial-reference", shlex.quote(spatial_reference)]
+    if ignore_missing_orientation:
+        parts.append("--ignore-missing-orientation")
     return " ".join(parts)
 
 
@@ -692,6 +707,8 @@ def _run_interactive_wizard(
     local_copy: bool,
     local_copy_provided: bool,
     spatial_reference: str | None,
+    ignore_missing_orientation: bool,
+    ignore_missing_orientation_provided: bool,
 ) -> tuple[
     str,
     DataTypeEnum,
@@ -702,10 +719,11 @@ def _run_interactive_wizard(
     "VerbosityChoice",
     bool,
     str | None,
+    bool,
 ]:
     """Prompt for any value the user didn't pass on the CLI. Returns the
     final (directory, data_type, output_filename, client_sidecar, client_schema, full,
-    verbosity, local_copy, spatial_reference).
+    verbosity, local_copy, spatial_reference, ignore_missing_orientation).
     """
     questionary.print(
         "Interactive mode — press Ctrl+C at any time to cancel.\n",
@@ -716,6 +734,8 @@ def _run_interactive_wizard(
             directory = _ask_directory()
         if data_type is None:
             data_type = _ask_data_type()
+        if data_type == DataTypeEnum.oriented_image and not ignore_missing_orientation_provided:
+            ignore_missing_orientation = _ask_ignore_missing_orientation()
         if output_filename is None:
             output_filename = _ask_output_filename()
         if client_sidecar is None:
@@ -744,6 +764,7 @@ def _run_interactive_wizard(
         verbosity,
         local_copy,
         spatial_reference,
+        ignore_missing_orientation,
     )
 
 
@@ -839,6 +860,18 @@ def generate(
             ),
         ),
     ] = None,
+    ignore_missing_orientation: Annotated[
+        bool,
+        typer.Option(
+            "--ignore-missing-orientation",
+            help=(
+                "Only meaningful for --datatype oriented_image. By default, "
+                "missing orientation (Pitch/Heading/Roll) in the generated "
+                "sidecar is an error; pass this to downgrade it to a warning "
+                "(the images still process, appearing in Lens without orientation)."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Scan a directory, extract per-file metadata, and write a sidecar CSV.
 
@@ -860,6 +893,10 @@ def generate(
             ctx.get_parameter_source("local_copy")
             == click.core.ParameterSource.COMMANDLINE
         )
+        ignore_orientation_provided = (
+            ctx.get_parameter_source("ignore_missing_orientation")
+            == click.core.ParameterSource.COMMANDLINE
+        )
         (
             directory,
             data_type,
@@ -870,6 +907,7 @@ def generate(
             verbosity_choice,
             local_copy,
             spatial_reference,
+            ignore_missing_orientation,
         ) = _run_interactive_wizard(
             directory,
             data_type,
@@ -883,6 +921,8 @@ def generate(
             local_copy,
             local_copy_provided,
             spatial_reference,
+            ignore_missing_orientation,
+            ignore_orientation_provided,
         )
         logging.getLogger().setLevel(
             level_for(
@@ -917,6 +957,7 @@ def generate(
                 verbosity=verbosity_choice,
                 local_copy=local_copy,
                 spatial_reference=spatial_reference,
+                ignore_missing_orientation=ignore_missing_orientation,
             )
         )
 
@@ -942,6 +983,7 @@ def generate(
             data_type=data_type,
             schema_path=None,
             input_files_path=directory,
+            ignore_missing_orientation=ignore_missing_orientation,
         )
     except Exception as e:
         _fail("Failed to lint generated sidecar", e)
