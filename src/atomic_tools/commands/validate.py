@@ -1,0 +1,254 @@
+"""``am-tools validate`` — lint data without saving a sidecar.
+
+Does exactly what ``am-tools sidecar generate`` does — scan a directory,
+extract per-file metadata, assemble a sidecar, and lint it — but never writes
+the sidecar to the remote/local directory. It exists for the common case of
+"I just want to know whether my data is clean" without leaving a file behind.
+
+The metadata extraction, sidecar assembly, wizard prompts, and lint pathway are
+all shared with ``sidecar generate`` (see :mod:`atomic_tools.commands.sidecar`);
+this module only swaps the persist step for an in-memory temp file that is
+linted and discarded.
+"""
+
+from __future__ import annotations
+
+import logging
+import tempfile
+from pathlib import Path
+from typing import Annotated
+
+import click
+import typer
+
+from atomic_tools.commands.sidecar import (
+    _build_sidecar,
+    _echo_replay_command,
+    _fail,
+    _format_replay_command,
+    _run_interactive_wizard,
+)
+from atomic_tools.utils.utils import DataTypeEnum
+from atomic_tools.validators.sidecar import lint_sidecar_file
+
+logger = logging.getLogger(__name__)
+
+
+def _validate(
+    directory: str,
+    data_type: DataTypeEnum,
+    client_sidecar: str | None,
+    client_schema: str | None,
+    full: bool = False,
+    spatial_reference: str | None = None,
+    ignore_missing_orientation: bool = False,
+):
+    """Build the sidecar in memory and lint it without persisting anything."""
+    logger.info(
+        f"Starting validation — directory={directory!r} data_type={data_type} "
+        f"client_sidecar={client_sidecar!r} client_schema={client_schema!r} "
+        f"full={full} spatial_reference={spatial_reference!r}"
+    )
+
+    df, _ = _build_sidecar(  # validate never persists, so the backend is unused
+        directory=directory,
+        data_type=data_type,
+        client_sidecar=client_sidecar,
+        client_schema=client_schema,
+        full=full,
+        spatial_reference=spatial_reference,
+    )
+
+    # Lint reads from a path, so stage the assembled sidecar in a throwaway temp
+    # file rather than writing it back to the (possibly remote) input directory.
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        local_csv = Path(tmp_dir) / "sidecar.csv"
+        df.to_csv(local_csv, index=False)
+        logger.info("Linting in-memory sidecar (not saved)…")
+        return lint_sidecar_file(
+            str(local_csv),
+            final=True,
+            data_type=data_type,
+            schema_path=None,
+            input_files_path=directory,
+            ignore_missing_orientation=ignore_missing_orientation,
+        )
+
+
+def validate(
+    ctx: typer.Context,
+    directory: Annotated[
+        str | None,
+        typer.Option(
+            help=(
+                "Directory to scan. Either an object-store URI "
+                "(s3://bucket/prefix, gs://..., az://...) or a local filesystem path."
+            ),
+        ),
+    ] = None,
+    data_type: Annotated[
+        DataTypeEnum | None,
+        typer.Option(
+            "--datatype",
+            "--data-type",
+            help="Data type of the input data (e.g. 'oriented_image', 'point_cloud').",
+            case_sensitive=False,
+        ),
+    ] = None,
+    client_sidecar: Annotated[
+        str | None,
+        typer.Option(
+            help=(
+                "Optional path to client-supplied sidecar data. May be an "
+                "object-store URI (s3://bucket/key/file.csv) or a local path. "
+                "Point it at a single CSV, or at a directory: when it's a "
+                "directory, every CSV in a subdirectory BELOW it is merged into "
+                "one. All merged CSVs must share the same schema (column count); "
+                "a mismatch aborts and names the bad file. Client values win on "
+                "conflict."
+            ),
+        ),
+    ] = None,
+    client_schema: Annotated[
+        str | None,
+        typer.Option(
+            help=(
+                "Optional client-supplied JSON schema describing how to "
+                "normalise the client sidecar CSV (positional column names, "
+                "per-client renames). Local path or object-store URI "
+                "(s3://bucket/key/schema.json, gs://..., az://...). See "
+                "schemas/column_names_example.json. If omitted, the client "
+                "CSV is used as-is with no renames."
+            ),
+        ),
+    ] = None,
+    full: Annotated[
+        bool,
+        typer.Option(
+            "--full",
+            help=(
+                "Include every metadata field extracted from each file. By "
+                "default, only the canonical/required fields for the data type "
+                "are kept (plus blank columns for any missing required fields)."
+            ),
+        ),
+    ] = False,
+    spatial_reference: Annotated[
+        str | None,
+        typer.Option(
+            "--spatial-reference",
+            "--spatial_reference",
+            help=(
+                "CRS of the source coordinates (e.g. 'EPSG:32612' or '32612'). "
+                "For images, lat/lon (and altitude) are treated as X/Y/Z "
+                "in this CRS and reprojected to EPSG:4326. For point clouds, a "
+                "'spatial_reference' column is added with this value in the "
+                "DEFAULT row."
+            ),
+        ),
+    ] = None,
+    ignore_missing_orientation: Annotated[
+        bool,
+        typer.Option(
+            "--ignore-missing-orientation",
+            help=(
+                "Only meaningful for --datatype oriented_image. By default, "
+                "missing orientation (Pitch/Heading/Roll) is an error; pass this "
+                "to downgrade it to a warning (the images still process, "
+                "appearing in Lens without orientation)."
+            ),
+        ),
+    ] = False,
+) -> None:
+    """Scan a directory, extract metadata, and lint it — without saving a sidecar.
+
+    Identical to ``sidecar generate`` except nothing is written: no sidecar is
+    saved to the input directory or locally. With no flags, prompts
+    interactively for each value. Any flag passed on the command line is used
+    as-is and not prompted for.
+    """
+    from atomic_tools.cli import Verbosity, level_for
+
+    verbosity_state: Verbosity = ctx.ensure_object(Verbosity)
+    verbosity_choice = verbosity_state.choice
+    verbosity_provided = verbosity_state.verbose or verbosity_state.silent
+
+    wizard_ran = directory is None or data_type is None
+    if wizard_ran:
+        full_provided = (
+            ctx.get_parameter_source("full") == click.core.ParameterSource.COMMANDLINE
+        )
+        ignore_orientation_provided = (
+            ctx.get_parameter_source("ignore_missing_orientation")
+            == click.core.ParameterSource.COMMANDLINE
+        )
+        # output_filename / local_copy are irrelevant when nothing is saved, so
+        # they're left at their defaults and ignored (hence save=False).
+        result = _run_interactive_wizard(
+            directory,
+            data_type,
+            None,
+            client_sidecar,
+            client_schema,
+            full,
+            full_provided,
+            verbosity_choice,
+            verbosity_provided,
+            False,
+            True,
+            spatial_reference,
+            ignore_missing_orientation,
+            ignore_orientation_provided,
+            save=False,
+        )
+        directory = result.directory
+        data_type = result.data_type
+        client_sidecar = result.client_sidecar
+        client_schema = result.client_schema
+        full = result.full
+        verbosity_choice = result.verbosity
+        spatial_reference = result.spatial_reference
+        ignore_missing_orientation = result.ignore_missing_orientation
+        logging.getLogger().setLevel(
+            level_for(
+                verbose=verbosity_choice == "verbose",
+                silent=verbosity_choice == "silent",
+            )
+        )
+
+    if not directory:
+        raise typer.BadParameter("Directory is required.")
+    if data_type is None:
+        raise typer.BadParameter("Data type is required.")
+
+    if wizard_ran:
+        _echo_replay_command(
+            _format_replay_command(
+                ["validate"],
+                directory=directory,
+                data_type=data_type,
+                client_sidecar=client_sidecar,
+                client_schema=client_schema,
+                full=full,
+                verbosity=verbosity_choice,
+                spatial_reference=spatial_reference,
+                ignore_missing_orientation=ignore_missing_orientation,
+            )
+        )
+
+    try:
+        report = _validate(
+            directory=directory,
+            data_type=data_type,
+            client_sidecar=client_sidecar,
+            client_schema=client_schema,
+            full=full,
+            spatial_reference=spatial_reference,
+            ignore_missing_orientation=ignore_missing_orientation,
+        )
+    except Exception as e:
+        _fail("Failed to validate data", e)
+
+    typer.echo(report.render())
+    if report.has_errors():
+        raise typer.Exit(code=1)

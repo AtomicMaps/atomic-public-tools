@@ -71,6 +71,36 @@ def test_lint_sidecar_help_lists_options():
         assert flag in result.stdout
 
 
+def test_root_help_lists_validate():
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "validate" in result.stdout
+
+
+def test_validate_help_lists_shared_options(monkeypatch):
+    monkeypatch.setenv("COLUMNS", "200")
+    result = runner.invoke(app, ["validate", "--help"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0
+    for flag in (
+        "--directory",
+        "--datatype",
+        "--client-sidecar",
+        "--client-schema",
+        "--full",
+        "--spatial-reference",
+        "--ignore-missing-orientation",
+    ):
+        assert flag in result.stdout
+
+
+def test_validate_help_omits_save_only_options():
+    # validate never writes a sidecar, so the generate-only save options are gone.
+    result = runner.invoke(app, ["validate", "--help"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0
+    assert "--output-filename" not in result.stdout
+    assert "--local-copy" not in result.stdout
+
+
 def test_version():
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0

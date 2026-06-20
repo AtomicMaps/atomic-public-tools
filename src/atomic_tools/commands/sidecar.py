@@ -17,7 +17,7 @@ import sys
 import tempfile
 from collections import defaultdict
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, NoReturn
+from typing import TYPE_CHECKING, Annotated, NamedTuple, NoReturn
 
 import click
 import questionary
@@ -488,23 +488,21 @@ def _reproject_dataframe(df, in_srs: str) -> None:
         df.at[idx, "GPSLatitude"] = str(ny)
 
 
-def _generate(
+def _build_sidecar(
     directory: str,
     data_type: DataTypeEnum,
-    output_filename: str,
     client_sidecar: str | None,
     client_schema: str | None,
     full: bool = False,
-    local_copy: bool = False,
     spatial_reference: str | None = None,
-) -> str:
-    logger.info(
-        f"Starting sidecar CSV generation — directory={directory!r} "
-        f"data_type={data_type} output={output_filename!r} "
-        f"client_sidecar={client_sidecar!r} client_schema={client_schema!r} "
-        f"full={full} local_copy={local_copy} spatial_reference={spatial_reference!r}"
-    )
+):
+    """Scan a directory, extract metadata, and assemble the sidecar DataFrame.
 
+    This is the shared core of both ``sidecar generate`` and ``validate``: it
+    does everything up to (but not including) writing the CSV anywhere. Returns
+    ``(df, backend)`` so callers can either persist the sidecar (``generate``)
+    or lint it from a throwaway temp file without saving (``validate``).
+    """
     if spatial_reference:
         # Fail fast on an unparseable CRS before doing any extraction work.
         from pyproj import CRS
@@ -634,6 +632,35 @@ def _generate(
             )
             _reproject_dataframe(df, spatial_reference)
 
+    return df, backend
+
+
+def _generate(
+    directory: str,
+    data_type: DataTypeEnum,
+    output_filename: str,
+    client_sidecar: str | None,
+    client_schema: str | None,
+    full: bool = False,
+    local_copy: bool = False,
+    spatial_reference: str | None = None,
+) -> str:
+    logger.info(
+        f"Starting sidecar CSV generation — directory={directory!r} "
+        f"data_type={data_type} output={output_filename!r} "
+        f"client_sidecar={client_sidecar!r} client_schema={client_schema!r} "
+        f"full={full} local_copy={local_copy} spatial_reference={spatial_reference!r}"
+    )
+
+    df, backend = _build_sidecar(
+        directory=directory,
+        data_type=data_type,
+        client_sidecar=client_sidecar,
+        client_schema=client_schema,
+        full=full,
+        spatial_reference=spatial_reference,
+    )
+
     local_copy_path: Path | None = None
     with tempfile.TemporaryDirectory() as tmp_dir:
         local_csv = Path(tmp_dir) / output_filename
@@ -658,32 +685,32 @@ def _generate(
 
 
 def _format_replay_command(
+    subcommand: list[str],
     directory: str,
     data_type: DataTypeEnum,
-    output_filename: str,
     client_sidecar: str | None,
     client_schema: str | None,
     full: bool,
     verbosity: "VerbosityChoice",
-    local_copy: bool,
     spatial_reference: str | None,
     ignore_missing_orientation: bool,
+    *,
+    output_filename: str | None = None,
+    local_copy: bool = False,
 ) -> str:
+    """Build the copy-pasteable replay command for ``sidecar generate`` or
+    ``validate``. ``subcommand`` is the command words (e.g. ``["sidecar",
+    "generate"]`` or ``["validate"]``); the save-only flags are emitted only
+    when relevant (``validate`` passes neither).
+    """
     parts = ["am-tools"]
     if verbosity == "verbose":
         parts.append("--verbose")
     elif verbosity == "silent":
         parts.append("--silent")
-    parts += [
-        "sidecar",
-        "generate",
-        "--directory",
-        shlex.quote(directory),
-        "--datatype",
-        data_type.value,
-        "--output-filename",
-        shlex.quote(output_filename),
-    ]
+    parts += [*subcommand, "--directory", shlex.quote(directory), "--datatype", data_type.value]
+    if output_filename is not None:
+        parts += ["--output-filename", shlex.quote(output_filename)]
     if client_sidecar:
         parts += ["--client-sidecar", shlex.quote(client_sidecar)]
     if client_schema is not None:
@@ -708,6 +735,24 @@ def _echo_replay_command(command: str) -> None:
     click.secho(f"  {command}\n", fg="bright_cyan", bold=True, err=True)
 
 
+class WizardResult(NamedTuple):
+    """The values the interactive wizard resolves. ``output_filename`` and
+    ``local_copy`` are only meaningful when the caller saves a sidecar; the
+    ``validate`` command leaves them at their passed-in defaults and ignores them.
+    """
+
+    directory: str
+    data_type: DataTypeEnum
+    output_filename: str | None
+    client_sidecar: str | None
+    client_schema: str | None
+    full: bool
+    verbosity: "VerbosityChoice"
+    local_copy: bool
+    spatial_reference: str | None
+    ignore_missing_orientation: bool
+
+
 def _run_interactive_wizard(
     directory: str | None,
     data_type: DataTypeEnum | None,
@@ -723,21 +768,13 @@ def _run_interactive_wizard(
     spatial_reference: str | None,
     ignore_missing_orientation: bool,
     ignore_missing_orientation_provided: bool,
-) -> tuple[
-    str,
-    DataTypeEnum,
-    str | None,
-    str | None,
-    str | None,
-    bool,
-    "VerbosityChoice",
-    bool,
-    str | None,
-    bool,
-]:
-    """Prompt for any value the user didn't pass on the CLI. Returns the
-    final (directory, data_type, output_filename, client_sidecar, client_schema, full,
-    verbosity, local_copy, spatial_reference, ignore_missing_orientation).
+    save: bool = True,
+) -> WizardResult:
+    """Prompt for any value the user didn't pass on the CLI.
+
+    When ``save`` is False (the ``validate`` command), the output-filename and
+    local-copy prompts are skipped because nothing is written to disk; those
+    two values are returned unchanged.
     """
     questionary.print(
         "Interactive mode — press Ctrl+C at any time to cancel.\n",
@@ -750,7 +787,7 @@ def _run_interactive_wizard(
             data_type = _ask_data_type()
         if data_type == DataTypeEnum.oriented_image and not ignore_missing_orientation_provided:
             ignore_missing_orientation = _ask_ignore_missing_orientation()
-        if output_filename is None:
+        if save and output_filename is None:
             output_filename = _ask_output_filename()
         if client_sidecar is None:
             client_sidecar = _ask_client_sidecar()
@@ -760,7 +797,7 @@ def _run_interactive_wizard(
             spatial_reference = _ask_spatial_reference()
         if not full_provided:
             full = _ask_full()
-        if not local_copy_provided and any(
+        if save and not local_copy_provided and any(
             is_remote_uri(p) for p in (directory, client_sidecar, client_schema)
         ):
             local_copy = _ask_local_copy()
@@ -768,17 +805,17 @@ def _run_interactive_wizard(
             verbosity = _ask_verbosity()
     except KeyboardInterrupt:
         raise typer.Exit(code=130) from None
-    return (
-        directory,
-        data_type,
-        output_filename,
-        client_sidecar,
-        client_schema,
-        full,
-        verbosity,
-        local_copy,
-        spatial_reference,
-        ignore_missing_orientation,
+    return WizardResult(
+        directory=directory,
+        data_type=data_type,
+        output_filename=output_filename,
+        client_sidecar=client_sidecar,
+        client_schema=client_schema,
+        full=full,
+        verbosity=verbosity,
+        local_copy=local_copy,
+        spatial_reference=spatial_reference,
+        ignore_missing_orientation=ignore_missing_orientation,
     )
 
 
@@ -962,6 +999,7 @@ def generate(
     if wizard_ran:
         _echo_replay_command(
             _format_replay_command(
+                ["sidecar", "generate"],
                 directory=directory,
                 data_type=data_type,
                 output_filename=output_filename,

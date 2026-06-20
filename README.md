@@ -107,6 +107,26 @@ am-tools sidecar generate \
   --client-sidecar ./sidecars
 ```
 
+### `am-tools validate`
+Sometimes you just want to know whether your data is clean without leaving a sidecar behind. `am-tools validate` does exactly what `am-tools sidecar generate` does — scans the directory, extracts per-file metadata, merges any client-supplied sidecar, builds the canonical sidecar, and lints it — but **never saves the sidecar** to the remote directory or locally. It's the right command when you only care about the lint report.
+
+It shares all the same options and interactive wizard as `sidecar generate`, with the two save-related questions removed (it doesn't ask what to name the sidecar or whether to keep a local copy, because nothing is written). Like `generate`, it lints in "final" mode and prints the report; it exits non-zero if any errors are found.
+
+```bash
+am-tools validate \
+  --directory ./data \
+  --datatype oriented_image
+
+# with a client sidecar, reprojection, and orientation ignored — same flags as generate
+am-tools validate \
+  --directory ./data \
+  --datatype oriented_image \
+  --client-sidecar ./my_sidecar.csv \
+  --client-schema ./schemas/my_schema.json \
+  --spatial-reference EPSG:32612 \
+  --ignore-missing-orientation
+```
+
 ### `am-tools lint`
 There are two subcommands in `am-tools lint`:
 
