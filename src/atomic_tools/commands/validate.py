@@ -42,12 +42,13 @@ def _validate(
     full: bool = False,
     spatial_reference: str | None = None,
     ignore_missing_orientation: bool = False,
+    coco: str | None = None,
 ):
     """Build the sidecar in memory and lint it without persisting anything."""
     logger.info(
         f"Starting validation — directory={directory!r} data_type={data_type} "
         f"client_sidecar={client_sidecar!r} client_schema={client_schema!r} "
-        f"full={full} spatial_reference={spatial_reference!r}"
+        f"full={full} spatial_reference={spatial_reference!r} coco={coco!r}"
     )
 
     df, _ = _build_sidecar(  # validate never persists, so the backend is unused
@@ -72,6 +73,7 @@ def _validate(
             schema_path=None,
             input_files_path=directory,
             ignore_missing_orientation=ignore_missing_orientation,
+            coco_path=coco,
         )
 
 
@@ -159,6 +161,19 @@ def validate(
             ),
         ),
     ] = False,
+    coco: Annotated[
+        str | None,
+        typer.Option(
+            "--coco",
+            help=(
+                "Optional COCO label file (local path, s3://… URI, or a directory "
+                "containing one). Image data types only. Reports how many labels "
+                "sit on images with missing/zero-size metadata "
+                "(degraded/unusable/not_on_disk), and adds those tiers to the "
+                "failed-rows CSV (--report)."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Scan a directory, extract metadata, and lint it — without saving a sidecar.
 
@@ -199,6 +214,7 @@ def validate(
             spatial_reference,
             ignore_missing_orientation,
             ignore_orientation_provided,
+            coco=coco,
             save=False,
         )
         directory = result.directory
@@ -209,6 +225,7 @@ def validate(
         verbosity_choice = result.verbosity
         spatial_reference = result.spatial_reference
         ignore_missing_orientation = result.ignore_missing_orientation
+        coco = result.coco
         logging.getLogger().setLevel(
             level_for(
                 verbose=verbosity_choice == "verbose",
@@ -233,6 +250,7 @@ def validate(
                 verbosity=verbosity_choice,
                 spatial_reference=spatial_reference,
                 ignore_missing_orientation=ignore_missing_orientation,
+                coco=coco,
             )
         )
 
@@ -245,6 +263,7 @@ def validate(
             full=full,
             spatial_reference=spatial_reference,
             ignore_missing_orientation=ignore_missing_orientation,
+            coco=coco,
         )
     except Exception as e:
         _fail("Failed to validate data", e)

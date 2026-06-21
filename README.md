@@ -190,6 +190,26 @@ When a sidecar lint finishes with any errors or warnings, the tool offers to sav
 am-tools lint sidecar my_sidecar.csv --final --datatype oriented_image --report missing.csv
 ```
 
+##### Label impact for labelled datasets (`--coco`)
+If your imagery has a COCO label file, pass it with `--coco` to find out how many **labels (annotations)** sit on images whose metadata isn't good enough for the pipeline. This is available on `am-tools lint sidecar`, `am-tools validate`, and `am-tools sidecar generate` (and prompted for in the wizard), but only for image data types — it's skipped for point clouds and video. Point `--coco` at a COCO `.json`, an `s3://…` URI, or a directory containing one (it looks for `input.coco.json`, then `*.coco.json`, then the first `*.json` with an `images[]` array).
+
+Each labelled image is matched to its sidecar row (by filename, using the parent folders to break ties when basenames collide) and sorted into a tier:
+
+- **complete** — every required and optional field is present.
+- **degraded** — usable, but an optional field group is missing (e.g. orientation when run with `--ignore-missing-orientation`). The image still processes but with less accuracy.
+- **unusable** — a required field is missing, or the COCO entry reports a zero `width`/`height`.
+- **not_on_disk** — the COCO references an image with no sidecar row (it was never extracted) — the most unusable case.
+
+The lint output gains a label-impact summary (how many labels are *affected* = degraded + unusable + not_on_disk, and how many are *unusable* = unusable + not_on_disk), and the failed-rows CSV (`--report`) gains `coco_status` and `coco_labels` columns so you can see per-image which labels are at risk — including the degraded and not-on-disk images, which wouldn't otherwise appear in that report.
+
+```
+am-tools validate --directory ./imgs --datatype oriented_image --coco labels.coco.json
+am-tools lint sidecar my_sidecar.csv --final --datatype oriented_image --coco labels.coco.json --report impact.csv
+am-tools sidecar generate --directory ./imgs --datatype oriented_image --coco labels.coco.json
+```
+
+> Note: the tier respects the same required/optional policy the linter uses. For `oriented_image`, orientation is required by default (so a missing heading makes an image *unusable*); pass `--ignore-missing-orientation` to treat orientation as optional (so it only makes an image *degraded*).
+
 ## Project layout
 
 ```

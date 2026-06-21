@@ -4,11 +4,18 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import click
 
+if TYPE_CHECKING:
+    from atomic_tools.validators.coco import CocoImpact
+
 Level = Literal["error", "warning", "info"]
+
+# Extra columns appended to the failed-rows CSV when a COCO file is supplied.
+COCO_STATUS_COLUMN = "coco_status"
+COCO_LABELS_COLUMN = "coco_labels"
 
 # Cell value written for a required field a row is missing. Present fields are
 # left blank so gaps are easy to spot when the CSV is opened in a spreadsheet.
@@ -35,14 +42,20 @@ class MissingDataReport:
     filename_column: str
     field_columns: list[str]
     rows: list[dict[str, str]] = field(default_factory=list)
+    # Set when a COCO file is supplied: each row then also carries a
+    # ``coco_status`` (tier) and ``coco_labels`` (annotation count) cell, and
+    # the CSV grows two matching columns.
+    include_coco: bool = False
 
     def is_empty(self) -> bool:
         return not self.rows
 
     def write_csv(self, path: str) -> None:
         header = [self.filename_column, *self.field_columns]
+        if self.include_coco:
+            header += [COCO_STATUS_COLUMN, COCO_LABELS_COLUMN]
         with open(path, "w", newline="", encoding="utf-8") as fh:
-            writer = csv.DictWriter(fh, fieldnames=header)
+            writer = csv.DictWriter(fh, fieldnames=header, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(self.rows)
 
@@ -53,6 +66,8 @@ class LintReport:
     # Populated by the sidecar linter when a datatype (and thus a set of
     # required fields) is known. None when there's nothing to tabulate.
     missing_data: MissingDataReport | None = None
+    # Populated when a COCO file is supplied (image datatypes only).
+    coco_impact: CocoImpact | None = None
 
     def add_error(
         self,

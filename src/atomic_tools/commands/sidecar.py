@@ -47,6 +47,7 @@ from atomic_tools.utils.utils import (
     has_value,
     is_remote_uri,
 )
+from atomic_tools.validators.coco import IMAGE_DATA_TYPES
 from atomic_tools.validators.required_fields import (
     ALL_SIDECAR_FIELD_GROUPS as _ALL_SIDECAR_FIELD_GROUPS,
 )
@@ -63,11 +64,8 @@ sidecar_app = typer.Typer(
     help="Generate a sidecar CSV by scanning a local or remote directory.",
 )
 
-_IMAGE_DATA_TYPES = {
-    DataTypeEnum.ortho_image,
-    DataTypeEnum.oriented_image,
-    DataTypeEnum.spherical_image,
-}
+# Image data types share the EXIF extractor and are the only types COCO label
+# impact applies to — IMAGE_DATA_TYPES is the single source of truth (coco.py).
 _VIDEO_DATA_TYPES = {DataTypeEnum.video}
 _POINT_CLOUD_DATA_TYPES = {DataTypeEnum.point_cloud}
 
@@ -169,6 +167,18 @@ def _ask_client_sidecar() -> str | None:
         instruction=(
             "(Local path or s3:// URI to a CSV, or a directory whose "
             "subfolders hold the CSVs to merge; press Enter to skip)"
+        ),
+    ).unsafe_ask()
+    answer = answer.strip()
+    return answer or None
+
+
+def _ask_coco() -> str | None:
+    answer = questionary.text(
+        "Optional COCO label file to assess label impact:",
+        instruction=(
+            "(Local path or s3:// URI to a COCO .json, or a directory containing "
+            "one; press Enter to skip)"
         ),
     ).unsafe_ask()
     answer = answer.strip()
@@ -540,7 +550,7 @@ def _build_sidecar(
     total = len(keys)
     logger.info(f"Found {total} file(s) to process in {backend.display_root}.")
 
-    is_image_or_video = data_type in (_IMAGE_DATA_TYPES | _VIDEO_DATA_TYPES)
+    is_image_or_video = data_type in (IMAGE_DATA_TYPES | _VIDEO_DATA_TYPES)
     is_point_cloud = data_type in _POINT_CLOUD_DATA_TYPES
 
     if not (is_image_or_video or is_point_cloud):
@@ -697,6 +707,7 @@ def _format_replay_command(
     *,
     output_filename: str | None = None,
     local_copy: bool = False,
+    coco: str | None = None,
 ) -> str:
     """Build the copy-pasteable replay command for ``sidecar generate`` or
     ``validate``. ``subcommand`` is the command words (e.g. ``["sidecar",
@@ -723,6 +734,8 @@ def _format_replay_command(
         parts += ["--spatial-reference", shlex.quote(spatial_reference)]
     if ignore_missing_orientation:
         parts.append("--ignore-missing-orientation")
+    if coco:
+        parts += ["--coco", shlex.quote(coco)]
     return " ".join(parts)
 
 
@@ -751,6 +764,7 @@ class WizardResult(NamedTuple):
     local_copy: bool
     spatial_reference: str | None
     ignore_missing_orientation: bool
+    coco: str | None
 
 
 def _run_interactive_wizard(
@@ -768,6 +782,7 @@ def _run_interactive_wizard(
     spatial_reference: str | None,
     ignore_missing_orientation: bool,
     ignore_missing_orientation_provided: bool,
+    coco: str | None = None,
     save: bool = True,
 ) -> WizardResult:
     """Prompt for any value the user didn't pass on the CLI.
@@ -793,6 +808,9 @@ def _run_interactive_wizard(
             client_sidecar = _ask_client_sidecar()
         if client_schema is None and client_sidecar is not None:
             client_schema = _ask_client_schema()
+        # COCO label impact only applies to imagery.
+        if coco is None and data_type in IMAGE_DATA_TYPES:
+            coco = _ask_coco()
         if spatial_reference is None:
             spatial_reference = _ask_spatial_reference()
         if not full_provided:
@@ -816,6 +834,7 @@ def _run_interactive_wizard(
         local_copy=local_copy,
         spatial_reference=spatial_reference,
         ignore_missing_orientation=ignore_missing_orientation,
+        coco=coco,
     )
 
 
@@ -923,6 +942,19 @@ def generate(
             ),
         ),
     ] = False,
+    coco: Annotated[
+        str | None,
+        typer.Option(
+            "--coco",
+            help=(
+                "Optional COCO label file (local path, s3://… URI, or a directory "
+                "containing one). Image data types only. After linting, reports "
+                "how many labels sit on images with missing/zero-size metadata "
+                "(degraded/unusable/not_on_disk), and adds those tiers to the "
+                "failed-rows CSV (--report)."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Scan a directory, extract per-file metadata, and write a sidecar CSV.
 
@@ -948,18 +980,7 @@ def generate(
             ctx.get_parameter_source("ignore_missing_orientation")
             == click.core.ParameterSource.COMMANDLINE
         )
-        (
-            directory,
-            data_type,
-            output_filename,
-            client_sidecar,
-            client_schema,
-            full,
-            verbosity_choice,
-            local_copy,
-            spatial_reference,
-            ignore_missing_orientation,
-        ) = _run_interactive_wizard(
+        result = _run_interactive_wizard(
             directory,
             data_type,
             output_filename,
@@ -974,7 +995,19 @@ def generate(
             spatial_reference,
             ignore_missing_orientation,
             ignore_orientation_provided,
+            coco=coco,
         )
+        directory = result.directory
+        data_type = result.data_type
+        output_filename = result.output_filename
+        client_sidecar = result.client_sidecar
+        client_schema = result.client_schema
+        full = result.full
+        verbosity_choice = result.verbosity
+        local_copy = result.local_copy
+        spatial_reference = result.spatial_reference
+        ignore_missing_orientation = result.ignore_missing_orientation
+        coco = result.coco
         logging.getLogger().setLevel(
             level_for(
                 verbose=verbosity_choice == "verbose",
@@ -1010,6 +1043,7 @@ def generate(
                 local_copy=local_copy,
                 spatial_reference=spatial_reference,
                 ignore_missing_orientation=ignore_missing_orientation,
+                coco=coco,
             )
         )
 
@@ -1036,6 +1070,7 @@ def generate(
             schema_path=None,
             input_files_path=directory,
             ignore_missing_orientation=ignore_missing_orientation,
+            coco_path=coco,
         )
     except Exception as e:
         _fail("Failed to lint generated sidecar", e)

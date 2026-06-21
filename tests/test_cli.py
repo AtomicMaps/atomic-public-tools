@@ -101,6 +101,20 @@ def test_validate_help_omits_save_only_options():
     assert "--local-copy" not in result.stdout
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["sidecar", "generate", "--help"],
+        ["validate", "--help"],
+        ["lint", "sidecar", "--help"],
+    ],
+)
+def test_coco_option_listed(argv):
+    result = runner.invoke(app, argv, env={"COLUMNS": "200"})
+    assert result.exit_code == 0
+    assert "--coco" in result.stdout
+
+
 def test_version():
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0

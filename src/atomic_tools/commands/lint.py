@@ -15,12 +15,14 @@ import typer
 
 from atomic_tools.commands.sidecar import (
     _ask_client_schema,
+    _ask_coco,
     _ask_data_type,
     _ask_ignore_missing_orientation,
     _ask_verbosity,
     ask_schema_uri,
 )
 from atomic_tools.utils.utils import DataTypeEnum
+from atomic_tools.validators.coco import IMAGE_DATA_TYPES
 from atomic_tools.validators.report import LintReport
 from atomic_tools.validators.schema import lint_schema_file
 from atomic_tools.validators.sidecar import lint_sidecar_file
@@ -153,6 +155,7 @@ def _format_sidecar_replay_command(
     input_files: str | None,
     verbosity: VerbosityChoice,
     ignore_missing_orientation: bool,
+    coco: str | None,
 ) -> str:
     parts = [
         "am-tools",
@@ -171,6 +174,8 @@ def _format_sidecar_replay_command(
         parts += ["--input-files", shlex.quote(input_files)]
     if ignore_missing_orientation:
         parts.append("--ignore-missing-orientation")
+    if coco:
+        parts += ["--coco", shlex.quote(coco)]
     return " ".join(parts)
 
 
@@ -286,6 +291,19 @@ def lint_sidecar_cmd(
             ),
         ),
     ] = False,
+    coco: Annotated[
+        str | None,
+        typer.Option(
+            "--coco",
+            help=(
+                "Optional COCO label file (local path, s3://… URI, or a directory "
+                "containing one). Image data types only; --datatype required. "
+                "Reports how many labels sit on images with missing/zero-size "
+                "metadata (degraded/unusable/not_on_disk), and adds those tiers "
+                "to the failed-rows CSV (--report)."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Validate a sidecar CSV (client or generated)."""
     from atomic_tools.cli import Verbosity, level_for
@@ -304,6 +322,7 @@ def lint_sidecar_cmd(
         ctx.get_parameter_source("ignore_missing_orientation")
         == click.core.ParameterSource.COMMANDLINE
     )
+    coco_provided = ctx.get_parameter_source("coco") == click.core.ParameterSource.COMMANDLINE
 
     # If the user didn't provide required info via arguments, ask interactively
     wizard_ran = path is None or (datatype is None and not final_provided)
@@ -325,6 +344,9 @@ def lint_sidecar_cmd(
                 schema = _ask_client_schema()
             if input_files is None and not input_files_provided:
                 input_files = _ask_input_files()
+            # COCO label impact only applies to imagery and needs a datatype.
+            if not coco_provided and datatype in IMAGE_DATA_TYPES:
+                coco = _ask_coco()
             if not verbosity_provided:
                 verbosity_choice = _ask_verbosity()
         except KeyboardInterrupt:
@@ -351,6 +373,7 @@ def lint_sidecar_cmd(
                 input_files=input_files,
                 verbosity=verbosity_choice,
                 ignore_missing_orientation=ignore_missing_orientation,
+                coco=coco,
             )
         )
 
@@ -361,6 +384,7 @@ def lint_sidecar_cmd(
         schema_path=schema,
         input_files_path=input_files,
         ignore_missing_orientation=ignore_missing_orientation,
+        coco_path=coco,
     )
     typer.echo(report.render())
 

@@ -66,6 +66,23 @@ def test_validate_runs_lint_in_final_mode(captured_lint, tmp_path):
     assert captured_lint["path_exists_during_lint"] is True
 
 
+def test_validate_passes_coco_to_lint(captured_lint, tmp_path):
+    result = runner.invoke(
+        app,
+        [
+            "validate",
+            "--directory",
+            str(tmp_path),
+            "--datatype",
+            "oriented_image",
+            "--coco",
+            str(tmp_path / "labels.coco.json"),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured_lint["lint_kwargs"]["coco_path"] == str(tmp_path / "labels.coco.json")
+
+
 def test_validate_passes_through_optional_args(captured_lint, tmp_path):
     result = runner.invoke(
         app,

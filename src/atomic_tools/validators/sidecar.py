@@ -43,6 +43,7 @@ def lint_sidecar_file(
     schema_path: str | Path | None,
     input_files_path: str | None,
     ignore_missing_orientation: bool = False,
+    coco_path: str | None = None,
 ) -> LintReport:
     report = LintReport()
 
@@ -150,6 +151,18 @@ def lint_sidecar_file(
     report.missing_data = _build_missing_data_report(
         df, required_groups, columns_set, default_row_idx
     )
+
+    if coco_path:
+        _apply_coco_impact(
+            df=df,
+            coco_path=coco_path,
+            data_type=data_type,
+            required_groups=required_groups,
+            optional_groups=optional_groups,
+            columns_set=columns_set,
+            default_row_idx=default_row_idx,
+            report=report,
+        )
 
     analyze_spatial_distribution(df, report)
 
@@ -496,5 +509,80 @@ def _check_file_inventory(
             f"{len(missing)} input file(s) have no row in this client sidecar: {listing}",
             fix_hint=(
                 "The generator will fill in any missing files automatically; this is informational."
+            ),
+        )
+
+
+def _apply_coco_impact(
+    *,
+    df: pd.DataFrame,
+    coco_path: str,
+    data_type: DataTypeEnum | None,
+    required_groups: list[list[str]],
+    optional_groups: list[list[str]],
+    columns_set: set[str],
+    default_row_idx: int | None,
+    report: LintReport,
+) -> None:
+    """Map COCO labels onto the sidecar's per-row verdicts and report impact."""
+    from atomic_tools.validators import coco as coco_mod
+
+    if data_type is None:
+        report.add_info(
+            "Skipped COCO label-impact: --datatype is required to know which "
+            "fields make an image usable."
+        )
+        return
+    if data_type not in coco_mod.IMAGE_DATA_TYPES:
+        report.add_warning(
+            f"COCO file ignored: label impact only applies to image data types, "
+            f"not {data_type.value}.",
+            fix_hint="Drop --coco for this datatype.",
+        )
+        return
+
+    try:
+        resolved_path, coco_images = coco_mod.load_coco(coco_path)
+    except coco_mod.CocoError as e:
+        report.add_error(f"Could not use COCO file: {e}")
+        return
+
+    if not coco_images:
+        report.add_warning(f"COCO file {resolved_path} has no images[] entries.")
+        return
+
+    impact = coco_mod.analyze_coco_impact(
+        df=df,
+        coco_path=resolved_path,
+        coco_images=coco_images,
+        required_groups=required_groups,
+        optional_groups=optional_groups,
+        columns_set=columns_set,
+        default_row_idx=default_row_idx,
+    )
+    report.coco_impact = impact
+
+    for line in impact.summary_lines():
+        report.add_info(line)
+
+    if report.missing_data is not None and impact.verdicts:
+        coco_mod.augment_missing_data(report.missing_data, impact)
+
+    flagged, truncated = coco_mod.flagged_sample(
+        impact, tiers={coco_mod.TIER_UNUSABLE, coco_mod.TIER_NOT_ON_DISK}
+    )
+    if flagged:
+        detail = "; ".join(
+            f"{v.report_name or '?'} [{v.tier}, {v.labels} label(s)]" for v in flagged
+        )
+        if truncated:
+            detail += f" (+{truncated} more)"
+        n_images = impact.unusable + impact.not_on_disk
+        report.add_warning(
+            f"{n_images} image(s) unusable/not-on-disk carry {impact.unusable_labels} "
+            f"label(s): {detail}",
+            fix_hint=(
+                "Per-image detail (including degraded rows) is in the failed-rows "
+                "CSV — use --report to save it."
             ),
         )
