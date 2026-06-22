@@ -248,6 +248,110 @@ def test_lint_attaches_coco_impact_and_csv(tmp_path):
     assert any("Label impact" in f.message for f in report.infos())
 
 
+def test_lint_not_on_disk_fails_unusable_warns(tmp_path):
+    # a.jpg = complete, c.jpg = present-but-unusable, d.jpg = not in the sidecar.
+    sidecar = _write_sidecar(
+        tmp_path,
+        [
+            ["DEFAULT", "", "", "", "", ""],
+            ["a.jpg", "51", "-114", "100", "2024:01:01", "90"],
+            ["c.jpg", "", "", "", "", ""],
+        ],
+    )
+    coco = _write_coco(
+        tmp_path,
+        images=[
+            {"id": 1, "file_name": "a.jpg", "width": 10, "height": 10},
+            {"id": 3, "file_name": "c.jpg", "width": 10, "height": 10},
+            {"id": 4, "file_name": "d.jpg", "width": 10, "height": 10},
+        ],
+        annotations=[{"image_id": 3}, {"image_id": 4}, {"image_id": 4}],
+    )
+    report = _lint(sidecar, DataTypeEnum.oriented_image, coco)
+
+    # not-on-disk (d.jpg, 2 labels) is now a hard failure.
+    assert report.has_errors()
+    err = next(f for f in report.errors() if "no matching file" in f.message)
+    assert "2 label(s)" in err.message
+    assert "d.jpg" in err.message
+
+    # present-but-unusable (c.jpg, 1 label) stays a warning, not an error.
+    warn = next(f for f in report.warnings() if "unusable carry" in f.message)
+    assert "1 label(s)" in warn.message
+    assert "no matching file" not in warn.message
+
+
+def test_lint_not_on_disk_downgraded_to_warning(tmp_path):
+    # Same setup as the failing case, but with not-on-disk reported as a warning
+    # (as `validate` does) — the gap is surfaced without erroring.
+    sidecar = _write_sidecar(
+        tmp_path,
+        [
+            ["DEFAULT", "", "", "", "", ""],
+            ["a.jpg", "51", "-114", "100", "2024:01:01", "90"],
+        ],
+    )
+    coco = _write_coco(
+        tmp_path,
+        images=[
+            {"id": 1, "file_name": "a.jpg", "width": 10, "height": 10},
+            {"id": 4, "file_name": "d.jpg", "width": 10, "height": 10},
+        ],
+        annotations=[{"image_id": 4}, {"image_id": 4}],
+    )
+    report = lint_sidecar_file(
+        str(sidecar),
+        final=True,
+        data_type=DataTypeEnum.oriented_image,
+        schema_path=None,
+        input_files_path=None,
+        ignore_missing_orientation=True,
+        coco_path=str(coco),
+        coco_not_on_disk_is_error=False,
+    )
+
+    # not-on-disk (d.jpg, 2 labels) is a warning, and produces no error.
+    assert not any("no matching file" in f.message for f in report.errors())
+    warn = next(f for f in report.warnings() if "no matching file" in f.message)
+    assert "2 label(s)" in warn.message
+    assert "d.jpg" in warn.message
+
+
+def test_render_shows_coco_matching_breakdown(tmp_path):
+    sidecar = _write_sidecar(
+        tmp_path,
+        [
+            ["DEFAULT", "", "", "", "", ""],
+            ["a.jpg", "51", "-114", "100", "2024:01:01", "90"],
+            ["c.jpg", "", "", "", "", ""],
+        ],
+    )
+    coco = _write_coco(
+        tmp_path,
+        images=[
+            {"id": 1, "file_name": "a.jpg", "width": 10, "height": 10},
+            {"id": 3, "file_name": "c.jpg", "width": 10, "height": 10},
+            {"id": 4, "file_name": "d.jpg", "width": 10, "height": 10},
+        ],
+        annotations=[{"image_id": 1}, {"image_id": 3}, {"image_id": 4}],
+    )
+    import click
+
+    report = _lint(sidecar, DataTypeEnum.oriented_image, coco)
+    out = click.unstyle(report.render())
+    assert "COCO label matching (labels.coco.json):" in out
+    # one image in each of complete / unusable / not_on_disk, plus a total row.
+    # Spacing is column-aligned, so match each row by its own collapsed text.
+    # a.jpg is degraded (has Heading but no Pitch/Roll), c.jpg unusable (missing
+    # required fields), d.jpg not-on-disk (absent from the sidecar).
+    rows = {" ".join(ln.split()) for ln in out.splitlines()}
+    assert "complete 0 image(s) 0 label(s)" in rows
+    assert "degraded 1 image(s) 1 label(s)" in rows
+    assert "unusable 1 image(s) 1 label(s)" in rows
+    assert "not_on_disk 1 image(s) 1 label(s)" in rows
+    assert "total 3 image(s) 3 label(s)" in rows
+
+
 def test_lint_coco_ignored_for_non_image_datatype(tmp_path):
     sidecar = _write_sidecar(tmp_path, [["DEFAULT", "", "", "", "", ""]])
     coco = _write_coco(tmp_path, images=[{"id": 1, "file_name": "a.jpg"}], annotations=[])

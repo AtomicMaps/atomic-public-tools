@@ -44,6 +44,7 @@ def lint_sidecar_file(
     input_files_path: str | None,
     ignore_missing_orientation: bool = False,
     coco_path: str | None = None,
+    coco_not_on_disk_is_error: bool = True,
 ) -> LintReport:
     report = LintReport()
 
@@ -162,6 +163,7 @@ def lint_sidecar_file(
             columns_set=columns_set,
             default_row_idx=default_row_idx,
             report=report,
+            not_on_disk_is_error=coco_not_on_disk_is_error,
         )
 
     analyze_spatial_distribution(df, report)
@@ -523,6 +525,7 @@ def _apply_coco_impact(
     columns_set: set[str],
     default_row_idx: int | None,
     report: LintReport,
+    not_on_disk_is_error: bool = True,
 ) -> None:
     """Map COCO labels onto the sidecar's per-row verdicts and report impact."""
     from atomic_tools.validators import coco as coco_mod
@@ -560,6 +563,7 @@ def _apply_coco_impact(
         columns_set=columns_set,
         default_row_idx=default_row_idx,
     )
+    impact.not_on_disk_is_error = not_on_disk_is_error
     report.coco_impact = impact
 
     for line in impact.summary_lines():
@@ -568,21 +572,51 @@ def _apply_coco_impact(
     if report.missing_data is not None and impact.verdicts:
         coco_mod.augment_missing_data(report.missing_data, impact)
 
-    flagged, truncated = coco_mod.flagged_sample(
-        impact, tiers={coco_mod.TIER_UNUSABLE, coco_mod.TIER_NOT_ON_DISK}
+    csv_hint = (
+        "Per-image detail (including degraded rows) is in the failed-rows "
+        "CSV — use --report to save it."
     )
-    if flagged:
-        detail = "; ".join(
-            f"{v.report_name or '?'} [{v.tier}, {v.labels} label(s)]" for v in flagged
+
+    def _format(verdicts: list) -> str:
+        return "; ".join(
+            f"{v.report_name or '?'} [{v.tier}, {v.labels} label(s)]" for v in verdicts
         )
-        if truncated:
-            detail += f" (+{truncated} more)"
-        n_images = impact.unusable + impact.not_on_disk
-        report.add_warning(
-            f"{n_images} image(s) unusable/not-on-disk carry {impact.unusable_labels} "
+
+    # not-on-disk means the COCO references images that were never extracted
+    # into the sidecar (no matching file), so their labels can't be carried
+    # through Flow. When building a sidecar this blocks (must be fixed before the
+    # file ships); during `validate` it's downgraded to a warning so an
+    # informational "is my data clean?" run reports the gap without failing.
+    nod_flagged, nod_truncated = coco_mod.flagged_sample(
+        impact, tiers={coco_mod.TIER_NOT_ON_DISK}
+    )
+    if nod_flagged:
+        detail = _format(nod_flagged)
+        if nod_truncated:
+            detail += f" (+{nod_truncated} more)"
+        add_finding = report.add_error if not_on_disk_is_error else report.add_warning
+        add_finding(
+            f"{impact.not_on_disk} COCO image(s) have no matching file in the input "
+            f"directory, carrying {impact.labels_in_tier(coco_mod.TIER_NOT_ON_DISK)} "
             f"label(s): {detail}",
             fix_hint=(
-                "Per-image detail (including degraded rows) is in the failed-rows "
-                "CSV — use --report to save it."
+                "These labels reference images that aren't in the scanned directory. "
+                "Either add the missing images, or trim the COCO to the images present. "
+                f"{csv_hint}"
             ),
+        )
+
+    # unusable-but-present images (a required field is missing, or zero width/
+    # height) stay a warning — the image is here, the metadata just needs fixing.
+    unusable_flagged, unusable_truncated = coco_mod.flagged_sample(
+        impact, tiers={coco_mod.TIER_UNUSABLE}
+    )
+    if unusable_flagged:
+        detail = _format(unusable_flagged)
+        if unusable_truncated:
+            detail += f" (+{unusable_truncated} more)"
+        report.add_warning(
+            f"{impact.unusable} image(s) unusable carry "
+            f"{impact.labels_in_tier(coco_mod.TIER_UNUSABLE)} label(s): {detail}",
+            fix_hint=csv_hint,
         )

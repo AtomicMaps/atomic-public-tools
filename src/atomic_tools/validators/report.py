@@ -119,6 +119,9 @@ class LintReport:
             if finding.fix_hint:
                 lines.append(click.style(f"        fix: {finding.fix_hint}", fg="bright_black"))
 
+        if self.coco_impact is not None:
+            lines.extend(self._render_coco_breakdown())
+
         n_err = len(self.errors())
         n_warn = len(self.warnings())
         if n_err:
@@ -133,3 +136,37 @@ class LintReport:
             footer = click.style("PASSED.", fg="green", bold=True)
         lines.append(footer)
         return "\n".join(lines)
+
+    def _render_coco_breakdown(self) -> list[str]:
+        """An aligned per-tier image/label table, shown just above the footer so
+        the COCO matching outcome is the last thing the user sees.
+        """
+        impact = self.coco_impact
+        assert impact is not None
+        rows = impact.tier_counts()
+        sev_color = {"ok": "green", "warn": "yellow", "error": "bright_red"}
+
+        imgs = [r[1] for r in rows] + [impact.images_in_coco]
+        labs = [r[2] for r in rows] + [impact.total_labels]
+        name_w = max(len(r[0]) for r in rows)
+        img_w = max(len(str(v)) for v in imgs)
+        lab_w = max(len(str(v)) for v in labs)
+
+        out = ["", click.style(f"COCO label matching ({impact.display_name}):", bold=True)]
+        for tier, n_img, n_lab, sev in rows:
+            # Dim tiers with nothing in them; colour the rest by severity.
+            fg = sev_color[sev] if n_img else "bright_black"
+            out.append(
+                click.style(
+                    f"  {tier:<{name_w}}  {n_img:>{img_w}} image(s)  {n_lab:>{lab_w}} label(s)",
+                    fg=fg,
+                )
+            )
+        out.append(
+            click.style(
+                f"  {'total':<{name_w}}  {impact.images_in_coco:>{img_w}} image(s)  "
+                f"{impact.total_labels:>{lab_w}} label(s)",
+                bold=True,
+            )
+        )
+        return out

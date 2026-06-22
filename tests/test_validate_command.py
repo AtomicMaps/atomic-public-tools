@@ -81,6 +81,8 @@ def test_validate_passes_coco_to_lint(captured_lint, tmp_path):
     )
     assert result.exit_code == 0, result.output
     assert captured_lint["lint_kwargs"]["coco_path"] == str(tmp_path / "labels.coco.json")
+    # validate is informational: COCO not-on-disk is a warning here, not an error.
+    assert captured_lint["lint_kwargs"]["coco_not_on_disk_is_error"] is False
 
 
 def test_validate_passes_through_optional_args(captured_lint, tmp_path):

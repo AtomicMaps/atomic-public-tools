@@ -98,10 +98,40 @@ class CocoImpact:
     affected_labels: int = 0
     unusable_labels: int = 0
     verdicts: list[CocoVerdict] = field(default_factory=list)
+    # Whether not-on-disk blocks (sidecar generation) or merely warns
+    # (informational `validate` runs). Drives both the finding severity and the
+    # colour of the not_on_disk row in the matching breakdown so they agree.
+    not_on_disk_is_error: bool = True
+
+    def labels_in_tier(self, tier: str) -> int:
+        """Total labels carried by images classified into ``tier``."""
+        return sum(v.labels for v in self.verdicts if v.tier == tier)
+
+    @property
+    def display_name(self) -> str:
+        return os.path.basename(self.coco_path)
+
+    def tier_counts(self) -> list[tuple[str, int, int, str]]:
+        """Ordered ``(tier, image_count, label_count, severity)`` rows for an
+        end-of-run matching breakdown. ``severity`` is one of ``ok``/``warn``/
+        ``error`` so the renderer can colour each tier without re-deriving which
+        tier blocks. Complete labels are the total minus everything affected.
+        """
+        return [
+            (TIER_COMPLETE, self.complete, self.total_labels - self.affected_labels, "ok"),
+            (TIER_DEGRADED, self.degraded, self.labels_in_tier(TIER_DEGRADED), "warn"),
+            (TIER_UNUSABLE, self.unusable, self.labels_in_tier(TIER_UNUSABLE), "warn"),
+            (
+                TIER_NOT_ON_DISK,
+                self.not_on_disk,
+                self.labels_in_tier(TIER_NOT_ON_DISK),
+                "error" if self.not_on_disk_is_error else "warn",
+            ),
+        ]
 
     def summary_lines(self) -> list[str]:
         return [
-            f"Label impact ({os.path.basename(self.coco_path)}): "
+            f"Label impact ({self.display_name}): "
             f"{self.images_in_coco} image(s) in COCO — "
             f"complete={self.complete} degraded={self.degraded} "
             f"unusable={self.unusable} not_on_disk={self.not_on_disk}.",

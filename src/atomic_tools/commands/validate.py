@@ -74,6 +74,10 @@ def _validate(
             input_files_path=directory,
             ignore_missing_orientation=ignore_missing_orientation,
             coco_path=coco,
+            # validate is informational — a COCO referencing images absent from
+            # the scanned directory is reported as a warning here, not a hard
+            # failure (it blocks only when generating a sidecar that ships).
+            coco_not_on_disk_is_error=False,
         )
 
 
