@@ -11,6 +11,15 @@ or an altitude in the wrong units — by looking at the batch as a whole:
 * files lying more than 2 standard deviations from the median distance,
 * the same distance/SD analysis applied to altitude.
 
+For point clouds (which have no GPS columns) the same idea is applied to each
+file's bounding-box center: the histogram shows each cloud's planar distance
+(in miles) from the median bbox center, plus an elevation (Z-center, in feet)
+distribution. Each bbox center is transformed into the goal CRS (Web Mercator)
+first — using that row's effective CRS (its ``file_srs``, else the batch
+``fallback_srs``) — so distance/elevation are reported in that CRS's units
+(meters, converted to miles/feet) regardless of the source CRS; a row with no
+CRS at all is an error rather than a guess at the source units.
+
 Uses ``numpy`` only, which clients already have via pandas, so no extra
 install is required.
 """
@@ -22,6 +31,12 @@ from typing import TYPE_CHECKING
 import click
 import numpy as np
 
+from atomic_tools.utils.coordinates import (
+    WEB_MERCATOR_EPSG,
+    transform_center_to_web_mercator,
+    transform_coordinates,
+    vertical_meters_per_unit,
+)
 from atomic_tools.validators.constants import DEFAULT_ROW_NAME, MAX_LISTED_FILES
 from atomic_tools.validators.values import parse_elevation, to_decimal_degree
 
@@ -34,7 +49,27 @@ _LAT_COL = "GPSLatitude"
 _LON_COL = "GPSLongitude"
 _ALT_COL = "GPSAltitude"
 
+# Per-file header CRS (every point cloud row) and the batch fallback CRS (only
+# the DEFAULT row, set via --spatial-reference). A row's effective CRS is its
+# file_srs, else the batch fallback_srs (see sidecar._add_file_srs_column and
+# sidecar._add_spatial_reference_column).
+_FILE_SRS_COL = "file_srs"
+_FALLBACK_SRS_COL = "fallback_srs"
+
+# Point-cloud bounding-box columns (see extractors.extract_pdal_metadata).
+_BOUNDS_MINX = "bounds.minx"
+_BOUNDS_MAXX = "bounds.maxx"
+_BOUNDS_MINY = "bounds.miny"
+_BOUNDS_MAXY = "bounds.maxy"
+_BOUNDS_MINZ = "bounds.minz"
+_BOUNDS_MAXZ = "bounds.maxz"
+
 _EARTH_RADIUS_MILES = 3958.7613
+# Point-cloud bounds come in source-CRS units, which for the projected CRSs
+# these clouds use are meters. Convert distance to miles and elevation to feet
+# so the histograms read in familiar units.
+_METERS_PER_MILE = 1609.344
+_FEET_PER_METER = 3.280839895
 _HISTOGRAM_BINS = 10
 _BAR_WIDTH = 24
 _SD_THRESHOLD = 2.0
@@ -168,8 +203,73 @@ def _non_default_rows(df: pd.DataFrame) -> pd.DataFrame:
     return df[first_col != DEFAULT_ROW_NAME]
 
 
+def _cell_crs(value: object) -> str | None:
+    """Return a non-empty CRS string from a cell, or None for blank/NaN."""
+    crs = str(value).strip()
+    return crs if crs and crs.lower() != "nan" else None
+
+
+def _fallback_crs(df: pd.DataFrame) -> str | None:
+    """Return the batch fallback CRS from the DEFAULT row's ``fallback_srs``.
+
+    Populated only when the sidecar was built with ``--spatial-reference``; a row
+    with no ``file_srs`` of its own falls back to this batch value.
+    """
+    if df.shape[1] == 0 or _FALLBACK_SRS_COL not in df.columns:
+        return None
+    is_default = df[df.columns[0]].astype(str).str.strip() == DEFAULT_ROW_NAME
+    for value in df.loc[is_default, _FALLBACK_SRS_COL]:
+        crs = _cell_crs(value)
+        if crs is not None:
+            return crs
+    return None
+
+
+def _row_crs(row: pd.Series, fallback: str | None) -> str | None:
+    """Return a row's effective CRS: its ``file_srs``, else the batch ``fallback``."""
+    if _FILE_SRS_COL in row.index:
+        crs = _cell_crs(row[_FILE_SRS_COL])
+        if crs is not None:
+            return crs
+    return fallback
+
+
+def _is_point_cloud_sidecar(rows: pd.DataFrame) -> bool:
+    """True if these rows look like point clouds (carry bounds or a file_srs col)."""
+    cols = set(rows.columns)
+    return _FILE_SRS_COL in cols or {_BOUNDS_MINX, _BOUNDS_MAXX} <= cols
+
+
+def _check_point_cloud_crs(
+    rows: pd.DataFrame,
+    filenames: pd.Series,
+    fallback: str | None,
+    report: LintReport,
+) -> None:
+    """Error if any point-cloud row has no CRS in either ``file_srs`` or ``fallback_srs``."""
+    if not _is_point_cloud_sidecar(rows):
+        return
+    missing = [
+        name
+        for name, (_, row) in zip(filenames, rows.iterrows(), strict=True)
+        if _row_crs(row, fallback) is None
+    ]
+    if missing:
+        report.add_error(
+            f"{len(missing)} point cloud row(s) have no CRS in either "
+            f"'{_FILE_SRS_COL}' or '{_FALLBACK_SRS_COL}': "
+            f"{_truncated_listing([repr(n) for n in missing])}",
+            fix_hint=(
+                "Regenerate the sidecar so PDAL records each file's CRS in "
+                f"'{_FILE_SRS_COL}', or pass --spatial-reference to set a "
+                f"'{_FALLBACK_SRS_COL}'."
+            ),
+        )
+
+
 def analyze_spatial_distribution(df: pd.DataFrame, report: LintReport) -> None:
     """Add batch-level spatial outlier findings to ``report`` (no-op if no coords)."""
+    fallback = _fallback_crs(df)
     rows = _non_default_rows(df)
     if rows.empty:
         return
@@ -179,6 +279,8 @@ def analyze_spatial_distribution(df: pd.DataFrame, report: LintReport) -> None:
 
     _analyze_coordinates(rows, filenames, report)
     _analyze_altitude(rows, filenames, report)
+    _check_point_cloud_crs(rows, filenames, fallback, report)
+    _analyze_point_cloud_bounds(rows, filenames, report, fallback)
 
 
 def _analyze_coordinates(
@@ -292,6 +394,210 @@ def _analyze_altitude(
         report=report,
         label="altitude",
         unit="",
+    )
+
+
+def _bounds_centroid(
+    row: pd.Series, lo_col: str, hi_col: str
+) -> float | None:
+    """Return the midpoint of ``[lo_col, hi_col]`` for one row, or None if unparseable.
+
+    Reuses :func:`parse_elevation`, which extracts a leading signed number, so it
+    copes with the plain numeric bounds PDAL emits (including negatives).
+    """
+    if lo_col not in row.index or hi_col not in row.index:
+        return None
+    lo = parse_elevation(row[lo_col])
+    hi = parse_elevation(row[hi_col])
+    if lo is None or hi is None:
+        return None
+    return (lo + hi) / 2.0
+
+
+def _centers_to_web_mercator(
+    cx_list: list[float],
+    cy_list: list[float],
+    crs_list: list[str],
+) -> tuple[list[float], list[float]] | None:
+    """Transform every bbox center's X/Y from its own CRS into Web Mercator.
+
+    Each center is transformed with its row's effective CRS (``crs_list``), so a
+    batch spanning multiple source CRSs still lands in one comparable frame.
+    All-or-nothing: returns None if any center fails to transform (an unusable
+    CRS, or a point outside the projection's valid domain).
+
+    Z is deliberately *not* transformed here — pyproj's 3D transform leaves Z
+    untouched when the source vertical datum is ``unknown`` (so a feet value
+    would survive uncorrected). Elevation is converted from source units
+    separately via :func:`vertical_meters_per_unit`.
+    """
+    tx: list[float] = []
+    ty: list[float] = []
+    for cx, cy, crs in zip(cx_list, cy_list, crs_list, strict=True):
+        result = transform_center_to_web_mercator(cx, cy, None, crs)
+        if result is None:
+            return None
+        tx.append(result[0])
+        ty.append(result[1])
+    return tx, ty
+
+
+def _format_center(center_x: float, center_y: float) -> str:
+    """Describe a Web Mercator batch center as lat/lon (with the raw EPSG:3857 X/Y).
+
+    The histograms work in Web Mercator, but a center in EPSG:3857 meters is
+    unreadable as a location, so lead with the lat/lon (EPSG:4326) a human can
+    drop into a map. Falls back to just the X/Y if the back-transform fails.
+    """
+    try:
+        lon, lat = transform_coordinates(center_x, center_y, WEB_MERCATOR_EPSG, "EPSG:4326")
+    except Exception:
+        return f"{center_x:,.3f}, {center_y:,.3f} (EPSG:3857)"
+    return (
+        f"{lat:.6f}, {lon:.6f} (lat/lon) "
+        f"[EPSG:3857 {center_x:,.3f}, {center_y:,.3f}]"
+    )
+
+
+def _analyze_point_cloud_bounds(
+    rows: pd.DataFrame,
+    filenames: pd.Series,
+    report: LintReport,
+    fallback: str | None,
+) -> None:
+    """Distance-from-centroid histogram for point clouds, from each file's bbox.
+
+    Mirrors :func:`_analyze_coordinates` but for point clouds: the "location" of
+    each file is the center of its bounding box (midpoint of min/max in X and Y),
+    the batch center is the median of those centers, and distance is the planar
+    (Euclidean) distance in miles. Each bbox center's X/Y is transformed into the
+    goal CRS (Web Mercator, meters) using that row's effective CRS (its
+    ``file_srs``, else the batch ``fallback``) so distances are comparable
+    regardless of the source CRS's units, and the batch center is reported in
+    lat/lon. Rows with no CRS are skipped here (and flagged by
+    :func:`_check_point_cloud_crs`). The Z-center is converted to feet from the
+    source CRS's own vertical unit (not the reprojection, which can't be trusted
+    to put Z in meters — see :func:`vertical_meters_per_unit`) and fed to a
+    separate elevation distribution mirroring :func:`_analyze_altitude`. No-op
+    when bounds absent.
+    """
+    if not {_BOUNDS_MINX, _BOUNDS_MAXX, _BOUNDS_MINY, _BOUNDS_MAXY} <= set(rows.columns):
+        return
+
+    names: list[str] = []
+    cx_list: list[float] = []
+    cy_list: list[float] = []
+    cz_feet_list: list[float | None] = []
+    crs_list: list[str] = []
+    for name, (_, row) in zip(filenames, rows.iterrows(), strict=True):
+        cx = _bounds_centroid(row, _BOUNDS_MINX, _BOUNDS_MAXX)
+        cy = _bounds_centroid(row, _BOUNDS_MINY, _BOUNDS_MAXY)
+        crs = _row_crs(row, fallback)
+        # Individually-malformed bounds are already flagged by the value checks,
+        # and CRS-less rows by _check_point_cloud_crs; only histogram the files
+        # whose X/Y bounds parsed and that carry a CRS to reach the goal CRS.
+        if cx is None or cy is None or crs is None:
+            continue
+        names.append(name)
+        cx_list.append(cx)
+        cy_list.append(cy)
+        crs_list.append(crs)
+        # Convert the Z-center from the source CRS's *own* vertical unit (often
+        # US survey feet for state-plane data) to feet for display. Done from the
+        # source unit rather than from a 3D reprojection because pyproj leaves Z
+        # untouched when the vertical datum is unknown — so reprojected Z can't
+        # be trusted to be in meters.
+        cz = _bounds_centroid(row, _BOUNDS_MINZ, _BOUNDS_MAXZ)
+        vfactor = vertical_meters_per_unit(crs)
+        if cz is None or vfactor is None:
+            cz_feet_list.append(None)
+        else:
+            cz_feet_list.append(cz * vfactor * _FEET_PER_METER)
+
+    if not names:
+        return
+
+    # Transform the centers' X/Y into the goal CRS so planar distances are in
+    # Web Mercator meters; this doubles as a transformability check at lint time.
+    transformed = _centers_to_web_mercator(cx_list, cy_list, crs_list)
+    if transformed is None:
+        report.add_error(
+            "Could not transform the point-cloud bounding-box centers to the goal "
+            "CRS (EPSG:3857), so their distance/elevation units are unknown.",
+            fix_hint=(
+                f"Ensure each row's '{_FILE_SRS_COL}' (or the batch "
+                f"'{_FALLBACK_SRS_COL}') is a CRS pyproj can transform to EPSG:3857."
+            ),
+        )
+        return
+    cx_list, cy_list = transformed
+    crs_note = " (reprojected to EPSG:3857)"
+
+    cx_arr = np.array(cx_list)
+    cy_arr = np.array(cy_list)
+
+    # Median rather than mean so a single wild outlier doesn't drag the center
+    # toward itself and mask the very thing we're trying to surface.
+    center_x = float(np.median(cx_arr))
+    center_y = float(np.median(cy_arr))
+    center_label = _format_center(center_x, center_y)
+
+    if len(names) < 2:
+        report.add_info(
+            f"Only 1 point cloud; skipped distance distribution "
+            f"(bbox center at {center_label})."
+        )
+    else:
+        distances = np.hypot(cx_arr - center_x, cy_arr - center_y) / _METERS_PER_MILE
+        outlier_mask, center, std = _sd_outliers(distances, high_only=True)
+        details = _outlier_details(names, distances, outlier_mask, "mi")
+        report.add_info(
+            f"Batch center (median bbox center): {center_label} "
+            f"({len(names)} point clouds). Distance from center (miles){crs_note}:\n"
+            + _render_histogram(distances, "mi", outlier_mask)
+            + _format_outlier_listing(details)
+        )
+        _flag_sd_outliers(
+            details=details,
+            center=center,
+            std=std,
+            report=report,
+            label="distance from center",
+            unit="mi",
+        )
+
+    _analyze_point_cloud_elevation(names, cz_feet_list, report)
+
+
+def _analyze_point_cloud_elevation(
+    names: list[str], cz_feet_list: list[float | None], report: LintReport
+) -> None:
+    """Z-center distribution across point clouds (analog of :func:`_analyze_altitude`).
+
+    ``cz_feet_list`` is already in feet, converted from each file's own source
+    vertical unit (see :func:`_analyze_point_cloud_bounds`).
+    """
+    z_names = [n for n, z in zip(names, cz_feet_list, strict=True) if z is not None]
+    z_vals = [z for z in cz_feet_list if z is not None]
+    if len(z_names) < 2:
+        return
+
+    z_arr = np.array(z_vals)
+    outlier_mask, center, std = _sd_outliers(z_arr, high_only=False)
+    details = _outlier_details(z_names, z_arr, outlier_mask, "ft")
+    report.add_info(
+        f"Elevation distribution across {len(z_names)} point clouds "
+        f"(bbox Z center, feet):\n"
+        + _render_histogram(z_arr, "ft", outlier_mask)
+        + _format_outlier_listing(details)
+    )
+    _flag_sd_outliers(
+        details=details,
+        center=center,
+        std=std,
+        report=report,
+        label="elevation",
+        unit="ft",
     )
 
 

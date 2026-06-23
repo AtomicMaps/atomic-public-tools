@@ -69,7 +69,7 @@ DATA_TYPE_INFO: dict = {
         "sub_types": ["rgb", "ir", "thermal"],
     },
     "point_cloud": {
-        "include": [".las", ".laz", "zlas"],
+        "include": [".las", ".laz", "zlas", ".e57"],
         "exclude": [".copc.las", ".copc.laz"],
         "sidecars": [],
     },

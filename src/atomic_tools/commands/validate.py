@@ -148,7 +148,7 @@ def validate(
                 "CRS of the source coordinates (e.g. 'EPSG:32612' or '32612'). "
                 "For images, lat/lon (and altitude) are treated as X/Y/Z "
                 "in this CRS and reprojected to EPSG:4326. For point clouds, a "
-                "'spatial_reference' column is added with this value in the "
+                "'fallback_srs' column is added with this value in the "
                 "DEFAULT row."
             ),
         ),

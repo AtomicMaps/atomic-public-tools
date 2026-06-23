@@ -2,12 +2,12 @@
 
 Originally `tasks/generate_sidecar_csv/generate_sidecar_csv.py`.
 
-Requires the following external binaries on PATH at runtime (NOT pip-installable):
+Requires the following external binaries at runtime (NOT pip-installable):
 
   * exiftool
-  * pdal  (the conda binary at /opt/conda/envs/pdal/bin/pdal — see
-          ``utils/extractors.py``; adjust if the client environment uses a
-          different path)
+  * pdal  (located at runtime by ``utils/extractors.find_pdal_bin`` — it
+          searches PATH, the active conda env, any conda env named ``pdal``,
+          and common install roots; override with the ``PDAL_BIN`` env var)
 """
 
 import logging
@@ -34,10 +34,18 @@ from atomic_tools.client_sidecar import (
 )
 from atomic_tools.io.storage import from_directory
 from atomic_tools.utils.aws_errors import find_auth_error, print_help_block
-from atomic_tools.utils.coordinates import transform_coordinates
+from atomic_tools.utils.coordinates import (
+    WEB_MERCATOR_EPSG,
+    can_transform_to_web_mercator,
+    transform_center_to_web_mercator,
+    transform_coordinates,
+)
 from atomic_tools.utils.extractors import (
+    PdalNotFoundError,
     extract_exif_metadata,
+    extract_pdal_crs,
     extract_pdal_metadata,
+    find_pdal_bin,
     infer_date_from_filepath,
 )
 from atomic_tools.utils.utils import (
@@ -72,6 +80,11 @@ _POINT_CLOUD_DATA_TYPES = {DataTypeEnum.point_cloud}
 
 def _fail(message: str, exc: Exception) -> NoReturn:
     """Log a failure, surface AWS auth help if applicable, and exit non-zero."""
+    # A missing pdal is a setup problem, not a bug — show the install
+    # instructions plainly rather than burying them under a traceback.
+    if isinstance(exc, PdalNotFoundError):
+        logger.error(f"{message}: {exc}")
+        raise typer.Exit(code=1) from None
     logger.exception(message)
     auth_err = find_auth_error(exc)
     if auth_err is not None:
@@ -468,9 +481,19 @@ def build_sidecar_df(
 
 
 def _add_spatial_reference_column(df, spatial_reference: str) -> None:
-    """Add a 'spatial_reference' column, populated only on the DEFAULT row."""
-    df["spatial_reference"] = ""
-    df.loc[df["Filename"] == "DEFAULT", "spatial_reference"] = spatial_reference
+    """Add a 'fallback_srs' column, populated only on the DEFAULT row."""
+    df["fallback_srs"] = ""
+    df.loc[df["Filename"] == "DEFAULT", "fallback_srs"] = spatial_reference
+
+
+def _add_file_srs_column(df, file_metadata: list[tuple[str, dict]]) -> None:
+    """Add a 'file_srs' column holding each file's PDAL-read header CRS.
+
+    Blank for files whose header carried no CRS (those rely on the DEFAULT row's
+    'fallback_srs') and blank on the DEFAULT row itself.
+    """
+    crs_by_label = {label: (extract_pdal_crs(meta) or "") for label, meta in file_metadata}
+    df["file_srs"] = df["Filename"].map(lambda name: crs_by_label.get(name, ""))
 
 
 def _reproject_dataframe(df, in_srs: str) -> None:
@@ -496,6 +519,78 @@ def _reproject_dataframe(df, in_srs: str) -> None:
             df.at[idx, "GPSAltitude"] = str(nz)
         df.at[idx, "GPSLongitude"] = str(nx)
         df.at[idx, "GPSLatitude"] = str(ny)
+
+
+def _bbox_center_from_meta(meta: dict) -> tuple[float, float, float | None] | None:
+    """Return ``(cx, cy, cz)`` — the bbox-center midpoints — from PDAL metadata.
+
+    ``cz`` is None when Z bounds are absent. Returns None if the X/Y bounds are
+    missing or non-numeric, so the caller can fall back to a CRS-only check.
+    """
+
+    def midpoint(lo_key: str, hi_key: str) -> float | None:
+        try:
+            return (float(meta[lo_key]) + float(meta[hi_key])) / 2.0
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    cx = midpoint("bounds.minx", "bounds.maxx")
+    cy = midpoint("bounds.miny", "bounds.maxy")
+    if cx is None or cy is None:
+        return None
+    return cx, cy, midpoint("bounds.minz", "bounds.maxz")
+
+
+def _validate_point_cloud_crs(
+    file_metadata: list[tuple[str, dict]],
+    spatial_reference: str | None,
+) -> None:
+    """Ensure every point cloud has a CRS reachable from EPSG:3857.
+
+    Flow renders point clouds in Web Mercator, so each file must resolve to a
+    CRS pyproj can transform there. The CRS is whatever PDAL read from the file
+    header, falling back to the ``--spatial-reference`` backup when the header
+    has none. The transformability check actually transforms the file's
+    bounding-box center into EPSG:3857 (a stricter test than merely building a
+    transformer — it also catches a CRS that maps real coordinates to non-finite
+    values), falling back to a CRS-only check when bounds are unavailable. Raises
+    ``ValueError`` if any file ends up with no CRS at all, or with a CRS that
+    cannot be transformed to EPSG:3857.
+    """
+    missing: list[str] = []
+    untransformable: list[str] = []
+
+    for label, meta in file_metadata:
+        crs = extract_pdal_crs(meta) or spatial_reference
+        if not crs:
+            missing.append(label)
+            continue
+        center = _bbox_center_from_meta(meta)
+        if center is not None:
+            transformable = transform_center_to_web_mercator(*center, crs) is not None
+        else:
+            transformable = can_transform_to_web_mercator(crs)
+        if not transformable:
+            untransformable.append(label)
+
+    if missing:
+        preview = ", ".join(missing[:10]) + (" …" if len(missing) > 10 else "")
+        raise ValueError(
+            f"PDAL could not determine a CRS for {len(missing)} point cloud "
+            f"file(s) and no backup CRS was provided. Re-run with "
+            f"--spatial-reference (e.g. 'EPSG:32612') to supply one. "
+            f"Affected files: {preview}"
+        )
+
+    if untransformable:
+        preview = ", ".join(untransformable[:10]) + (
+            " …" if len(untransformable) > 10 else ""
+        )
+        raise ValueError(
+            f"The CRS for {len(untransformable)} point cloud file(s) cannot be "
+            f"transformed to {WEB_MERCATOR_EPSG} by pyproj, so it cannot be "
+            f"used. Affected files: {preview}"
+        )
 
 
 def _build_sidecar(
@@ -569,6 +664,12 @@ def _build_sidecar(
     empty_count = 0
     tool = "EXIF" if is_image_or_video else "PDAL"
 
+    # For point clouds, confirm pdal is available up front so we fail fast with
+    # install instructions instead of logging the same "pdal not found" warning
+    # once per file as we walk the directory.
+    if is_point_cloud:
+        find_pdal_bin()
+
     # Progress bar renders to stderr only when attached to a TTY; on a pipe or
     # in a log file tqdm suppresses it (``disable=None``), so non-interactive
     # runs stay clean. The "<looked-at>/<total>" count is shown by default; the
@@ -600,6 +701,11 @@ def _build_sidecar(
             "those rows will have blank fields in the sidecar."
         )
 
+    # Point clouds must carry a CRS that reaches Web Mercator; fail fast here
+    # (before merging/building) rather than emit a sidecar Flow can't ingest.
+    if is_point_cloud:
+        _validate_point_cloud_crs(file_metadata, spatial_reference)
+
     if client_sidecar:
         client_url = client_sidecar.strip()
         if not client_url:
@@ -630,10 +736,15 @@ def _build_sidecar(
         f"Sidecar DataFrame: {len(df)} row(s) (including DEFAULT), {len(df.columns)} column(s)."
     )
 
+    if is_point_cloud:
+        # Record each file's header CRS (with or without --spatial-reference) so
+        # the linter can convert every row's bounds into the goal CRS.
+        _add_file_srs_column(df, file_metadata)
+
     if spatial_reference:
         if is_point_cloud:
             logger.info(
-                f"Recording spatial_reference={spatial_reference!r} in the DEFAULT row."
+                f"Recording fallback_srs={spatial_reference!r} in the DEFAULT row."
             )
             _add_spatial_reference_column(df, spatial_reference)
         elif is_image_or_video:
@@ -925,7 +1036,7 @@ def generate(
                 "CRS of the source coordinates (e.g. 'EPSG:32612' or '32612'). "
                 "For images, lat/lon (and altitude) are treated as X/Y/Z "
                 "in this CRS and reprojected to EPSG:4326. For point clouds, a "
-                "'spatial_reference' column is added with this value in the "
+                "'fallback_srs' column is added with this value in the "
                 "DEFAULT row."
             ),
         ),
