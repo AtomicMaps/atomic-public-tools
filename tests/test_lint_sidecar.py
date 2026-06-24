@@ -53,9 +53,8 @@ def _lint_pointcloud(p):
 # ---- --final mode -------------------------------------------------------
 
 
-def test_final_missing_orientation_columns_warns_not_errors(tmp_path):
-    """Pitch/Heading/Roll are optional for oriented_image: their absence warns
-    but still succeeds (the image renders in Lens without orientation)."""
+def test_final_missing_orientation_columns_error_by_default(tmp_path):
+    """By default, missing Pitch/Heading/Roll on oriented_image is an error."""
     header = ["Filename", "CreateDate", "GPSAltitude", "GPSLatitude", "GPSLongitude"]
     rows = [
         ["DEFAULT", "", "", "", ""],
@@ -68,6 +67,30 @@ def test_final_missing_orientation_columns_warns_not_errors(tmp_path):
         data_type=DataTypeEnum.oriented_image,
         schema_path=None,
         input_files_path=None,
+    )
+    assert report.has_errors()
+    error_text = " ".join(f.message for f in report.errors())
+    assert "Pitch" in error_text
+    assert "Heading" in error_text
+    assert "Roll" in error_text
+
+
+def test_final_missing_orientation_columns_warn_when_ignored(tmp_path):
+    """With ignore_missing_orientation, their absence only warns and succeeds
+    (the image renders in Lens without orientation)."""
+    header = ["Filename", "CreateDate", "GPSAltitude", "GPSLatitude", "GPSLongitude"]
+    rows = [
+        ["DEFAULT", "", "", "", ""],
+        ["1.jpg", "2024:06:15 10:30:00", "1000", "51.0", "-114.0"],
+    ]
+    p = _write_csv(tmp_path, "s.csv", header, rows)
+    report = lint_sidecar_file(
+        str(p),
+        final=True,
+        data_type=DataTypeEnum.oriented_image,
+        schema_path=None,
+        input_files_path=None,
+        ignore_missing_orientation=True,
     )
     assert not report.has_errors(), [f.message for f in report.errors()]
     warning_text = " ".join(f.message for f in report.warnings())
@@ -516,3 +539,45 @@ def test_point_cloud_min_gt_max_warns(tmp_path):
     p = _write_csv(tmp_path, "s.csv", header, rows)
     report = _lint_pointcloud(p)
     assert any("bounds.minx" in f.message and "bounds.maxx" in f.message for f in report.warnings())
+
+
+# ---- --ignore-missing-orientation flag (CLI) ---------------------------
+
+
+def test_cli_oriented_missing_orientation_errors_by_default(tmp_path):
+    from typer.testing import CliRunner
+
+    from atomic_tools.cli import app
+
+    header = ["Filename", "CreateDate", "GPSAltitude", "GPSLatitude", "GPSLongitude"]
+    rows = [["DEFAULT", "", "", "", ""], ["1.jpg", "2024:06:15 10:30:00", "1000", "40.0", "-111.0"]]
+    p = _write_csv(tmp_path, "s.csv", header, rows)
+    result = CliRunner().invoke(
+        app, ["--silent", "lint", "sidecar", str(p), "--final", "--datatype", "oriented_image"]
+    )
+    assert result.exit_code == 1
+    assert "Pitch" in result.stdout
+
+
+def test_cli_ignore_missing_orientation_flag_downgrades_to_warning(tmp_path):
+    from typer.testing import CliRunner
+
+    from atomic_tools.cli import app
+
+    header = ["Filename", "CreateDate", "GPSAltitude", "GPSLatitude", "GPSLongitude"]
+    rows = [["DEFAULT", "", "", "", ""], ["1.jpg", "2024:06:15 10:30:00", "1000", "40.0", "-111.0"]]
+    p = _write_csv(tmp_path, "s.csv", header, rows)
+    result = CliRunner().invoke(
+        app,
+        [
+            "--silent",
+            "lint",
+            "sidecar",
+            str(p),
+            "--final",
+            "--datatype",
+            "oriented_image",
+            "--ignore-missing-orientation",
+        ],
+    )
+    assert result.exit_code == 0

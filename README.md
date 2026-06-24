@@ -107,6 +107,26 @@ am-tools sidecar generate \
   --client-sidecar ./sidecars
 ```
 
+### `am-tools validate`
+Sometimes you just want to know whether your data is clean without leaving a sidecar behind. `am-tools validate` does exactly what `am-tools sidecar generate` does — scans the directory, extracts per-file metadata, merges any client-supplied sidecar, builds the canonical sidecar, and lints it — but **never saves the sidecar** to the remote directory or locally. It's the right command when you only care about the lint report.
+
+It shares all the same options and interactive wizard as `sidecar generate`, with the two save-related questions removed (it doesn't ask what to name the sidecar or whether to keep a local copy, because nothing is written). Like `generate`, it lints in "final" mode and prints the report; it exits non-zero if any errors are found.
+
+```bash
+am-tools validate \
+  --directory ./data \
+  --datatype oriented_image
+
+# with a client sidecar, reprojection, and orientation ignored — same flags as generate
+am-tools validate \
+  --directory ./data \
+  --datatype oriented_image \
+  --client-sidecar ./my_sidecar.csv \
+  --client-schema ./schemas/my_schema.json \
+  --spatial-reference EPSG:32612 \
+  --ignore-missing-orientation
+```
+
 ### `am-tools lint`
 There are two subcommands in `am-tools lint`:
 
@@ -146,6 +166,49 @@ After running `am-tools lint schema`, if any errors are detected, it will tell y
 The command `am-tools lint sidecar` can lint both the client provided sidecar as well as the generated sidecar that `am-tools sidecar generate` builds. The first thing the linter wil ask you after a link to the sidecar is if the sidecar is generated or not. For linting a client provided sidecar, it will skip certain checks because it assumes that the files will have metadata that will be combined with the client sidecar.
 
 For linting the generated sidecar, it will ask for data type. This is used to make sure it has all of the required columns for that data type. There are some basic checks for required fields to make sure the values make sense. If any fields fail this test, the script will tell you possible fixes.
+
+##### Orientation data for oriented images
+When the data type is `oriented_image` (either chosen in the wizard or passed with `--datatype oriented_image`), the wizard asks whether you want to ignore missing orientation data (`Pitch`/`Heading`/`Roll`). **By default — unless you explicitly opt to ignore it — missing orientation is treated as an error.** Choosing to ignore it (or passing `--ignore-missing-orientation`) downgrades it to a warning; the images still process and appear in Lens, just without orientation. The same option is available on `am-tools sidecar generate`, where it controls the automatic lint that runs on the generated sidecar. To skip the prompt non-interactively:
+
+```
+am-tools lint sidecar my_sidecar.csv --final --datatype oriented_image --ignore-missing-orientation
+am-tools sidecar generate --directory ./imgs --datatype oriented_image --ignore-missing-orientation
+```
+
+Whenever the sidecar has latitude and longitude columns, the linter also runs a batch-level spatial check to help catch coordinates that parse fine but are wrong relative to the rest of the batch (a dropped decimal, a flipped sign, an altitude in the wrong units):
+
+- Files whose coordinates fall outside the US are listed (an approximate bounding-box check — ignore it if your data is legitimately abroad).
+- The batch's median center is computed and a histogram shows how many files fall into each distance-from-center bin (in miles), so outliers stand out.
+- Files lying more than 2 standard deviations from the median distance are listed individually.
+- The same distribution histogram and 2-SD outlier list are produced for altitude.
+
+These are reported as warnings (and informational histograms), so they never block submission on their own — they're there to help you spot bad rows.
+
+When a sidecar lint finishes with any errors or warnings, the tool offers to save a CSV report of just the rows that are missing required data. The report has one row per file with a gap and one column per required field, with `MISSING` marking the fields that file lacks (a field counts as present if it's filled on the row or on the `DEFAULT` row). When it asks for a path, pressing Enter without typing one saves the report into the current directory and prints a link to the saved file. You can also write this report non-interactively with `--report <path>`:
+
+```
+am-tools lint sidecar my_sidecar.csv --final --datatype oriented_image --report missing.csv
+```
+
+##### Label impact for labelled datasets (`--coco`)
+If your imagery has a COCO label file, pass it with `--coco` to find out how many **labels (annotations)** sit on images whose metadata isn't good enough for the pipeline. This is available on `am-tools lint sidecar`, `am-tools validate`, and `am-tools sidecar generate` (and prompted for in the wizard), but only for image data types — it's skipped for point clouds and video. Point `--coco` at a COCO `.json`, an `s3://…` URI, or a directory containing one (it looks for `input.coco.json`, then `*.coco.json`, then the first `*.json` with an `images[]` array).
+
+Each labelled image is matched to its sidecar row (by filename, using the parent folders to break ties when basenames collide) and sorted into a tier:
+
+- **complete** — every required and optional field is present.
+- **degraded** — usable, but an optional field group is missing (e.g. orientation when run with `--ignore-missing-orientation`). The image still processes but with less accuracy.
+- **unusable** — a required field is missing, or the COCO entry reports a zero `width`/`height`.
+- **not_on_disk** — the COCO references an image with no sidecar row (it was never extracted) — the most unusable case.
+
+The lint output gains a label-impact summary (how many labels are *affected* = degraded + unusable + not_on_disk, and how many are *unusable* = unusable + not_on_disk), and the failed-rows CSV (`--report`) gains `coco_status` and `coco_labels` columns so you can see per-image which labels are at risk — including the degraded and not-on-disk images, which wouldn't otherwise appear in that report.
+
+```
+am-tools validate --directory ./imgs --datatype oriented_image --coco labels.coco.json
+am-tools lint sidecar my_sidecar.csv --final --datatype oriented_image --coco labels.coco.json --report impact.csv
+am-tools sidecar generate --directory ./imgs --datatype oriented_image --coco labels.coco.json
+```
+
+> Note: the tier respects the same required/optional policy the linter uses. For `oriented_image`, orientation is required by default (so a missing heading makes an image *unusable*); pass `--ignore-missing-orientation` to treat orientation as optional (so it only makes an image *degraded*).
 
 ## Project layout
 

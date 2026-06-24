@@ -6,9 +6,12 @@ locally first) and a display filename used in log messages.
 """
 
 import datetime
+import glob
 import json
 import logging
+import os
 import re
+import shutil
 import subprocess
 from typing import TYPE_CHECKING
 
@@ -116,9 +119,113 @@ _EXIFTOOL_NOISE_FIELDS = {
     "GPSPosition",
 }
 
-_PDAL_BIN = "/opt/conda/envs/pdal/bin/pdal"
 # LAS header stores bounds as flat keys; remap to bounds.X for downstream.
 _LAS_BOUNDS_DIMS = frozenset({"minx", "miny", "maxx", "maxy", "minz", "maxz"})
+
+# Keys in flattened `pdal info --metadata` output that carry the file's CRS as a
+# WKT/PROJ string, in preference order. PDAL leaves all of these as "" when the
+# point cloud header has no spatial reference. `spatialreference` is the
+# top-level canonical value; the `srs.*` variants are fallbacks.
+_PDAL_CRS_KEYS = (
+    "spatialreference",
+    "comp_spatialreference",
+    "srs.wkt",
+    "srs.compoundwkt",
+    "srs.horizontal",
+    "srs.proj4",
+)
+
+# How to get PDAL — surfaced to the user when it can't be located.
+_PDAL_INSTALL_HELP = (
+    "PDAL is required for point cloud metadata extraction but could not be found.\n"
+    "Install it via conda (recommended):\n"
+    "    conda install -c conda-forge pdal\n"
+    "or, on macOS, via Homebrew:\n"
+    "    brew install pdal\n"
+    "If PDAL is already installed in a non-standard location, put its 'bin' "
+    "directory on your PATH or set the PDAL_BIN environment variable to the "
+    "full path of the pdal executable."
+)
+
+# Cached result of _find_pdal_bin() so the (filesystem-walking) search runs once.
+_PDAL_BIN: "str | None" = None
+
+
+class PdalNotFoundError(RuntimeError):
+    """Raised when the pdal executable cannot be located on the system."""
+
+
+def _candidate_pdal_paths() -> "list[str]":
+    """Logical places a pdal executable might live, in priority order.
+
+    Ordered: explicit override, then PATH, then the active conda env, then any
+    conda env named 'pdal', then common conda/Homebrew install roots.
+    """
+    candidates: list[str] = []
+
+    override = os.environ.get("PDAL_BIN")
+    if override:
+        candidates.append(override)
+
+    on_path = shutil.which("pdal")
+    if on_path:
+        candidates.append(on_path)
+
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix:
+        candidates.append(os.path.join(conda_prefix, "bin", "pdal"))
+
+    # conda/mamba install roots; check a 'pdal'-named env first, then any env.
+    conda_roots = [
+        os.environ.get("CONDA_ROOT"),
+        os.environ.get("MAMBA_ROOT_PREFIX"),
+        "/opt/conda",
+        "/opt/miniconda3",
+        "/opt/anaconda3",
+        os.path.expanduser("~/miniconda3"),
+        os.path.expanduser("~/anaconda3"),
+        os.path.expanduser("~/miniforge3"),
+        os.path.expanduser("~/mambaforge"),
+    ]
+    for root in conda_roots:
+        if not root:
+            continue
+        candidates.append(os.path.join(root, "envs", "pdal", "bin", "pdal"))
+        candidates.extend(glob.glob(os.path.join(root, "envs", "*", "bin", "pdal")))
+        candidates.append(os.path.join(root, "bin", "pdal"))
+
+    # Homebrew / common system prefixes (PATH usually covers these, but not
+    # always when invoked from a GUI or a stripped environment).
+    candidates.extend(["/opt/homebrew/bin/pdal", "/usr/local/bin/pdal", "/usr/bin/pdal"])
+
+    # De-duplicate while preserving order.
+    seen: set[str] = set()
+    unique: list[str] = []
+    for path in candidates:
+        if path and path not in seen:
+            seen.add(path)
+            unique.append(path)
+    return unique
+
+
+def find_pdal_bin() -> str:
+    """Locate the pdal executable, caching the result for reuse.
+
+    Searches PATH, the conda environment, and other logical install locations.
+    Raises :class:`PdalNotFoundError` with install instructions if none of the
+    candidates is an executable file.
+    """
+    global _PDAL_BIN
+    if _PDAL_BIN is not None:
+        return _PDAL_BIN
+
+    for path in _candidate_pdal_paths():
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            logger.info(f"Using pdal executable at {path}")
+            _PDAL_BIN = path
+            return _PDAL_BIN
+
+    raise PdalNotFoundError(_PDAL_INSTALL_HELP)
 
 
 def _flatten_dict(data: dict, prefix: str = "") -> dict:
@@ -171,9 +278,10 @@ def extract_pdal_metadata(local_path: str, filename: str) -> dict:
     incompatibilities between the conda env and system libstdc++.
     """
     try:
+        pdal_bin = find_pdal_bin()
         logger.info(f"Running pdal info for {filename}")
         proc = subprocess.run(
-            [_PDAL_BIN, "info", "--metadata", local_path],
+            [pdal_bin, "info", "--metadata", local_path],
             capture_output=True,
             text=True,
             timeout=120,
@@ -208,6 +316,26 @@ def extract_pdal_metadata(local_path: str, filename: str) -> dict:
             f"creation_doy={out.get('creation_doy')}"
         )
         return out
+    except PdalNotFoundError:
+        # Missing pdal is a setup problem affecting every file, not a per-file
+        # extraction failure — let it propagate so the caller can stop and tell
+        # the user how to install it.
+        raise
     except Exception as exc:
         logger.warning(f"PDAL extraction failed for {filename}: {exc}")
         return {}
+
+
+def extract_pdal_crs(meta: dict) -> str | None:
+    """Return the CRS PDAL read from a point cloud's header, or None if absent.
+
+    Reads the flattened metadata produced by :func:`extract_pdal_metadata` and
+    returns the first non-empty CRS string (see :data:`_PDAL_CRS_KEYS`). PDAL
+    emits empty strings for these keys when the file carries no spatial
+    reference, so a None result means "PDAL could not find a CRS".
+    """
+    for key in _PDAL_CRS_KEYS:
+        value = meta.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None

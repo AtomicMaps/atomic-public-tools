@@ -24,16 +24,15 @@ from atomic_tools.utils.utils import (
     has_value,
     load_sidecar_df,
 )
-from atomic_tools.validators.report import LintReport
+from atomic_tools.validators.constants import DEFAULT_ROW_NAME, MAX_LISTED_FILES
+from atomic_tools.validators.geography import analyze_spatial_distribution
+from atomic_tools.validators.report import MISSING_MARKER, LintReport, MissingDataReport
 from atomic_tools.validators.required_fields import (
     ALL_SIDECAR_FIELD_GROUPS,
     OPTIONAL_SIDECAR_FIELD_GROUPS,
     REQUIRED_SIDECAR_FIELD_GROUPS,
 )
 from atomic_tools.validators.values import VALIDATORS
-
-_MAX_LISTED_FILES = 20
-_DEFAULT_ROW_NAME = "DEFAULT"
 
 
 def lint_sidecar_file(
@@ -43,6 +42,9 @@ def lint_sidecar_file(
     data_type: DataTypeEnum | None,
     schema_path: str | Path | None,
     input_files_path: str | None,
+    ignore_missing_orientation: bool = False,
+    coco_path: str | None = None,
+    coco_not_on_disk_is_error: bool = True,
 ) -> LintReport:
     report = LintReport()
 
@@ -102,6 +104,12 @@ def lint_sidecar_file(
 
     required_groups = REQUIRED_SIDECAR_FIELD_GROUPS.get(data_type, []) if data_type else []
     optional_groups = OPTIONAL_SIDECAR_FIELD_GROUPS.get(data_type, []) if data_type else []
+    if data_type == DataTypeEnum.oriented_image and not ignore_missing_orientation:
+        # Orientation (Pitch/Heading/Roll) is optional-by-default for oriented
+        # images, but unless the caller opts to ignore it we promote it to
+        # required so missing orientation is an error rather than a warning.
+        required_groups = [*required_groups, *optional_groups]
+        optional_groups = []
     columns = list(df.columns)
     columns_set = set(columns)
 
@@ -141,6 +149,25 @@ def lint_sidecar_file(
                 report=report,
             )
 
+    report.missing_data = _build_missing_data_report(
+        df, required_groups, columns_set, default_row_idx
+    )
+
+    if coco_path:
+        _apply_coco_impact(
+            df=df,
+            coco_path=coco_path,
+            data_type=data_type,
+            required_groups=required_groups,
+            optional_groups=optional_groups,
+            columns_set=columns_set,
+            default_row_idx=default_row_idx,
+            report=report,
+            not_on_disk_is_error=coco_not_on_disk_is_error,
+        )
+
+    analyze_spatial_distribution(df, report)
+
     if not report.findings:
         mode = "final" if final else "client"
         datatype_str = data_type.value if data_type is not None else "unspecified"
@@ -156,7 +183,7 @@ def _find_default_row_index(df: pd.DataFrame) -> int | None:
     if df.shape[1] == 0 or len(df) == 0:
         return None
     stripped = df[df.columns[0]].astype(str).str.strip()
-    matches = stripped[stripped == _DEFAULT_ROW_NAME]
+    matches = stripped[stripped == DEFAULT_ROW_NAME]
     if matches.empty:
         return None
     return int(matches.index[0])
@@ -236,10 +263,10 @@ def _check_required_values(
                 missing_rows.append((int(idx), fname))
 
         if missing_rows:
-            sample = missing_rows[:_MAX_LISTED_FILES]
+            sample = missing_rows[:MAX_LISTED_FILES]
             tail = (
-                f" (+{len(missing_rows) - _MAX_LISTED_FILES} more)"
-                if len(missing_rows) > _MAX_LISTED_FILES
+                f" (+{len(missing_rows) - MAX_LISTED_FILES} more)"
+                if len(missing_rows) > MAX_LISTED_FILES
                 else ""
             )
             row_summary = ", ".join(f"row {idx} ({name!r})" for idx, name in sample) + tail
@@ -252,6 +279,60 @@ def _check_required_values(
             )
 
     return default_satisfied
+
+
+def _build_missing_data_report(
+    df: pd.DataFrame,
+    required_groups: list[list[str]],
+    columns_set: set[str],
+    default_row_idx: int | None,
+) -> MissingDataReport | None:
+    """Tabulate which required fields each non-DEFAULT row is missing.
+
+    A field group counts as present for a row when the row (or the DEFAULT row)
+    supplies any field in the group — the same rule ``_check_required_values``
+    uses. Returns None when no required fields are known (no datatype), and an
+    empty report (no rows) when nothing is missing.
+    """
+    if not required_groups or df.shape[1] == 0:
+        return None
+
+    file_col = df.columns[0]
+    default_row = df.iloc[default_row_idx] if default_row_idx is not None else None
+    field_columns = [group[0] for group in required_groups]
+
+    # The present fields and DEFAULT-row coverage of each group don't change
+    # per data row, so resolve them once. Groups DEFAULT already covers can't be
+    # missing on any row, so we only re-check the rest row by row.
+    present_by_field = {
+        group[0]: [f for f in group if f in columns_set] for group in required_groups
+    }
+    default_covers = {
+        canonical: default_row is not None and any(has_value(default_row[f]) for f in present)
+        for canonical, present in present_by_field.items()
+    }
+
+    rows: list[dict[str, str]] = []
+    for idx, row in df.iterrows():
+        if idx == default_row_idx:
+            continue
+        record: dict[str, str] = {str(file_col): str(row[file_col]).strip()}
+        any_missing = False
+        for canonical in field_columns:
+            if default_covers[canonical]:
+                missing = False
+            else:
+                missing = not any(has_value(row[f]) for f in present_by_field[canonical])
+                any_missing = any_missing or missing
+            record[canonical] = MISSING_MARKER if missing else ""
+        if any_missing:
+            rows.append(record)
+
+    return MissingDataReport(
+        filename_column=str(file_col),
+        field_columns=field_columns,
+        rows=rows,
+    )
 
 
 def _check_value_formats(
@@ -276,7 +357,7 @@ def _check_value_formats(
             if ok:
                 continue
             if idx == default_row_idx:
-                label = _DEFAULT_ROW_NAME
+                label = DEFAULT_ROW_NAME
             else:
                 fname = file_col_series[idx] if file_col_series is not None else ""
                 label = f"row {idx} ({fname!r})" if fname else f"row {idx}"
@@ -359,7 +440,7 @@ def _check_file_inventory(
 
     file_col = df.columns[0]
     sidecar_filenames = df[file_col].astype(str).str.strip()
-    non_default_mask = sidecar_filenames != _DEFAULT_ROW_NAME
+    non_default_mask = sidecar_filenames != DEFAULT_ROW_NAME
 
     # Bucket by basename so each key only tail-checks rows sharing its
     # basename — tail-suffix requires equal last component.
@@ -404,11 +485,8 @@ def _check_file_inventory(
     if not missing:
         return
     missing.sort()
-    sample = missing[:_MAX_LISTED_FILES]
-    if len(missing) > _MAX_LISTED_FILES:
-        tail = f" (+{len(missing) - _MAX_LISTED_FILES} more)"
-    else:
-        tail = ""
+    sample = missing[:MAX_LISTED_FILES]
+    tail = f" (+{len(missing) - MAX_LISTED_FILES} more)" if len(missing) > MAX_LISTED_FILES else ""
     listing = ", ".join(repr(n) for n in sample) + tail
 
     if final:
@@ -434,4 +512,111 @@ def _check_file_inventory(
             fix_hint=(
                 "The generator will fill in any missing files automatically; this is informational."
             ),
+        )
+
+
+def _apply_coco_impact(
+    *,
+    df: pd.DataFrame,
+    coco_path: str,
+    data_type: DataTypeEnum | None,
+    required_groups: list[list[str]],
+    optional_groups: list[list[str]],
+    columns_set: set[str],
+    default_row_idx: int | None,
+    report: LintReport,
+    not_on_disk_is_error: bool = True,
+) -> None:
+    """Map COCO labels onto the sidecar's per-row verdicts and report impact."""
+    from atomic_tools.validators import coco as coco_mod
+
+    if data_type is None:
+        report.add_info(
+            "Skipped COCO label-impact: --datatype is required to know which "
+            "fields make an image usable."
+        )
+        return
+    if data_type not in coco_mod.IMAGE_DATA_TYPES:
+        report.add_warning(
+            f"COCO file ignored: label impact only applies to image data types, "
+            f"not {data_type.value}.",
+            fix_hint="Drop --coco for this datatype.",
+        )
+        return
+
+    try:
+        resolved_path, coco_images = coco_mod.load_coco(coco_path)
+    except coco_mod.CocoError as e:
+        report.add_error(f"Could not use COCO file: {e}")
+        return
+
+    if not coco_images:
+        report.add_warning(f"COCO file {resolved_path} has no images[] entries.")
+        return
+
+    impact = coco_mod.analyze_coco_impact(
+        df=df,
+        coco_path=resolved_path,
+        coco_images=coco_images,
+        required_groups=required_groups,
+        optional_groups=optional_groups,
+        columns_set=columns_set,
+        default_row_idx=default_row_idx,
+    )
+    impact.not_on_disk_is_error = not_on_disk_is_error
+    report.coco_impact = impact
+
+    for line in impact.summary_lines():
+        report.add_info(line)
+
+    if report.missing_data is not None and impact.verdicts:
+        coco_mod.augment_missing_data(report.missing_data, impact)
+
+    csv_hint = (
+        "Per-image detail (including degraded rows) is in the failed-rows "
+        "CSV — use --report to save it."
+    )
+
+    def _format(verdicts: list) -> str:
+        return "; ".join(
+            f"{v.report_name or '?'} [{v.tier}, {v.labels} label(s)]" for v in verdicts
+        )
+
+    # not-on-disk means the COCO references images that were never extracted
+    # into the sidecar (no matching file), so their labels can't be carried
+    # through Flow. When building a sidecar this blocks (must be fixed before the
+    # file ships); during `validate` it's downgraded to a warning so an
+    # informational "is my data clean?" run reports the gap without failing.
+    nod_flagged, nod_truncated = coco_mod.flagged_sample(
+        impact, tiers={coco_mod.TIER_NOT_ON_DISK}
+    )
+    if nod_flagged:
+        detail = _format(nod_flagged)
+        if nod_truncated:
+            detail += f" (+{nod_truncated} more)"
+        add_finding = report.add_error if not_on_disk_is_error else report.add_warning
+        add_finding(
+            f"{impact.not_on_disk} COCO image(s) have no matching file in the input "
+            f"directory, carrying {impact.labels_in_tier(coco_mod.TIER_NOT_ON_DISK)} "
+            f"label(s): {detail}",
+            fix_hint=(
+                "These labels reference images that aren't in the scanned directory. "
+                "Either add the missing images, or trim the COCO to the images present. "
+                f"{csv_hint}"
+            ),
+        )
+
+    # unusable-but-present images (a required field is missing, or zero width/
+    # height) stay a warning — the image is here, the metadata just needs fixing.
+    unusable_flagged, unusable_truncated = coco_mod.flagged_sample(
+        impact, tiers={coco_mod.TIER_UNUSABLE}
+    )
+    if unusable_flagged:
+        detail = _format(unusable_flagged)
+        if unusable_truncated:
+            detail += f" (+{unusable_truncated} more)"
+        report.add_warning(
+            f"{impact.unusable} image(s) unusable carry "
+            f"{impact.labels_in_tier(coco_mod.TIER_UNUSABLE)} label(s): {detail}",
+            fix_hint=csv_hint,
         )

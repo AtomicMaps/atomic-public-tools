@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 import pandas as pd
 
-from atomic_tools.utils.object_store import REMOTE_SCHEME_TO_STORE_TYPE, ObjectStore
+from atomic_tools.utils.object_store import store_for_bucket
 from atomic_tools.utils.utils import (
     find_sidecar_row,
     get_object_keys,
@@ -221,9 +221,8 @@ def _list_sidecar_csvs_below(url: str) -> list[str]:
     if is_remote_uri(url):
         parsed = urlparse(url)
         scheme = parsed.scheme.lower()
-        store_type = REMOTE_SCHEME_TO_STORE_TYPE[scheme]
         prefix = parsed.path.strip("/")
-        store = ObjectStore(store_type).from_url(f"{scheme}://{parsed.netloc}")
+        store = store_for_bucket(scheme, parsed.netloc)
         keys = get_object_keys(store, prefix, include=[_CSV_SUFFIX], exclude=[])
         results: list[str] = []
         for key in keys:

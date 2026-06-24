@@ -221,3 +221,4 @@ __marimo__/
 sidecar_csv_path
 Example-fake-data/Pictures/sidecar.csv
 .claude/settings.local.json
+sidecar.csv

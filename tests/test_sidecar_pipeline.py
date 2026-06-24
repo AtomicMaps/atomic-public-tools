@@ -15,14 +15,17 @@ from atomic_tools.client_sidecar import (
 )
 from atomic_tools.commands.sidecar import (
     _ALL_SIDECAR_FIELD_GROUPS,
+    _add_file_srs_column,
     _add_spatial_reference_column,
     _disambiguate_filenames,
     _fill_missing_dates_from_filepath,
     _reproject_dataframe,
     _split_gps_position,
+    _validate_point_cloud_crs,
     _warn_missing_required_fields,
     build_sidecar_df,
 )
+from atomic_tools.utils.extractors import extract_pdal_crs
 from atomic_tools.utils.utils import DataTypeEnum
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -183,12 +186,115 @@ def test_add_spatial_reference_column_point_cloud():
     df = build_sidecar_df(metadata, required_field_groups=pc_groups)
     _add_spatial_reference_column(df, "EPSG:2956")
 
-    assert "spatial_reference" in df.columns
+    assert "fallback_srs" in df.columns
     default = df[df["Filename"] == "DEFAULT"].iloc[0]
-    assert default["spatial_reference"] == "EPSG:2956"
-    # File rows carry no spatial_reference value (it lives in DEFAULT).
+    assert default["fallback_srs"] == "EPSG:2956"
+    # File rows carry no fallback_srs value (it lives in DEFAULT).
     file_row = df[df["Filename"] == "cloud.las"].iloc[0]
-    assert file_row["spatial_reference"] == ""
+    assert file_row["fallback_srs"] == ""
+
+
+def test_add_file_srs_column_records_header_crs():
+    pc_groups = _ALL_SIDECAR_FIELD_GROUPS[DataTypeEnum.point_cloud]
+    metadata = [
+        ("with_crs.las", {"num_points": "1", "bounds.minx": "0", "spatialreference": "EPSG:32612"}),
+        ("no_crs.las", {"num_points": "1", "bounds.minx": "0", "spatialreference": ""}),
+    ]
+    df = build_sidecar_df(metadata, required_field_groups=pc_groups)
+    _add_file_srs_column(df, metadata)
+
+    assert "file_srs" in df.columns
+    assert df[df["Filename"] == "with_crs.las"].iloc[0]["file_srs"] == "EPSG:32612"
+    # A file whose header has no CRS gets a blank cell (it relies on fallback_srs).
+    assert df[df["Filename"] == "no_crs.las"].iloc[0]["file_srs"] == ""
+    # The DEFAULT row is left blank too.
+    assert df[df["Filename"] == "DEFAULT"].iloc[0]["file_srs"] == ""
+
+
+# WKT PDAL emits for a file georeferenced to UTM zone 12N (EPSG:32612).
+_UTM12N_WKT = (
+    'PROJCS["WGS 84 / UTM zone 12N",GEOGCS["WGS 84",DATUM["WGS_1984",'
+    'SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],'
+    'UNIT["degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],'
+    'PARAMETER["central_meridian",-111],UNIT["metre",1],'
+    'AUTHORITY["EPSG","32612"]]'
+)
+
+
+def test_extract_pdal_crs_prefers_top_level_spatialreference():
+    meta = {"spatialreference": _UTM12N_WKT, "srs.wkt": "ignored"}
+    assert extract_pdal_crs(meta) == _UTM12N_WKT
+
+
+def test_extract_pdal_crs_falls_back_to_srs_keys():
+    # PDAL leaves the top-level key empty but populates the srs.* block.
+    meta = {"spatialreference": "", "comp_spatialreference": "", "srs.wkt": _UTM12N_WKT}
+    assert extract_pdal_crs(meta) == _UTM12N_WKT
+
+
+def test_extract_pdal_crs_none_when_header_has_no_crs():
+    # PDAL emits empty strings for every CRS key when the header is unreferenced.
+    meta = {"spatialreference": "", "comp_spatialreference": "", "srs.wkt": "  "}
+    assert extract_pdal_crs(meta) is None
+
+
+def test_validate_point_cloud_crs_passes_with_embedded_crs():
+    file_metadata = [("cloud.las", {"spatialreference": _UTM12N_WKT})]
+    _validate_point_cloud_crs(file_metadata, spatial_reference=None)
+
+
+def test_validate_point_cloud_crs_uses_backup_when_header_missing():
+    file_metadata = [("cloud.las", {"spatialreference": ""})]
+    _validate_point_cloud_crs(file_metadata, spatial_reference="EPSG:32612")
+
+
+def test_validate_point_cloud_crs_transforms_bbox_center():
+    # Bounds present → the check transforms the actual bbox center to EPSG:3857.
+    meta = {
+        "spatialreference": _UTM12N_WKT,
+        "bounds.minx": 500000.0,
+        "bounds.maxx": 500100.0,
+        "bounds.miny": 4500000.0,
+        "bounds.maxy": 4500100.0,
+        "bounds.minz": 10.0,
+        "bounds.maxz": 20.0,
+    }
+    _validate_point_cloud_crs([("cloud.las", meta)], spatial_reference=None)
+
+
+def test_validate_point_cloud_crs_raises_when_center_unreachable_with_bounds():
+    # Even with bounds present, a CRS with no path to Web Mercator is rejected.
+    meta = {
+        "spatialreference": 'LOCAL_CS["unknown",UNIT["metre",1]]',
+        "bounds.minx": 0.0,
+        "bounds.maxx": 100.0,
+        "bounds.miny": 0.0,
+        "bounds.maxy": 100.0,
+    }
+    with pytest.raises(ValueError, match="cannot be\\s+transformed to EPSG:3857"):
+        _validate_point_cloud_crs([("cloud.las", meta)], spatial_reference=None)
+
+
+def test_validate_point_cloud_crs_raises_when_no_crs_and_no_backup():
+    file_metadata = [("a.las", {"spatialreference": ""}), ("b.las", {})]
+    with pytest.raises(ValueError, match="could not determine a CRS"):
+        _validate_point_cloud_crs(file_metadata, spatial_reference=None)
+
+
+def test_validate_point_cloud_crs_raises_when_crs_unreachable_from_3857():
+    # A local engineering CRS parses but has no transform to Web Mercator.
+    local_crs = 'LOCAL_CS["unknown",UNIT["metre",1]]'
+    file_metadata = [("cloud.las", {"spatialreference": local_crs})]
+    with pytest.raises(ValueError, match="cannot be\\s+transformed to EPSG:3857"):
+        _validate_point_cloud_crs(file_metadata, spatial_reference=None)
+
+
+def test_validate_point_cloud_crs_raises_when_backup_unreachable_from_3857():
+    file_metadata = [("cloud.las", {"spatialreference": ""})]
+    with pytest.raises(ValueError, match="cannot be\\s+transformed to EPSG:3857"):
+        _validate_point_cloud_crs(
+            file_metadata, spatial_reference='LOCAL_CS["x",UNIT["metre",1]]'
+        )
 
 
 def test_load_input_sidecar_headered():

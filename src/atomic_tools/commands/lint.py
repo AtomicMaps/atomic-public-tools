@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import shlex
+import sys
+from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 
 import click
@@ -12,11 +15,15 @@ import typer
 
 from atomic_tools.commands.sidecar import (
     _ask_client_schema,
+    _ask_coco,
     _ask_data_type,
+    _ask_ignore_missing_orientation,
     _ask_verbosity,
     ask_schema_uri,
 )
 from atomic_tools.utils.utils import DataTypeEnum
+from atomic_tools.validators.coco import IMAGE_DATA_TYPES
+from atomic_tools.validators.report import LintReport
 from atomic_tools.validators.schema import lint_schema_file
 from atomic_tools.validators.sidecar import lint_sidecar_file
 
@@ -69,6 +76,64 @@ def _echo_replay_command(command: str) -> None:
     click.secho(f"  {command}\n", fg="bright_cyan", bold=True, err=True)
 
 
+def _default_report_name(sidecar_path: str) -> str:
+    base = os.path.basename(sidecar_path.rstrip("/")) or "sidecar"
+    stem = os.path.splitext(base)[0]
+    return f"{stem}_lint_report.csv"
+
+
+def _write_missing_data_report(report: LintReport, report_path: str) -> None:
+    table = report.missing_data
+    if table is None:
+        click.secho(
+            "Cannot write a missing-data report without a datatype "
+            "(it determines which fields are required). Re-run with --datatype.",
+            fg="yellow",
+            err=True,
+        )
+        return
+    saved = Path(report_path).expanduser().resolve()
+    try:
+        table.write_csv(str(saved))
+    except OSError as e:
+        click.secho(f"Could not write report to {saved}: {e}", fg="red", err=True)
+        return
+    click.secho(
+        f"Saved missing-data report ({len(table.rows)} row(s)) to {saved.as_uri()}",
+        fg="green",
+        err=True,
+    )
+
+
+def _maybe_offer_missing_data_report(report: LintReport, *, sidecar_path: str) -> None:
+    """When a lint failed or warned, offer to save the missing-data rows to CSV.
+
+    Only fires for an interactive TTY; scripted runs use the ``--report`` flag.
+    """
+    table = report.missing_data
+    if table is None or table.is_empty():
+        return
+    if not (report.has_errors() or report.warnings()):
+        return
+    if not sys.stdin.isatty():
+        return
+    default_target = Path.cwd() / _default_report_name(sidecar_path)
+    try:
+        if not questionary.confirm(
+            f"Save a CSV report of the {len(table.rows)} row(s) missing required data?",
+            default=True,
+        ).unsafe_ask():
+            return
+        report_path = questionary.text(
+            "Path for the report CSV:",
+            instruction=f"(Press Enter to save to the current directory: {default_target})",
+            default="",
+        ).unsafe_ask()
+    except KeyboardInterrupt:
+        return
+    _write_missing_data_report(report, (report_path or "").strip() or str(default_target))
+
+
 def _verbosity_prefix(verbosity: VerbosityChoice) -> list[str]:
     if verbosity == "verbose":
         return ["--verbose"]
@@ -89,6 +154,8 @@ def _format_sidecar_replay_command(
     schema: str | None,
     input_files: str | None,
     verbosity: VerbosityChoice,
+    ignore_missing_orientation: bool,
+    coco: str | None,
 ) -> str:
     parts = [
         "am-tools",
@@ -105,6 +172,10 @@ def _format_sidecar_replay_command(
         parts += ["--schema", shlex.quote(schema)]
     if input_files:
         parts += ["--input-files", shlex.quote(input_files)]
+    if ignore_missing_orientation:
+        parts.append("--ignore-missing-orientation")
+    if coco:
+        parts += ["--coco", shlex.quote(coco)]
     return " ".join(parts)
 
 
@@ -198,6 +269,41 @@ def lint_sidecar_cmd(
             ),
         ),
     ] = None,
+    report_out: Annotated[
+        str | None,
+        typer.Option(
+            "--report",
+            help=(
+                "Write a CSV of the rows missing required data (one column per "
+                "required field) to this path. Skips the interactive prompt."
+            ),
+        ),
+    ] = None,
+    ignore_missing_orientation: Annotated[
+        bool,
+        typer.Option(
+            "--ignore-missing-orientation",
+            help=(
+                "Only meaningful for --datatype oriented_image with --final. By "
+                "default, missing orientation (Pitch/Heading/Roll) is an error; "
+                "pass this to downgrade it to a warning (the images still process, "
+                "appearing in Lens without orientation)."
+            ),
+        ),
+    ] = False,
+    coco: Annotated[
+        str | None,
+        typer.Option(
+            "--coco",
+            help=(
+                "Optional COCO label file (local path, s3://… URI, or a directory "
+                "containing one). Image data types only; --datatype required. "
+                "Reports how many labels sit on images with missing/zero-size "
+                "metadata (degraded/unusable/not_on_disk), and adds those tiers "
+                "to the failed-rows CSV (--report)."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Validate a sidecar CSV (client or generated)."""
     from atomic_tools.cli import Verbosity, level_for
@@ -212,6 +318,11 @@ def lint_sidecar_cmd(
     input_files_provided = (
         ctx.get_parameter_source("input_files") == click.core.ParameterSource.COMMANDLINE
     )
+    ignore_orientation_provided = (
+        ctx.get_parameter_source("ignore_missing_orientation")
+        == click.core.ParameterSource.COMMANDLINE
+    )
+    coco_provided = ctx.get_parameter_source("coco") == click.core.ParameterSource.COMMANDLINE
 
     # If the user didn't provide required info via arguments, ask interactively
     wizard_ran = path is None or (datatype is None and not final_provided)
@@ -223,10 +334,19 @@ def lint_sidecar_cmd(
                 final = _ask_final()
             if final and datatype is None:
                 datatype = _ask_data_type()
+            if (
+                final
+                and datatype == DataTypeEnum.oriented_image
+                and not ignore_orientation_provided
+            ):
+                ignore_missing_orientation = _ask_ignore_missing_orientation()
             if schema is None and not schema_provided:
                 schema = _ask_client_schema()
             if input_files is None and not input_files_provided:
                 input_files = _ask_input_files()
+            # COCO label impact only applies to imagery and needs a datatype.
+            if not coco_provided and datatype in IMAGE_DATA_TYPES:
+                coco = _ask_coco()
             if not verbosity_provided:
                 verbosity_choice = _ask_verbosity()
         except KeyboardInterrupt:
@@ -252,6 +372,8 @@ def lint_sidecar_cmd(
                 schema=schema,
                 input_files=input_files,
                 verbosity=verbosity_choice,
+                ignore_missing_orientation=ignore_missing_orientation,
+                coco=coco,
             )
         )
 
@@ -261,6 +383,14 @@ def lint_sidecar_cmd(
         data_type=datatype,
         schema_path=schema,
         input_files_path=input_files,
+        ignore_missing_orientation=ignore_missing_orientation,
+        coco_path=coco,
     )
     typer.echo(report.render())
+
+    if report_out is not None:
+        _write_missing_data_report(report, report_out)
+    else:
+        _maybe_offer_missing_data_report(report, sidecar_path=path)
+
     raise typer.Exit(code=report.exit_code())

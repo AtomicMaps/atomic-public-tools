@@ -2,25 +2,27 @@
 
 Originally `tasks/generate_sidecar_csv/generate_sidecar_csv.py`.
 
-Requires the following external binaries on PATH at runtime (NOT pip-installable):
+Requires the following external binaries at runtime (NOT pip-installable):
 
   * exiftool
-  * pdal  (the conda binary at /opt/conda/envs/pdal/bin/pdal — see
-          ``utils/extractors.py``; adjust if the client environment uses a
-          different path)
+  * pdal  (located at runtime by ``utils/extractors.find_pdal_bin`` — it
+          searches PATH, the active conda env, any conda env named ``pdal``,
+          and common install roots; override with the ``PDAL_BIN`` env var)
 """
 
 import logging
 import shlex
 import shutil
+import sys
 import tempfile
 from collections import defaultdict
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, NoReturn
+from typing import TYPE_CHECKING, Annotated, NamedTuple, NoReturn
 
 import click
 import questionary
 import typer
+from tqdm import tqdm
 
 if TYPE_CHECKING:
     from atomic_tools.cli import VerbosityChoice
@@ -32,10 +34,18 @@ from atomic_tools.client_sidecar import (
 )
 from atomic_tools.io.storage import from_directory
 from atomic_tools.utils.aws_errors import find_auth_error, print_help_block
-from atomic_tools.utils.coordinates import transform_coordinates
+from atomic_tools.utils.coordinates import (
+    WEB_MERCATOR_EPSG,
+    can_transform_to_web_mercator,
+    transform_center_to_web_mercator,
+    transform_coordinates,
+)
 from atomic_tools.utils.extractors import (
+    PdalNotFoundError,
     extract_exif_metadata,
+    extract_pdal_crs,
     extract_pdal_metadata,
+    find_pdal_bin,
     infer_date_from_filepath,
 )
 from atomic_tools.utils.utils import (
@@ -45,6 +55,7 @@ from atomic_tools.utils.utils import (
     has_value,
     is_remote_uri,
 )
+from atomic_tools.validators.coco import IMAGE_DATA_TYPES
 from atomic_tools.validators.required_fields import (
     ALL_SIDECAR_FIELD_GROUPS as _ALL_SIDECAR_FIELD_GROUPS,
 )
@@ -61,17 +72,19 @@ sidecar_app = typer.Typer(
     help="Generate a sidecar CSV by scanning a local or remote directory.",
 )
 
-_IMAGE_DATA_TYPES = {
-    DataTypeEnum.ortho_image,
-    DataTypeEnum.oriented_image,
-    DataTypeEnum.spherical_image,
-}
+# Image data types share the EXIF extractor and are the only types COCO label
+# impact applies to — IMAGE_DATA_TYPES is the single source of truth (coco.py).
 _VIDEO_DATA_TYPES = {DataTypeEnum.video}
 _POINT_CLOUD_DATA_TYPES = {DataTypeEnum.point_cloud}
 
 
 def _fail(message: str, exc: Exception) -> NoReturn:
     """Log a failure, surface AWS auth help if applicable, and exit non-zero."""
+    # A missing pdal is a setup problem, not a bug — show the install
+    # instructions plainly rather than burying them under a traceback.
+    if isinstance(exc, PdalNotFoundError):
+        logger.error(f"{message}: {exc}")
+        raise typer.Exit(code=1) from None
     logger.exception(message)
     auth_err = find_auth_error(exc)
     if auth_err is not None:
@@ -105,6 +118,18 @@ def _ask_data_type() -> DataTypeEnum:
         choices=[v.value for v in DataTypeEnum if v in _REQUIRED_SIDECAR_FIELD_GROUPS],
     ).unsafe_ask()
     return DataTypeEnum(choice)
+
+
+def _ask_ignore_missing_orientation() -> bool:
+    return questionary.confirm(
+        "Ignore missing orientation data (Pitch/Heading/Roll)?",
+        instruction=(
+            "(No — the default — treats a missing orientation field as an error; "
+            "Yes downgrades it to a warning so the images still process, "
+            "appearing in Lens without orientation)"
+        ),
+        default=False,
+    ).unsafe_ask()
 
 
 def _ask_output_filename() -> str:
@@ -155,6 +180,18 @@ def _ask_client_sidecar() -> str | None:
         instruction=(
             "(Local path or s3:// URI to a CSV, or a directory whose "
             "subfolders hold the CSVs to merge; press Enter to skip)"
+        ),
+    ).unsafe_ask()
+    answer = answer.strip()
+    return answer or None
+
+
+def _ask_coco() -> str | None:
+    answer = questionary.text(
+        "Optional COCO label file to assess label impact:",
+        instruction=(
+            "(Local path or s3:// URI to a COCO .json, or a directory containing "
+            "one; press Enter to skip)"
         ),
     ).unsafe_ask()
     answer = answer.strip()
@@ -444,9 +481,19 @@ def build_sidecar_df(
 
 
 def _add_spatial_reference_column(df, spatial_reference: str) -> None:
-    """Add a 'spatial_reference' column, populated only on the DEFAULT row."""
-    df["spatial_reference"] = ""
-    df.loc[df["Filename"] == "DEFAULT", "spatial_reference"] = spatial_reference
+    """Add a 'fallback_srs' column, populated only on the DEFAULT row."""
+    df["fallback_srs"] = ""
+    df.loc[df["Filename"] == "DEFAULT", "fallback_srs"] = spatial_reference
+
+
+def _add_file_srs_column(df, file_metadata: list[tuple[str, dict]]) -> None:
+    """Add a 'file_srs' column holding each file's PDAL-read header CRS.
+
+    Blank for files whose header carried no CRS (those rely on the DEFAULT row's
+    'fallback_srs') and blank on the DEFAULT row itself.
+    """
+    crs_by_label = {label: (extract_pdal_crs(meta) or "") for label, meta in file_metadata}
+    df["file_srs"] = df["Filename"].map(lambda name: crs_by_label.get(name, ""))
 
 
 def _reproject_dataframe(df, in_srs: str) -> None:
@@ -474,23 +521,93 @@ def _reproject_dataframe(df, in_srs: str) -> None:
         df.at[idx, "GPSLatitude"] = str(ny)
 
 
-def _generate(
+def _bbox_center_from_meta(meta: dict) -> tuple[float, float, float | None] | None:
+    """Return ``(cx, cy, cz)`` — the bbox-center midpoints — from PDAL metadata.
+
+    ``cz`` is None when Z bounds are absent. Returns None if the X/Y bounds are
+    missing or non-numeric, so the caller can fall back to a CRS-only check.
+    """
+
+    def midpoint(lo_key: str, hi_key: str) -> float | None:
+        try:
+            return (float(meta[lo_key]) + float(meta[hi_key])) / 2.0
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    cx = midpoint("bounds.minx", "bounds.maxx")
+    cy = midpoint("bounds.miny", "bounds.maxy")
+    if cx is None or cy is None:
+        return None
+    return cx, cy, midpoint("bounds.minz", "bounds.maxz")
+
+
+def _validate_point_cloud_crs(
+    file_metadata: list[tuple[str, dict]],
+    spatial_reference: str | None,
+) -> None:
+    """Ensure every point cloud has a CRS reachable from EPSG:3857.
+
+    Flow renders point clouds in Web Mercator, so each file must resolve to a
+    CRS pyproj can transform there. The CRS is whatever PDAL read from the file
+    header, falling back to the ``--spatial-reference`` backup when the header
+    has none. The transformability check actually transforms the file's
+    bounding-box center into EPSG:3857 (a stricter test than merely building a
+    transformer — it also catches a CRS that maps real coordinates to non-finite
+    values), falling back to a CRS-only check when bounds are unavailable. Raises
+    ``ValueError`` if any file ends up with no CRS at all, or with a CRS that
+    cannot be transformed to EPSG:3857.
+    """
+    missing: list[str] = []
+    untransformable: list[str] = []
+
+    for label, meta in file_metadata:
+        crs = extract_pdal_crs(meta) or spatial_reference
+        if not crs:
+            missing.append(label)
+            continue
+        center = _bbox_center_from_meta(meta)
+        if center is not None:
+            transformable = transform_center_to_web_mercator(*center, crs) is not None
+        else:
+            transformable = can_transform_to_web_mercator(crs)
+        if not transformable:
+            untransformable.append(label)
+
+    if missing:
+        preview = ", ".join(missing[:10]) + (" …" if len(missing) > 10 else "")
+        raise ValueError(
+            f"PDAL could not determine a CRS for {len(missing)} point cloud "
+            f"file(s) and no backup CRS was provided. Re-run with "
+            f"--spatial-reference (e.g. 'EPSG:32612') to supply one. "
+            f"Affected files: {preview}"
+        )
+
+    if untransformable:
+        preview = ", ".join(untransformable[:10]) + (
+            " …" if len(untransformable) > 10 else ""
+        )
+        raise ValueError(
+            f"The CRS for {len(untransformable)} point cloud file(s) cannot be "
+            f"transformed to {WEB_MERCATOR_EPSG} by pyproj, so it cannot be "
+            f"used. Affected files: {preview}"
+        )
+
+
+def _build_sidecar(
     directory: str,
     data_type: DataTypeEnum,
-    output_filename: str,
     client_sidecar: str | None,
     client_schema: str | None,
     full: bool = False,
-    local_copy: bool = False,
     spatial_reference: str | None = None,
-) -> str:
-    logger.info(
-        f"Starting sidecar CSV generation — directory={directory!r} "
-        f"data_type={data_type} output={output_filename!r} "
-        f"client_sidecar={client_sidecar!r} client_schema={client_schema!r} "
-        f"full={full} local_copy={local_copy} spatial_reference={spatial_reference!r}"
-    )
+):
+    """Scan a directory, extract metadata, and assemble the sidecar DataFrame.
 
+    This is the shared core of both ``sidecar generate`` and ``validate``: it
+    does everything up to (but not including) writing the CSV anywhere. Returns
+    ``(df, backend)`` so callers can either persist the sidecar (``generate``)
+    or lint it from a throwaway temp file without saving (``validate``).
+    """
     if spatial_reference:
         # Fail fast on an unparseable CRS before doing any extraction work.
         from pyproj import CRS
@@ -528,7 +645,7 @@ def _generate(
     total = len(keys)
     logger.info(f"Found {total} file(s) to process in {backend.display_root}.")
 
-    is_image_or_video = data_type in (_IMAGE_DATA_TYPES | _VIDEO_DATA_TYPES)
+    is_image_or_video = data_type in (IMAGE_DATA_TYPES | _VIDEO_DATA_TYPES)
     is_point_cloud = data_type in _POINT_CLOUD_DATA_TYPES
 
     if not (is_image_or_video or is_point_cloud):
@@ -545,26 +662,49 @@ def _generate(
 
     file_metadata: list[tuple[str, dict]] = []
     empty_count = 0
+    tool = "EXIF" if is_image_or_video else "PDAL"
 
-    for i, key in enumerate(keys, 1):
-        display_label = display_labels[key]
-        tool = "EXIF" if is_image_or_video else "PDAL"
-        logger.info(f"[{i}/{total}] Extracting {tool}: {key}")
-        with backend.open_local(key) as local_path:
-            if is_image_or_video:
-                meta = extract_exif_metadata(local_path, filename=display_label)
-            else:
-                meta = extract_pdal_metadata(local_path, filename=display_label)
-        if not meta:
-            empty_count += 1
-            logger.warning(f"No {tool} metadata returned for {key}")
-        file_metadata.append((display_label, meta))
+    # For point clouds, confirm pdal is available up front so we fail fast with
+    # install instructions instead of logging the same "pdal not found" warning
+    # once per file as we walk the directory.
+    if is_point_cloud:
+        find_pdal_bin()
+
+    # Progress bar renders to stderr only when attached to a TTY; on a pipe or
+    # in a log file tqdm suppresses it (``disable=None``), so non-interactive
+    # runs stay clean. The "<looked-at>/<total>" count is shown by default; the
+    # postfix shows the file currently being processed.
+    with tqdm(
+        keys,
+        desc=f"Extracting {tool} metadata",
+        unit="file",
+        file=sys.stderr,
+        disable=None,
+    ) as progress_keys:
+        for i, key in enumerate(progress_keys, 1):
+            progress_keys.set_postfix_str(Path(key).name if key else "")
+            display_label = display_labels[key]
+            logger.info(f"[{i}/{total}] Extracting {tool}: {key}")
+            with backend.open_local(key) as local_path:
+                if is_image_or_video:
+                    meta = extract_exif_metadata(local_path, filename=display_label)
+                else:
+                    meta = extract_pdal_metadata(local_path, filename=display_label)
+            if not meta:
+                empty_count += 1
+                logger.warning(f"No {tool} metadata returned for {key}")
+            file_metadata.append((display_label, meta))
 
     if empty_count:
         logger.warning(
             f"{empty_count}/{total} file(s) produced empty metadata — "
             "those rows will have blank fields in the sidecar."
         )
+
+    # Point clouds must carry a CRS that reaches Web Mercator; fail fast here
+    # (before merging/building) rather than emit a sidecar Flow can't ingest.
+    if is_point_cloud:
+        _validate_point_cloud_crs(file_metadata, spatial_reference)
 
     if client_sidecar:
         client_url = client_sidecar.strip()
@@ -596,10 +736,15 @@ def _generate(
         f"Sidecar DataFrame: {len(df)} row(s) (including DEFAULT), {len(df.columns)} column(s)."
     )
 
+    if is_point_cloud:
+        # Record each file's header CRS (with or without --spatial-reference) so
+        # the linter can convert every row's bounds into the goal CRS.
+        _add_file_srs_column(df, file_metadata)
+
     if spatial_reference:
         if is_point_cloud:
             logger.info(
-                f"Recording spatial_reference={spatial_reference!r} in the DEFAULT row."
+                f"Recording fallback_srs={spatial_reference!r} in the DEFAULT row."
             )
             _add_spatial_reference_column(df, spatial_reference)
         elif is_image_or_video:
@@ -607,6 +752,35 @@ def _generate(
                 f"Reprojecting coordinates from {spatial_reference!r} to EPSG:4326."
             )
             _reproject_dataframe(df, spatial_reference)
+
+    return df, backend
+
+
+def _generate(
+    directory: str,
+    data_type: DataTypeEnum,
+    output_filename: str,
+    client_sidecar: str | None,
+    client_schema: str | None,
+    full: bool = False,
+    local_copy: bool = False,
+    spatial_reference: str | None = None,
+) -> str:
+    logger.info(
+        f"Starting sidecar CSV generation — directory={directory!r} "
+        f"data_type={data_type} output={output_filename!r} "
+        f"client_sidecar={client_sidecar!r} client_schema={client_schema!r} "
+        f"full={full} local_copy={local_copy} spatial_reference={spatial_reference!r}"
+    )
+
+    df, backend = _build_sidecar(
+        directory=directory,
+        data_type=data_type,
+        client_sidecar=client_sidecar,
+        client_schema=client_schema,
+        full=full,
+        spatial_reference=spatial_reference,
+    )
 
     local_copy_path: Path | None = None
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -632,31 +806,33 @@ def _generate(
 
 
 def _format_replay_command(
+    subcommand: list[str],
     directory: str,
     data_type: DataTypeEnum,
-    output_filename: str,
     client_sidecar: str | None,
     client_schema: str | None,
     full: bool,
     verbosity: "VerbosityChoice",
-    local_copy: bool,
     spatial_reference: str | None,
+    ignore_missing_orientation: bool,
+    *,
+    output_filename: str | None = None,
+    local_copy: bool = False,
+    coco: str | None = None,
 ) -> str:
+    """Build the copy-pasteable replay command for ``sidecar generate`` or
+    ``validate``. ``subcommand`` is the command words (e.g. ``["sidecar",
+    "generate"]`` or ``["validate"]``); the save-only flags are emitted only
+    when relevant (``validate`` passes neither).
+    """
     parts = ["am-tools"]
     if verbosity == "verbose":
         parts.append("--verbose")
     elif verbosity == "silent":
         parts.append("--silent")
-    parts += [
-        "sidecar",
-        "generate",
-        "--directory",
-        shlex.quote(directory),
-        "--datatype",
-        data_type.value,
-        "--output-filename",
-        shlex.quote(output_filename),
-    ]
+    parts += [*subcommand, "--directory", shlex.quote(directory), "--datatype", data_type.value]
+    if output_filename is not None:
+        parts += ["--output-filename", shlex.quote(output_filename)]
     if client_sidecar:
         parts += ["--client-sidecar", shlex.quote(client_sidecar)]
     if client_schema is not None:
@@ -667,6 +843,10 @@ def _format_replay_command(
         parts.append("--local-copy")
     if spatial_reference:
         parts += ["--spatial-reference", shlex.quote(spatial_reference)]
+    if ignore_missing_orientation:
+        parts.append("--ignore-missing-orientation")
+    if coco:
+        parts += ["--coco", shlex.quote(coco)]
     return " ".join(parts)
 
 
@@ -677,6 +857,25 @@ def _echo_replay_command(command: str) -> None:
         err=True,
     )
     click.secho(f"  {command}\n", fg="bright_cyan", bold=True, err=True)
+
+
+class WizardResult(NamedTuple):
+    """The values the interactive wizard resolves. ``output_filename`` and
+    ``local_copy`` are only meaningful when the caller saves a sidecar; the
+    ``validate`` command leaves them at their passed-in defaults and ignores them.
+    """
+
+    directory: str
+    data_type: DataTypeEnum
+    output_filename: str | None
+    client_sidecar: str | None
+    client_schema: str | None
+    full: bool
+    verbosity: "VerbosityChoice"
+    local_copy: bool
+    spatial_reference: str | None
+    ignore_missing_orientation: bool
+    coco: str | None
 
 
 def _run_interactive_wizard(
@@ -692,20 +891,16 @@ def _run_interactive_wizard(
     local_copy: bool,
     local_copy_provided: bool,
     spatial_reference: str | None,
-) -> tuple[
-    str,
-    DataTypeEnum,
-    str | None,
-    str | None,
-    str | None,
-    bool,
-    "VerbosityChoice",
-    bool,
-    str | None,
-]:
-    """Prompt for any value the user didn't pass on the CLI. Returns the
-    final (directory, data_type, output_filename, client_sidecar, client_schema, full,
-    verbosity, local_copy, spatial_reference).
+    ignore_missing_orientation: bool,
+    ignore_missing_orientation_provided: bool,
+    coco: str | None = None,
+    save: bool = True,
+) -> WizardResult:
+    """Prompt for any value the user didn't pass on the CLI.
+
+    When ``save`` is False (the ``validate`` command), the output-filename and
+    local-copy prompts are skipped because nothing is written to disk; those
+    two values are returned unchanged.
     """
     questionary.print(
         "Interactive mode — press Ctrl+C at any time to cancel.\n",
@@ -716,17 +911,22 @@ def _run_interactive_wizard(
             directory = _ask_directory()
         if data_type is None:
             data_type = _ask_data_type()
-        if output_filename is None:
+        if data_type == DataTypeEnum.oriented_image and not ignore_missing_orientation_provided:
+            ignore_missing_orientation = _ask_ignore_missing_orientation()
+        if save and output_filename is None:
             output_filename = _ask_output_filename()
         if client_sidecar is None:
             client_sidecar = _ask_client_sidecar()
         if client_schema is None and client_sidecar is not None:
             client_schema = _ask_client_schema()
+        # COCO label impact only applies to imagery.
+        if coco is None and data_type in IMAGE_DATA_TYPES:
+            coco = _ask_coco()
         if spatial_reference is None:
             spatial_reference = _ask_spatial_reference()
         if not full_provided:
             full = _ask_full()
-        if not local_copy_provided and any(
+        if save and not local_copy_provided and any(
             is_remote_uri(p) for p in (directory, client_sidecar, client_schema)
         ):
             local_copy = _ask_local_copy()
@@ -734,16 +934,18 @@ def _run_interactive_wizard(
             verbosity = _ask_verbosity()
     except KeyboardInterrupt:
         raise typer.Exit(code=130) from None
-    return (
-        directory,
-        data_type,
-        output_filename,
-        client_sidecar,
-        client_schema,
-        full,
-        verbosity,
-        local_copy,
-        spatial_reference,
+    return WizardResult(
+        directory=directory,
+        data_type=data_type,
+        output_filename=output_filename,
+        client_sidecar=client_sidecar,
+        client_schema=client_schema,
+        full=full,
+        verbosity=verbosity,
+        local_copy=local_copy,
+        spatial_reference=spatial_reference,
+        ignore_missing_orientation=ignore_missing_orientation,
+        coco=coco,
     )
 
 
@@ -834,8 +1036,33 @@ def generate(
                 "CRS of the source coordinates (e.g. 'EPSG:32612' or '32612'). "
                 "For images, lat/lon (and altitude) are treated as X/Y/Z "
                 "in this CRS and reprojected to EPSG:4326. For point clouds, a "
-                "'spatial_reference' column is added with this value in the "
+                "'fallback_srs' column is added with this value in the "
                 "DEFAULT row."
+            ),
+        ),
+    ] = None,
+    ignore_missing_orientation: Annotated[
+        bool,
+        typer.Option(
+            "--ignore-missing-orientation",
+            help=(
+                "Only meaningful for --datatype oriented_image. By default, "
+                "missing orientation (Pitch/Heading/Roll) in the generated "
+                "sidecar is an error; pass this to downgrade it to a warning "
+                "(the images still process, appearing in Lens without orientation)."
+            ),
+        ),
+    ] = False,
+    coco: Annotated[
+        str | None,
+        typer.Option(
+            "--coco",
+            help=(
+                "Optional COCO label file (local path, s3://… URI, or a directory "
+                "containing one). Image data types only. After linting, reports "
+                "how many labels sit on images with missing/zero-size metadata "
+                "(degraded/unusable/not_on_disk), and adds those tiers to the "
+                "failed-rows CSV (--report)."
             ),
         ),
     ] = None,
@@ -860,17 +1087,11 @@ def generate(
             ctx.get_parameter_source("local_copy")
             == click.core.ParameterSource.COMMANDLINE
         )
-        (
-            directory,
-            data_type,
-            output_filename,
-            client_sidecar,
-            client_schema,
-            full,
-            verbosity_choice,
-            local_copy,
-            spatial_reference,
-        ) = _run_interactive_wizard(
+        ignore_orientation_provided = (
+            ctx.get_parameter_source("ignore_missing_orientation")
+            == click.core.ParameterSource.COMMANDLINE
+        )
+        result = _run_interactive_wizard(
             directory,
             data_type,
             output_filename,
@@ -883,7 +1104,21 @@ def generate(
             local_copy,
             local_copy_provided,
             spatial_reference,
+            ignore_missing_orientation,
+            ignore_orientation_provided,
+            coco=coco,
         )
+        directory = result.directory
+        data_type = result.data_type
+        output_filename = result.output_filename
+        client_sidecar = result.client_sidecar
+        client_schema = result.client_schema
+        full = result.full
+        verbosity_choice = result.verbosity
+        local_copy = result.local_copy
+        spatial_reference = result.spatial_reference
+        ignore_missing_orientation = result.ignore_missing_orientation
+        coco = result.coco
         logging.getLogger().setLevel(
             level_for(
                 verbose=verbosity_choice == "verbose",
@@ -908,6 +1143,7 @@ def generate(
     if wizard_ran:
         _echo_replay_command(
             _format_replay_command(
+                ["sidecar", "generate"],
                 directory=directory,
                 data_type=data_type,
                 output_filename=output_filename,
@@ -917,6 +1153,8 @@ def generate(
                 verbosity=verbosity_choice,
                 local_copy=local_copy,
                 spatial_reference=spatial_reference,
+                ignore_missing_orientation=ignore_missing_orientation,
+                coco=coco,
             )
         )
 
@@ -942,6 +1180,8 @@ def generate(
             data_type=data_type,
             schema_path=None,
             input_files_path=directory,
+            ignore_missing_orientation=ignore_missing_orientation,
+            coco_path=coco,
         )
     except Exception as e:
         _fail("Failed to lint generated sidecar", e)
