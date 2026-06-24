@@ -198,7 +198,8 @@ def _ask_coco() -> str | None:
     return answer or None
 
 
-_SCHEMA_CUSTOM = "Custom path or URI…"
+_SCHEMA_CUSTOM = "Custom local path…"
+_SCHEMA_S3 = "S3 link (s3:// URI)…"
 _SCHEMA_SKIP = "Skip"
 
 
@@ -209,6 +210,13 @@ def _validate_schema_input(v: str) -> bool | str:
     if is_remote_uri(v):
         return True
     return Path(v).expanduser().is_file() or "File not found (and not a remote URI)."
+
+
+def _validate_remote_uri(v: str) -> bool | str:
+    v = v.strip()
+    if not v:
+        return "Required."
+    return is_remote_uri(v) or "Expected an s3:// (or gs:// / az://) URI."
 
 
 def ask_schema_uri(prompt: str = "Path or URI to schema JSON:") -> str:
@@ -227,9 +235,26 @@ def ask_schema_uri(prompt: str = "Path or URI to schema JSON:") -> str:
     return str(Path(answer).expanduser().resolve())
 
 
+def ask_remote_schema_uri(prompt: str = "S3 link to schema JSON:") -> str:
+    """Prompt for a remote (s3/gs/az) schema URI, passed through as-is."""
+    return (
+        questionary.text(
+            prompt,
+            instruction="(s3://… / gs://… / az://… URI)",
+            validate=_validate_remote_uri,
+        )
+        .unsafe_ask()
+        .strip()
+    )
+
+
 def _ask_client_schema() -> str | None:
     schemas = _list_local_schemas()
-    choices = [str(p.name) for p in schemas] + [_SCHEMA_CUSTOM, _SCHEMA_SKIP]
+    choices = [str(p.name) for p in schemas] + [
+        _SCHEMA_CUSTOM,
+        _SCHEMA_S3,
+        _SCHEMA_SKIP,
+    ]
     selection = questionary.select(
         "Optional client schema (normalises a client-supplied sidecar):",
         choices=choices,
@@ -239,6 +264,8 @@ def _ask_client_schema() -> str | None:
         return None
     if selection == _SCHEMA_CUSTOM:
         return ask_schema_uri()
+    if selection == _SCHEMA_S3:
+        return ask_remote_schema_uri()
     return str(next(p for p in schemas if p.name == selection))
 
 
@@ -922,7 +949,9 @@ def _run_interactive_wizard(
         # COCO label impact only applies to imagery.
         if coco is None and data_type in IMAGE_DATA_TYPES:
             coco = _ask_coco()
-        if spatial_reference is None:
+        # fallback_srs only applies to point clouds; other data types carry
+        # their CRS per-file, so don't bother the user with this prompt.
+        if spatial_reference is None and data_type in _POINT_CLOUD_DATA_TYPES:
             spatial_reference = _ask_spatial_reference()
         if not full_provided:
             full = _ask_full()

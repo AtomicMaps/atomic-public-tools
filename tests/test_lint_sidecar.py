@@ -99,6 +99,23 @@ def test_final_missing_orientation_columns_warn_when_ignored(tmp_path):
     assert "Roll" in warning_text
 
 
+def test_final_referenced_fields_produce_no_lint_signal(tmp_path):
+    """Missing referenced (non-required) fields must not error or warn."""
+    header = _oriented_image_header()  # has required + orientation, no FocalLength/Make
+    rows = [
+        ["DEFAULT", "", "", "", "", "", "", ""],
+        ["1.jpg", "2024:06:15 10:30:00", "1000", "51.0", "-114.0", "1", "2", "3"],
+    ]
+    p = _write_csv(tmp_path, "ref.csv", header, rows)
+    report = _lint_oriented(p, final=True)
+    assert not report.has_errors(), [f.message for f in report.errors()]
+    findings_text = " ".join(
+        f.message for f in report.warnings() + report.errors()
+    )
+    for referenced in ("FocalLength", "Make", "Model", "GPSXYAccuracy"):
+        assert referenced not in findings_text
+
+
 def test_final_missing_date_column_errors(tmp_path):
     """CreateDate is documented as optional but stays required in the final
     sidecar: a missing date column still errors."""
