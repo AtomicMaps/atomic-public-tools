@@ -13,11 +13,11 @@ canonicalization/column-selection):
 * ``REFERENCED_*``  — non-required EXIF fields the data-engineering pipeline
   reads (focal length, make/model, accuracy, dimensions, …). The linter
   produces *no* signal for them, but they are offered as suggestions in
-  ``am-tools schema build`` and are canonicalized / carried into generated
+  ``am-tools build-schema`` and are canonicalized / carried into generated
   sidecars when present (they are folded into ``ALL_*``).
 * ``REFERENCED_FULL_*`` — comprehensive/advanced referenced fields (calibration
   internals, quaternion orientation, view angles, …). Offered only under
-  ``schema build --full`` and *not* folded into ``ALL_*``, so they don't bloat
+  ``build-schema --full`` and *not* folded into ``ALL_*``, so they don't bloat
   default generated sidecars.
 
 Invariant: each canonical name appears in exactly one tier per data type
@@ -130,7 +130,7 @@ OPTIONAL_SIDECAR_FIELD_GROUPS: dict[str, list[list[str]]] = {
 
 
 # Non-required EXIF fields the data-engineering pipeline reads. The linter emits
-# no signal for these, but they're offered as suggestions in `schema build` and
+# no signal for these, but they're offered as suggestions in `build-schema` and
 # (because they're folded into ALL_* below) canonicalized and carried into
 # generated sidecars when present. Curated to fields a client is plausibly able
 # to supply in a sidecar CSV.
@@ -172,7 +172,7 @@ REFERENCED_SIDECAR_FIELD_GROUPS: dict[str, list[list[str]]] = {
 }
 
 # Comprehensive/advanced referenced fields: calibration internals, quaternion
-# orientation, initial-view angles, etc. Offered only under `schema build
+# orientation, initial-view angles, etc. Offered only under `build-schema
 # --full`. Each group adds a *new* canonical (never re-lists one already in a
 # required/optional/curated-referenced group for the same data type) and is NOT
 # folded into ALL_*.
@@ -218,7 +218,7 @@ ALL_SIDECAR_FIELD_GROUPS: dict[str, list[list[str]]] = {
     )
 }
 
-# ALL_* plus the comprehensive referenced tier. Backs `schema build --full`;
+# ALL_* plus the comprehensive referenced tier. Backs `build-schema --full`;
 # deliberately not used by sidecar generation/linting. Every REFERENCED_FULL_*
 # data type is already a key in ALL_* (it unions in REQUIRED_*), so iterating
 # ALL_*'s keys covers them all.

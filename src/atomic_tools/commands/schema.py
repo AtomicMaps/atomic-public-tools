@@ -1,6 +1,6 @@
 """Interactively build a client schema (column-name mapping) for a sidecar CSV.
 
-``am-tools schema build`` reads a client-supplied sidecar CSV (local or remote),
+``am-tools build-schema`` reads a client-supplied sidecar CSV (local or remote),
 shows per-column statistics and samples, and walks the user through mapping each
 column to a canonical name. It writes a ``schema.json`` in the exact format
 consumed by ``sidecar generate --client-schema`` (see ``client_sidecar`` and
@@ -41,11 +41,6 @@ from atomic_tools.validators.required_fields import (
 from atomic_tools.validators.schema import lint_schema_file
 
 logger = logging.getLogger(__name__)
-
-schema_app = typer.Typer(
-    no_args_is_help=True,
-    help="Build a client schema (column-name mapping) for a sidecar CSV.",
-)
 
 # The filename/match column is the implicit first column of every sidecar; it
 # isn't part of the required/optional field groups, so offer it explicitly.
@@ -474,8 +469,7 @@ def _save_schema(schema: dict, csv_path: str, target: str, filename: str) -> lis
 # ---- Command ---------------------------------------------------------------
 
 
-@schema_app.command("build")
-def build(
+def build_schema_command(
     ctx: typer.Context,
     csv_path: Annotated[
         str | None,
@@ -570,3 +564,25 @@ def build(
         click.secho(f"\nSchema written to: {path}", fg="green", bold=True, err=True)
         report = lint_schema_file(path)
         typer.echo(report.render())
+
+    # Offer to keep going: the schema we just wrote, the client sidecar it was
+    # built from, and the data type are exactly the inputs `sidecar generate`
+    # needs, so carry them over and ask only the remaining wizard questions.
+    # Prefer a remote schema path for the follow-on so the printed replay
+    # command matches what you'd run against object storage.
+    schema_for_sidecar = next(
+        (p for p in written if is_remote_uri(p)),
+        written[0] if written else None,
+    )
+    if schema_for_sidecar is not None:
+        from atomic_tools.cli import Verbosity
+        from atomic_tools.commands.sidecar import offer_sidecar_after_schema
+
+        verbosity: Verbosity = ctx.ensure_object(Verbosity)
+        offer_sidecar_after_schema(
+            data_type=data_type,
+            client_sidecar=csv_path,
+            client_schema=schema_for_sidecar,
+            verbosity=verbosity.choice,
+            verbosity_provided=verbosity.verbose or verbosity.silent,
+        )

@@ -1,4 +1,4 @@
-"""Tests for `am-tools schema build` (pure helpers + CLI registration)."""
+"""Tests for `am-tools build-schema` (pure helpers + CLI registration)."""
 
 import json
 
@@ -6,6 +6,7 @@ from typer.testing import CliRunner
 
 from atomic_tools.cli import app
 from atomic_tools.commands import schema as schema_cmd
+from atomic_tools.commands import sidecar as sidecar_cmd
 from atomic_tools.commands.schema import (
     _default_schema_filename,
     build_schema,
@@ -245,14 +246,14 @@ def test_build_headerless_is_positional_list():
 # ---- CLI registration ------------------------------------------------------
 
 
-def test_schema_group_registered():
+def test_build_schema_registered():
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
-    assert "schema" in result.stdout
+    assert "build-schema" in result.stdout
 
 
-def test_schema_build_help():
-    result = runner.invoke(app, ["schema", "build", "--help"])
+def test_build_schema_help():
+    result = runner.invoke(app, ["build-schema", "--help"])
     assert result.exit_code == 0
     assert "CSV" in result.stdout
 
@@ -280,9 +281,10 @@ def test_build_headered_end_to_end(tmp_path, monkeypatch):
             schema_cmd._SAVE_LOCAL,  # save target
             "schema.json",  # filename
             str(out),  # local path
+            False,  # build a sidecar now? -> no
         ],
     )
-    result = runner.invoke(app, ["schema", "build", str(csv)])
+    result = runner.invoke(app, ["build-schema", str(csv)])
     assert result.exit_code == 0, result.output
     written = json.loads(out.read_text())
     assert written == {
@@ -310,9 +312,10 @@ def test_build_full_offers_comprehensive_field(tmp_path, monkeypatch):
             schema_cmd._SAVE_LOCAL,  # save target
             "schema.json",  # filename
             str(out),  # local path
+            False,  # build a sidecar now? -> no
         ],
     )
-    result = runner.invoke(app, ["schema", "build", "--full", str(csv)])
+    result = runner.invoke(app, ["build-schema", "--full", str(csv)])
     assert result.exit_code == 0, result.output
     written = json.loads(out.read_text())
     assert written == {"column_name_mapping": {"cx": "CalibratedOpticalCenterX"}}
@@ -333,9 +336,63 @@ def test_build_headerless_end_to_end(tmp_path, monkeypatch):
             schema_cmd._SAVE_LOCAL,  # save target
             "schema.json",  # filename
             str(out),  # local path
+            False,  # build a sidecar now? -> no
         ],
     )
-    result = runner.invoke(app, ["schema", "build", str(csv)])
+    result = runner.invoke(app, ["build-schema", str(csv)])
     assert result.exit_code == 0, result.output
     written = json.loads(out.read_text())
     assert written == {"column_names": ["Filename", "GPSLatitude", "GPSLongitude"]}
+
+
+def test_build_then_offer_sidecar_carries_over(tmp_path, monkeypatch):
+    """Answering 'yes' to the follow-on prompt carries the schema, the client
+    sidecar it was built from, and the data type into the sidecar wizard, and
+    only asks the remaining questions."""
+    csv = tmp_path / "client.csv"
+    csv.write_text(
+        "Filename,Latitude [Degrees]\na.jpg,40.1\nb.jpg,41.0\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "out.json"
+
+    captured: dict = {}
+
+    def _capture_run_generate(result, *, wizard_ran):
+        captured["result"] = result
+        captured["wizard_ran"] = wizard_ran
+
+    # Stop before any real scanning/extraction — we only assert the carry-over.
+    monkeypatch.setattr(sidecar_cmd, "_run_generate", _capture_run_generate)
+
+    _patch_prompts(
+        monkeypatch,
+        answers=[
+            DataTypeEnum.oriented_image.value,  # data type
+            True,  # has header?
+            "Filename",  # col Filename
+            "GPSLatitude",  # col Latitude [Degrees]
+            schema_cmd._SAVE_LOCAL,  # save target
+            "schema.json",  # filename
+            str(out),  # local path
+            True,  # build a sidecar now? -> yes
+            # ...remaining sidecar-wizard questions:
+            str(tmp_path),  # directory to scan
+            False,  # ignore missing orientation? (oriented_image)
+            "sidecar.csv",  # output filename
+            "",  # COCO label file -> skip
+            False,  # include every field (--full)?
+            sidecar_cmd._VERBOSITY_DEFAULT,  # logging verbosity
+        ],
+    )
+    result = runner.invoke(app, ["build-schema", str(csv)])
+    assert result.exit_code == 0, result.output
+
+    res = captured["result"]
+    assert captured["wizard_ran"] is True
+    # The three values that should be carried over from the schema build:
+    assert res.data_type == DataTypeEnum.oriented_image
+    assert res.client_sidecar == str(csv)
+    assert res.client_schema == str(out)
+    # And a value answered in the remaining wizard:
+    assert res.directory == str(tmp_path)

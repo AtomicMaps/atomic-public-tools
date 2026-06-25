@@ -8,7 +8,7 @@ import typer
 
 from atomic_tools import __version__
 from atomic_tools.commands.lint import lint_app
-from atomic_tools.commands.schema import schema_app
+from atomic_tools.commands.schema import build_schema_command
 from atomic_tools.commands.sidecar import sidecar_app
 from atomic_tools.commands.validate import validate as validate_command
 
@@ -52,7 +52,10 @@ app = typer.Typer(
 
 app.add_typer(sidecar_app, name="sidecar", help="Generate a sidecar CSV from S3.")
 app.add_typer(lint_app, name="lint", help="Validate schema/sidecar files before submission.")
-app.add_typer(schema_app, name="schema", help="Build a client schema for a sidecar CSV.")
+app.command(
+    name="build-schema",
+    help="Build a client schema (column-name mapping) for a sidecar CSV.",
+)(build_schema_command)
 app.command(
     name="validate",
     help="Lint data without saving a sidecar (extract, build, and check in one step).",
