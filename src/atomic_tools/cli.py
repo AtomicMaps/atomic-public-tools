@@ -10,7 +10,9 @@ from atomic_tools import __version__
 from atomic_tools.commands.lint import lint_app
 from atomic_tools.commands.schema import build_schema_command
 from atomic_tools.commands.sidecar import sidecar_app
+from atomic_tools.commands.update import update_command
 from atomic_tools.commands.validate import validate as validate_command
+from atomic_tools.version_check import check_for_update
 
 VerbosityChoice = Literal["default", "verbose", "silent"]
 
@@ -60,6 +62,10 @@ app.command(
     name="validate",
     help="Lint data without saving a sidecar (extract, build, and check in one step).",
 )(validate_command)
+app.command(
+    name="update",
+    help="Update am-tools to the latest version (git pull + reinstall).",
+)(update_command)
 
 
 def _version_callback(value: bool) -> None:
@@ -102,3 +108,8 @@ def main(
     logging.basicConfig(format=_LOG_FORMAT, level=verbosity.level)
     logging.getLogger().setLevel(verbosity.level)
     ctx.obj = verbosity
+
+    # First run of the day: nudge the user if the repo has a newer version.
+    # Best-effort and silent-safe — never raises, and skips when --silent.
+    if not silent:
+        check_for_update()
