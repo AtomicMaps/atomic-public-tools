@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import shlex
 import sys
 from pathlib import Path
@@ -21,7 +20,7 @@ from atomic_tools.commands.sidecar import (
     _ask_verbosity,
     ask_schema_uri,
 )
-from atomic_tools.utils.utils import DataTypeEnum
+from atomic_tools.utils.utils import DataTypeEnum, uri_stem
 from atomic_tools.validators.coco import IMAGE_DATA_TYPES
 from atomic_tools.validators.report import LintReport
 from atomic_tools.validators.schema import lint_schema_file
@@ -77,9 +76,7 @@ def _echo_replay_command(command: str) -> None:
 
 
 def _default_report_name(sidecar_path: str) -> str:
-    base = os.path.basename(sidecar_path.rstrip("/")) or "sidecar"
-    stem = os.path.splitext(base)[0]
-    return f"{stem}_lint_report.csv"
+    return f"{uri_stem(sidecar_path) or 'sidecar'}_lint_report.csv"
 
 
 def _write_missing_data_report(report: LintReport, report_path: str) -> None:

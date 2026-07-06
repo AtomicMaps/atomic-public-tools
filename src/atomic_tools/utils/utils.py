@@ -366,6 +366,16 @@ def is_remote_uri(uri: str | None) -> bool:
     return urlparse(uri).scheme.lower() in REMOTE_SCHEME_TO_STORE_TYPE
 
 
+def uri_stem(path: str) -> str:
+    """Filename stem (no directory, no extension) of a local path or remote URI.
+
+    e.g. ``s3://b/p/data.csv`` -> ``"data"``, ``./foo/bar.json`` -> ``"bar"``.
+    Returns ``""`` when no stem can be derived (caller supplies a fallback).
+    """
+    base = path.rstrip("/").rsplit("/", 1)[-1]
+    return Path(base).stem
+
+
 def read_text_uri(uri: str, *, encoding: str = "utf-8") -> str:
     """Read text content from a local path or remote URI (s3/gs/az)."""
     parsed = urlparse(uri)

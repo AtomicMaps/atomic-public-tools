@@ -198,7 +198,8 @@ def _ask_coco() -> str | None:
     return answer or None
 
 
-_SCHEMA_CUSTOM = "Custom path or URI…"
+_SCHEMA_CUSTOM = "Custom local path…"
+_SCHEMA_S3 = "S3 link (s3:// URI)…"
 _SCHEMA_SKIP = "Skip"
 
 
@@ -209,6 +210,13 @@ def _validate_schema_input(v: str) -> bool | str:
     if is_remote_uri(v):
         return True
     return Path(v).expanduser().is_file() or "File not found (and not a remote URI)."
+
+
+def _validate_remote_uri(v: str) -> bool | str:
+    v = v.strip()
+    if not v:
+        return "Required."
+    return is_remote_uri(v) or "Expected an s3:// (or gs:// / az://) URI."
 
 
 def ask_schema_uri(prompt: str = "Path or URI to schema JSON:") -> str:
@@ -227,9 +235,26 @@ def ask_schema_uri(prompt: str = "Path or URI to schema JSON:") -> str:
     return str(Path(answer).expanduser().resolve())
 
 
+def ask_remote_schema_uri(prompt: str = "S3 link to schema JSON:") -> str:
+    """Prompt for a remote (s3/gs/az) schema URI, passed through as-is."""
+    return (
+        questionary.text(
+            prompt,
+            instruction="(s3://… / gs://… / az://… URI)",
+            validate=_validate_remote_uri,
+        )
+        .unsafe_ask()
+        .strip()
+    )
+
+
 def _ask_client_schema() -> str | None:
     schemas = _list_local_schemas()
-    choices = [str(p.name) for p in schemas] + [_SCHEMA_CUSTOM, _SCHEMA_SKIP]
+    choices = [str(p.name) for p in schemas] + [
+        _SCHEMA_CUSTOM,
+        _SCHEMA_S3,
+        _SCHEMA_SKIP,
+    ]
     selection = questionary.select(
         "Optional client schema (normalises a client-supplied sidecar):",
         choices=choices,
@@ -239,6 +264,8 @@ def _ask_client_schema() -> str | None:
         return None
     if selection == _SCHEMA_CUSTOM:
         return ask_schema_uri()
+    if selection == _SCHEMA_S3:
+        return ask_remote_schema_uri()
     return str(next(p for p in schemas if p.name == selection))
 
 
@@ -922,7 +949,9 @@ def _run_interactive_wizard(
         # COCO label impact only applies to imagery.
         if coco is None and data_type in IMAGE_DATA_TYPES:
             coco = _ask_coco()
-        if spatial_reference is None:
+        # fallback_srs only applies to point clouds; other data types carry
+        # their CRS per-file, so don't bother the user with this prompt.
+        if spatial_reference is None and data_type in _POINT_CLOUD_DATA_TYPES:
             spatial_reference = _ask_spatial_reference()
         if not full_provided:
             full = _ask_full()
@@ -947,6 +976,137 @@ def _run_interactive_wizard(
         ignore_missing_orientation=ignore_missing_orientation,
         coco=coco,
     )
+
+
+def _run_generate(result: WizardResult, *, wizard_ran: bool) -> None:
+    """Generate and lint a sidecar from a fully-resolved set of options.
+
+    Shared by ``sidecar generate`` and the ``build-schema`` follow-on: it
+    normalises the output filename, echoes the replay command (only when a
+    wizard ran), writes the sidecar, then lints it. ``result.verbosity`` is
+    assumed to have already been applied to the root logger by the caller.
+    """
+    directory = result.directory
+    data_type = result.data_type
+
+    output_filename = result.output_filename or "sidecar.csv"
+    basename = Path(output_filename).name
+    if basename != output_filename:
+        logger.warning(
+            f"--output-filename ignored directory portion of {output_filename!r}; "
+            f"writing as {basename!r} in the input directory."
+        )
+        output_filename = basename
+
+    if not directory:
+        raise typer.BadParameter("Directory is required.")
+    if data_type is None:
+        raise typer.BadParameter("Data type is required.")
+
+    if wizard_ran:
+        _echo_replay_command(
+            _format_replay_command(
+                ["sidecar", "generate"],
+                directory=directory,
+                data_type=data_type,
+                output_filename=output_filename,
+                client_sidecar=result.client_sidecar,
+                client_schema=result.client_schema,
+                full=result.full,
+                verbosity=result.verbosity,
+                local_copy=result.local_copy,
+                spatial_reference=result.spatial_reference,
+                ignore_missing_orientation=result.ignore_missing_orientation,
+                coco=result.coco,
+            )
+        )
+
+    try:
+        sidecar_path = _generate(
+            directory=directory,
+            data_type=data_type,
+            output_filename=output_filename,
+            client_sidecar=result.client_sidecar,
+            client_schema=result.client_schema,
+            full=result.full,
+            local_copy=result.local_copy,
+            spatial_reference=result.spatial_reference,
+        )
+    except Exception as e:
+        _fail("Failed to generate sidecar CSV", e)
+
+    logger.info("Linting generated sidecar…")
+    try:
+        report = lint_sidecar_file(
+            sidecar_path,
+            final=True,
+            data_type=data_type,
+            schema_path=None,
+            input_files_path=directory,
+            ignore_missing_orientation=result.ignore_missing_orientation,
+            coco_path=result.coco,
+        )
+    except Exception as e:
+        _fail("Failed to lint generated sidecar", e)
+
+    typer.echo(report.render())
+    if report.has_errors():
+        raise typer.Exit(code=1)
+
+
+def offer_sidecar_after_schema(
+    *,
+    data_type: DataTypeEnum,
+    client_sidecar: str,
+    client_schema: str,
+    verbosity: "VerbosityChoice" = "default",
+    verbosity_provided: bool = False,
+) -> None:
+    """After ``build-schema`` writes a schema, offer to generate a sidecar now.
+
+    The data type, the client sidecar CSV the schema was built from, and the
+    schema file just written are carried straight into the sidecar wizard; only
+    the remaining questions (scan directory, output filename, …) are asked.
+    """
+    from atomic_tools.cli import level_for
+
+    proceed = questionary.confirm(
+        "Build a sidecar now using this schema?",
+        instruction=(
+            "(Carries over the data type, the client sidecar, and the schema "
+            "you just built; you'll be asked for the directory to scan and a "
+            "few other options)"
+        ),
+        default=True,
+    ).unsafe_ask()
+    if not proceed:
+        return
+
+    result = _run_interactive_wizard(
+        directory=None,
+        data_type=data_type,
+        output_filename=None,
+        client_sidecar=client_sidecar,
+        client_schema=client_schema,
+        full=False,
+        full_provided=False,
+        verbosity=verbosity,
+        verbosity_provided=verbosity_provided,
+        local_copy=False,
+        local_copy_provided=False,
+        spatial_reference=None,
+        ignore_missing_orientation=False,
+        ignore_missing_orientation_provided=False,
+        coco=None,
+        save=True,
+    )
+    logging.getLogger().setLevel(
+        level_for(
+            verbose=result.verbosity == "verbose",
+            silent=result.verbosity == "silent",
+        )
+    )
+    _run_generate(result, wizard_ran=True)
 
 
 @sidecar_app.command()
@@ -1108,84 +1268,26 @@ def generate(
             ignore_orientation_provided,
             coco=coco,
         )
-        directory = result.directory
-        data_type = result.data_type
-        output_filename = result.output_filename
-        client_sidecar = result.client_sidecar
-        client_schema = result.client_schema
-        full = result.full
         verbosity_choice = result.verbosity
-        local_copy = result.local_copy
-        spatial_reference = result.spatial_reference
-        ignore_missing_orientation = result.ignore_missing_orientation
-        coco = result.coco
         logging.getLogger().setLevel(
             level_for(
                 verbose=verbosity_choice == "verbose",
                 silent=verbosity_choice == "silent",
             )
         )
-
-    output_filename = output_filename or "sidecar.csv"
-    basename = Path(output_filename).name
-    if basename != output_filename:
-        logger.warning(
-            f"--output-filename ignored directory portion of {output_filename!r}; "
-            f"writing as {basename!r} in the input directory."
-        )
-        output_filename = basename
-
-    if not directory:
-        raise typer.BadParameter("Directory is required.")
-    if data_type is None:
-        raise typer.BadParameter("Data type is required.")
-
-    if wizard_ran:
-        _echo_replay_command(
-            _format_replay_command(
-                ["sidecar", "generate"],
-                directory=directory,
-                data_type=data_type,
-                output_filename=output_filename,
-                client_sidecar=client_sidecar,
-                client_schema=client_schema,
-                full=full,
-                verbosity=verbosity_choice,
-                local_copy=local_copy,
-                spatial_reference=spatial_reference,
-                ignore_missing_orientation=ignore_missing_orientation,
-                coco=coco,
-            )
-        )
-
-    try:
-        sidecar_path = _generate(
+    else:
+        result = WizardResult(
             directory=directory,
             data_type=data_type,
             output_filename=output_filename,
             client_sidecar=client_sidecar,
             client_schema=client_schema,
             full=full,
+            verbosity=verbosity_choice,
             local_copy=local_copy,
             spatial_reference=spatial_reference,
-        )
-    except Exception as e:
-        _fail("Failed to generate sidecar CSV", e)
-
-    logger.info("Linting generated sidecar…")
-    try:
-        report = lint_sidecar_file(
-            sidecar_path,
-            final=True,
-            data_type=data_type,
-            schema_path=None,
-            input_files_path=directory,
             ignore_missing_orientation=ignore_missing_orientation,
-            coco_path=coco,
+            coco=coco,
         )
-    except Exception as e:
-        _fail("Failed to lint generated sidecar", e)
 
-    typer.echo(report.render())
-    if report.has_errors():
-        raise typer.Exit(code=1)
+    _run_generate(result, wizard_ran=wizard_ran)
