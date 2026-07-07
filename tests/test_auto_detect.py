@@ -164,7 +164,7 @@ def _make_mixed_dir(tmp_path):
 def test_mixed_directory_scan(tmp_path, patched_extractors, caplog):
     _make_mixed_dir(tmp_path)
     with caplog.at_level("WARNING", logger="atomic_tools.commands.sidecar"):
-        df, _backend, detected = _build_sidecar(
+        df, _backend, detected, vector = _build_sidecar(
             directory=str(tmp_path),
             data_type=None,
             client_sidecar=None,
@@ -181,9 +181,11 @@ def test_mixed_directory_scan(tmp_path, patched_extractors, caplog):
     assert by_name["c.mp4"] == "full_motion_video"
     assert by_name["DEFAULT"] == ""
 
-    # Vector and unclassified files were skipped with warnings.
+    # Vector files are returned for the caller to report at the end of the run
+    # (not warned about mid-scan); unclassified files still warn mid-scan.
+    assert any(name.endswith("d.geojson") for name in vector)
     messages = " ".join(rec.message for rec in caplog.records)
-    assert "vector sidecar generation is not supported" in messages
+    assert "vector sidecar generation is not supported" not in messages
     assert "matched no known data type" in messages
 
     # PC-only column present because point-cloud rows exist.
@@ -201,9 +203,30 @@ def test_mixed_directory_scan(tmp_path, patched_extractors, caplog):
     assert row_b["GPSLatitude"] == ""
 
 
+def test_preview_and_thumbnail_files_skipped_silently(tmp_path, patched_extractors, caplog):
+    # Camera-generated derivatives (the exact exclude patterns that make
+    # infer_data_type return None) must be dropped quietly — not counted in the
+    # "no known data type" warning.
+    (tmp_path / "a.jpg").write_text("x")
+    (tmp_path / "R0010013_ThumbnailImage.jpg").write_text("x")
+    (tmp_path / "R0010013_PreviewImage.jpg").write_text("x")
+    (tmp_path / "shot_thumbnail.png").write_text("x")
+    with caplog.at_level("WARNING", logger="atomic_tools.commands.sidecar"):
+        df, _backend, _detected, _vector = _build_sidecar(
+            directory=str(tmp_path),
+            data_type=None,
+            client_sidecar=None,
+            client_schema=None,
+        )
+    names = [n for n in df["Filename"] if n != "DEFAULT"]
+    assert names == ["a.jpg"]  # only the real image became a row
+    messages = " ".join(rec.message for rec in caplog.records)
+    assert "matched no known data type" not in messages
+
+
 def test_scan_only_pdal_when_point_cloud_present(tmp_path, patched_extractors):
     (tmp_path / "a.jpg").write_text("x")
-    _df, _backend, detected = _build_sidecar(
+    _df, _backend, detected, _vector = _build_sidecar(
         directory=str(tmp_path),
         data_type=None,
         client_sidecar=None,
@@ -231,7 +254,7 @@ def test_no_supported_files_raises(tmp_path, patched_extractors):
 
 def test_filter_point_cloud_scans_only_las(tmp_path, patched_extractors):
     _make_mixed_dir(tmp_path)
-    df, _backend, detected = _build_sidecar(
+    df, _backend, detected, _vector = _build_sidecar(
         directory=str(tmp_path),
         data_type=DataTypeEnum.point_cloud,
         client_sidecar=None,
@@ -247,7 +270,7 @@ def test_filter_spherical_stays_spherical_no_refinement(tmp_path, patched_extrac
     # must NOT be reclassified to oriented.
     (tmp_path / "1.jpg").write_text("x")
     (tmp_path / "2.jpg").write_text("x")
-    df, _backend, detected = _build_sidecar(
+    df, _backend, detected, _vector = _build_sidecar(
         directory=str(tmp_path),
         data_type=DataTypeEnum.spherical_image,
         client_sidecar=None,
@@ -417,7 +440,7 @@ def test_client_datatype_column_dropped(tmp_path, patched_extractors, caplog):
         encoding="utf-8",
     )
     with caplog.at_level("WARNING", logger="atomic_tools.commands.sidecar"):
-        df, _backend, _detected = _build_sidecar(
+        df, _backend, _detected, _vector = _build_sidecar(
             directory=str(tmp_path),
             data_type=None,
             client_sidecar=str(client),

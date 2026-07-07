@@ -342,3 +342,32 @@ def test_point_cloud_findings_do_not_fail_lint(tmp_path):
     report = _pc_lint(p)
     assert not report.has_errors(), [f.message for f in report.errors()]
     assert report.exit_code() == 0
+
+
+def test_point_cloud_untransformable_crs_is_flagged(tmp_path):
+    # A CRS is present but has no path to Web Mercator → error, reported as
+    # "cannot be transformed" (not as the "no CRS" case). Written via pandas so
+    # the comma-bearing WKT is quoted correctly.
+    import pandas as pd
+
+    local_crs = 'LOCAL_CS["unknown",UNIT["metre",1]]'
+    df = pd.DataFrame(
+        [
+            {c: "" for c in _pc_header()} | {"Filename": "DEFAULT", "fallback_srs": local_crs},
+            {
+                "Filename": "a.las",
+                "bounds.minx": "1000", "bounds.maxx": "1100",
+                "bounds.miny": "2000", "bounds.maxy": "2100",
+                "bounds.minz": "10", "bounds.maxz": "20",
+                "fallback_srs": "",
+            },
+        ],
+        columns=_pc_header(),
+    )
+    p = tmp_path / "pc.csv"
+    df.to_csv(p, index=False)
+    report = _pc_lint(p)
+    assert any(
+        "cannot be transformed" in f.message and "a.las" in f.message
+        for f in report.errors()
+    ), _messages(report)

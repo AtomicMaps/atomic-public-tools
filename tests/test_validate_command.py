@@ -33,7 +33,7 @@ def captured_lint(monkeypatch):
                 {"Filename": "a.jpg", "GPSLatitude": "51.0", "GPSLongitude": "-114.0"},
             ]
         )
-        return df, object(), {DataTypeEnum.oriented_image}
+        return df, object(), {DataTypeEnum.oriented_image}, []
 
     def fake_lint(path, **kwargs):
         calls["lint_path"] = path
@@ -131,7 +131,7 @@ def test_validate_writes_no_sidecar(captured_lint, tmp_path):
 
 def test_validate_exits_nonzero_on_errors(monkeypatch, tmp_path):
     def fake_build_sidecar(**kwargs):
-        return pd.DataFrame([{"Filename": "DEFAULT"}]), object(), set()
+        return pd.DataFrame([{"Filename": "DEFAULT"}]), object(), set(), []
 
     def fake_lint(path, **kwargs):
         report = LintReport()

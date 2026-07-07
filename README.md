@@ -112,6 +112,8 @@ am-tools sidecar generate \
 
 **Reformat and reproject from an input EPSG.** If your sidecar coordinates are not already in `EPSG:4326` (WGS84), add `--spatial-reference`. For images/videos the lat/lon (and altitude) are treated as X/Y/Z in that CRS and reprojected to `EPSG:4326`; for point clouds the value is recorded in a `fallback_srs` column instead. In a mixed directory it does both:
 
+> **Point cloud CRS check.** Every point-cloud row gets a `crs_web_mercator_ok` column: `yes` when its effective CRS — the one PDAL read from the file (`file_srs`), else the `--spatial-reference` fallback — converts to Web Mercator (`EPSG:3857`, the frame Flow renders point clouds in), and `no` when the CRS is missing or can't be converted. A `no` row is also reported as a lint error, so the sidecar is still written (you can see exactly which files need attention) but the run exits non-zero until you supply a valid CRS.
+
 ```bash
 am-tools sidecar generate \
   --directory ./data \

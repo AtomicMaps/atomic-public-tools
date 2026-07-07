@@ -23,10 +23,13 @@ import typer
 
 from atomic_tools.commands.sidecar import (
     _build_sidecar,
+    _crs_failures,
     _echo_replay_command,
     _fail,
     _format_replay_command,
+    _raise_crs_failures_loudly,
     _run_interactive_wizard,
+    _warn_skipped_vectors,
 )
 from atomic_tools.utils.utils import DataTypeEnum, DataTypeFilter
 from atomic_tools.validators.sidecar import lint_sidecar_file
@@ -52,7 +55,7 @@ def _validate(
     )
 
     # validate never persists, so the backend is unused.
-    df, _, _detected = _build_sidecar(
+    df, _, _detected, skipped_vector = _build_sidecar(
         directory=directory,
         data_type=data_type,
         client_sidecar=client_sidecar,
@@ -60,6 +63,7 @@ def _validate(
         full=full,
         spatial_reference=spatial_reference,
     )
+    crs_failures = _crs_failures(df)
 
     # Lint reads from a path, so stage the assembled sidecar in a throwaway temp
     # file rather than writing it back to the (possibly remote) input directory.
@@ -67,7 +71,7 @@ def _validate(
         local_csv = Path(tmp_dir) / "sidecar.csv"
         df.to_csv(local_csv, index=False)
         logger.info("Linting in-memory sidecar (not saved)…")
-        return lint_sidecar_file(
+        report = lint_sidecar_file(
             str(local_csv),
             final=True,
             data_type=data_type,
@@ -80,6 +84,7 @@ def _validate(
             # failure (it blocks only when generating a sidecar that ships).
             coco_not_on_disk_is_error=False,
         )
+        return report, skipped_vector, crs_failures
 
 
 def validate(
@@ -269,7 +274,7 @@ def validate(
         )
 
     try:
-        report = _validate(
+        report, skipped_vector, crs_failures = _validate(
             directory=directory,
             data_type=data_type_enum,
             client_sidecar=client_sidecar,
@@ -283,5 +288,7 @@ def validate(
         _fail("Failed to validate data", e)
 
     typer.echo(report.render())
-    if report.has_errors():
+    _warn_skipped_vectors(skipped_vector)
+    _raise_crs_failures_loudly(crs_failures)
+    if report.has_errors() or crs_failures:
         raise typer.Exit(code=1)

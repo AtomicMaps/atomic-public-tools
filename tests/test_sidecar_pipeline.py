@@ -15,13 +15,14 @@ from atomic_tools.client_sidecar import (
 )
 from atomic_tools.commands.sidecar import (
     _ALL_SIDECAR_FIELD_GROUPS,
+    _CRS_WEB_MERCATOR_COL,
+    _add_crs_web_mercator_column,
     _add_file_srs_column,
     _add_spatial_reference_column,
     _disambiguate_filenames,
     _fill_missing_dates_from_filepath,
     _reproject_dataframe,
     _split_gps_position,
-    _validate_point_cloud_crs,
     _warn_missing_required_fields,
     build_sidecar_df,
 )
@@ -239,6 +240,15 @@ def test_extract_pdal_crs_prefers_top_level_spatialreference():
     assert extract_pdal_crs(meta) == _UTM12N_WKT
 
 
+def test_extract_pdal_crs_prefers_compound_over_plain():
+    # Aligns with atomicmapspy PointCloud.get_srs: the compound WKT (horizontal +
+    # vertical) wins over the plain horizontal-only spatialreference, so a file
+    # with a vertical datum keeps its full definition.
+    compound = 'COMPD_CS["UTM12N + NAVD88",' + _UTM12N_WKT + ',VERT_CS["NAVD88"]]'
+    meta = {"srs.compoundwkt": compound, "spatialreference": _UTM12N_WKT}
+    assert extract_pdal_crs(meta) == compound
+
+
 def test_extract_pdal_crs_falls_back_to_srs_keys():
     # PDAL leaves the top-level key empty but populates the srs.* block.
     meta = {"spatialreference": "", "comp_spatialreference": "", "srs.wkt": _UTM12N_WKT}
@@ -251,17 +261,177 @@ def test_extract_pdal_crs_none_when_header_has_no_crs():
     assert extract_pdal_crs(meta) is None
 
 
-def test_validate_point_cloud_crs_passes_with_embedded_crs():
-    file_metadata = [("cloud.las", {"spatialreference": _UTM12N_WKT})]
-    _validate_point_cloud_crs(file_metadata, spatial_reference=None)
+def test_meta_from_filters_info_maps_bounds_num_points_and_srs():
+    from atomic_tools.utils.extractors import _meta_from_filters_info
+
+    fi = {
+        "bbox": {"minx": 0.0, "maxx": 1.0, "miny": 2.0, "maxy": 3.0, "minz": 4.0, "maxz": 5.0},
+        "num_points": 42,
+        "srs": {"compoundwkt": _UTM12N_WKT, "units": {"horizontal": "metre"}},
+    }
+    out = _meta_from_filters_info(fi)
+    assert out["bounds.minx"] == 0.0 and out["bounds.maxz"] == 5.0
+    assert out["num_points"] == 42
+    # srs sub-keys flatten under the srs. prefix so extract_pdal_crs finds them.
+    assert out["srs.compoundwkt"] == _UTM12N_WKT
+    assert out["srs.units.horizontal"] == "metre"
+    assert extract_pdal_crs(out) == _UTM12N_WKT
 
 
-def test_validate_point_cloud_crs_uses_backup_when_header_missing():
-    file_metadata = [("cloud.las", {"spatialreference": ""})]
-    _validate_point_cloud_crs(file_metadata, spatial_reference="EPSG:32612")
+def test_extract_pdal_metadata_falls_back_to_filters_info_when_header_empty(monkeypatch):
+    # E57 (and any reader whose header block is empty): `pdal info --metadata`
+    # returns nothing, so extraction must fall back to a filters.info pipeline.
+    from atomic_tools.utils import extractors
+
+    fi = {
+        "bbox": {"minx": 10.0, "maxx": 20.0, "miny": 30.0, "maxy": 40.0, "minz": 1.0, "maxz": 2.0},
+        "num_points": 7,
+        "srs": {"compoundwkt": _UTM12N_WKT},
+    }
+    monkeypatch.setattr(extractors, "find_pdal_bin", lambda: "/fake/pdal")
+    monkeypatch.setattr(extractors, "_run_pdal_info", lambda *a, **k: {"metadata": {}})
+    called = {}
+
+    def fake_filters_info(pdal_bin, local_path):
+        called["path"] = local_path
+        return fi
+
+    monkeypatch.setattr(extractors, "_run_pdal_filters_info", fake_filters_info)
+
+    meta = extractors.extract_pdal_metadata("scan.e57", "scan.e57")
+    assert called["path"] == "scan.e57"  # fallback actually ran
+    assert meta["bounds.minx"] == 10.0 and meta["bounds.maxx"] == 20.0
+    assert meta["num_points"] == 7
+    assert extract_pdal_crs(meta) == _UTM12N_WKT
 
 
-def test_validate_point_cloud_crs_transforms_bbox_center():
+def test_extract_pdal_metadata_skips_filters_info_when_header_has_bounds(monkeypatch):
+    # LAS/LAZ: the header block already carries bounds, so no pipeline fallback.
+    from atomic_tools.utils import extractors
+
+    monkeypatch.setattr(extractors, "find_pdal_bin", lambda: "/fake/pdal")
+    monkeypatch.setattr(
+        extractors,
+        "_run_pdal_info",
+        lambda *a, **k: {"metadata": {"minx": 1, "maxx": 2, "miny": 3, "maxy": 4, "count": 9}},
+    )
+
+    def boom(*a, **k):
+        raise AssertionError("filters.info fallback should not run for a populated header")
+
+    monkeypatch.setattr(extractors, "_run_pdal_filters_info", boom)
+
+    meta = extractors.extract_pdal_metadata("cloud.las", "cloud.las")
+    assert meta["bounds.minx"] == 1
+    assert meta["num_points"] == 9  # count → num_points
+
+
+def test_e57_seconds_to_datetime_valid_and_invalid():
+    import datetime
+
+    from atomic_tools.utils.extractors import _E57_EPOCH, _e57_seconds_to_datetime
+
+    target = datetime.datetime(2024, 6, 15, 10, 30, 0, tzinfo=datetime.timezone.utc)
+    secs = (target - _E57_EPOCH).total_seconds()
+    got = _e57_seconds_to_datetime(secs)
+    assert got == target
+    assert got.year == 2024 and got.timetuple().tm_yday == 167  # leap-year DOY
+    # Rejected values fall back to None (→ filename/client-sidecar date).
+    assert _e57_seconds_to_datetime(float("nan")) is None
+    assert _e57_seconds_to_datetime(float("inf")) is None
+    assert _e57_seconds_to_datetime(-1) is None
+    assert _e57_seconds_to_datetime("nope") is None
+    assert _e57_seconds_to_datetime(10**15) is None  # beyond the ~2100 ceiling
+
+
+def test_parse_e57_datetime_node_reads_and_missing():
+    import datetime
+
+    from atomic_tools.utils.extractors import _E57_EPOCH, _parse_e57_datetime_node
+
+    target = datetime.datetime(2023, 3, 1, tzinfo=datetime.timezone.utc)
+    secs = (target - _E57_EPOCH).total_seconds()
+
+    class _Val:
+        def value(self):
+            return secs
+
+    node = {"creationDateTime": {"dateTimeValue": _Val()}}
+    assert _parse_e57_datetime_node(node, "creationDateTime") == target
+    assert _parse_e57_datetime_node({}, "creationDateTime") is None  # absent → None
+
+
+def test_extract_pdal_metadata_populates_e57_creation_date(monkeypatch):
+    # E57 header/filters.info carry no date; the pye57-derived capture datetime
+    # supplies creation_year / creation_doy.
+    import datetime
+
+    from atomic_tools.utils import extractors
+
+    monkeypatch.setattr(extractors, "find_pdal_bin", lambda: "/fake/pdal")
+    monkeypatch.setattr(extractors, "_run_pdal_info", lambda *a, **k: {"metadata": {}})
+    monkeypatch.setattr(
+        extractors,
+        "_run_pdal_filters_info",
+        lambda *a, **k: {
+            "bbox": {"minx": 0, "maxx": 1, "miny": 0, "maxy": 1, "minz": 0, "maxz": 1},
+            "num_points": 5,
+        },
+    )
+    monkeypatch.setattr(
+        extractors,
+        "_extract_e57_capture_datetime",
+        lambda p: datetime.datetime(2024, 6, 15, tzinfo=datetime.timezone.utc),
+    )
+    meta = extractors.extract_pdal_metadata("scan.e57", "scan.e57")
+    assert meta["creation_year"] == 2024
+    assert meta["creation_doy"] == 167
+    assert meta["num_points"] == 5
+
+
+def test_extract_pdal_metadata_e57_without_date_leaves_creation_fields_absent(monkeypatch):
+    # When pye57 yields no date, creation fields stay absent (→ filename fallback),
+    # not fabricated.
+    from atomic_tools.utils import extractors
+
+    monkeypatch.setattr(extractors, "find_pdal_bin", lambda: "/fake/pdal")
+    monkeypatch.setattr(extractors, "_run_pdal_info", lambda *a, **k: {"metadata": {}})
+    monkeypatch.setattr(
+        extractors,
+        "_run_pdal_filters_info",
+        lambda *a, **k: {"bbox": {"minx": 0, "maxx": 1, "miny": 0, "maxy": 1}, "num_points": 5},
+    )
+    monkeypatch.setattr(extractors, "_extract_e57_capture_datetime", lambda p: None)
+    meta = extractors.extract_pdal_metadata("scan.e57", "scan.e57")
+    assert "creation_year" not in meta and "creation_doy" not in meta
+
+
+def _crs_status(pc_metadata, spatial_reference=None):
+    """Run _add_crs_web_mercator_column over a minimal df and return the per-row
+    crs_web_mercator_ok value keyed by filename (DEFAULT included)."""
+    import pandas as pd
+
+    labels = [label for label, _ in pc_metadata]
+    df = pd.DataFrame([{"Filename": "DEFAULT"}] + [{"Filename": lb} for lb in labels])
+    _add_crs_web_mercator_column(df, pc_metadata, spatial_reference)
+    return dict(zip(df["Filename"], df[_CRS_WEB_MERCATOR_COL], strict=True))
+
+
+def test_crs_column_yes_with_embedded_crs():
+    status = _crs_status([("cloud.las", {"spatialreference": _UTM12N_WKT})])
+    assert status["cloud.las"] == "yes"
+    # DEFAULT (and any non-point-cloud row) stays blank.
+    assert status["DEFAULT"] == ""
+
+
+def test_crs_column_yes_with_backup_when_header_missing():
+    status = _crs_status(
+        [("cloud.las", {"spatialreference": ""})], spatial_reference="EPSG:32612"
+    )
+    assert status["cloud.las"] == "yes"
+
+
+def test_crs_column_yes_transforms_bbox_center():
     # Bounds present → the check transforms the actual bbox center to EPSG:3857.
     meta = {
         "spatialreference": _UTM12N_WKT,
@@ -272,11 +442,11 @@ def test_validate_point_cloud_crs_transforms_bbox_center():
         "bounds.minz": 10.0,
         "bounds.maxz": 20.0,
     }
-    _validate_point_cloud_crs([("cloud.las", meta)], spatial_reference=None)
+    assert _crs_status([("cloud.las", meta)])["cloud.las"] == "yes"
 
 
-def test_validate_point_cloud_crs_raises_when_center_unreachable_with_bounds():
-    # Even with bounds present, a CRS with no path to Web Mercator is rejected.
+def test_crs_column_no_when_center_unreachable_with_bounds():
+    # Even with bounds present, a CRS with no path to Web Mercator is "no".
     meta = {
         "spatialreference": 'LOCAL_CS["unknown",UNIT["metre",1]]',
         "bounds.minx": 0.0,
@@ -284,30 +454,27 @@ def test_validate_point_cloud_crs_raises_when_center_unreachable_with_bounds():
         "bounds.miny": 0.0,
         "bounds.maxy": 100.0,
     }
-    with pytest.raises(ValueError, match="cannot be\\s+transformed to EPSG:3857"):
-        _validate_point_cloud_crs([("cloud.las", meta)], spatial_reference=None)
+    assert _crs_status([("cloud.las", meta)])["cloud.las"] == "no"
 
 
-def test_validate_point_cloud_crs_raises_when_no_crs_and_no_backup():
-    file_metadata = [("a.las", {"spatialreference": ""}), ("b.las", {})]
-    with pytest.raises(ValueError, match="could not determine a CRS"):
-        _validate_point_cloud_crs(file_metadata, spatial_reference=None)
+def test_crs_column_no_when_no_crs_and_no_backup():
+    status = _crs_status([("a.las", {"spatialreference": ""}), ("b.las", {})])
+    assert status["a.las"] == "no"
+    assert status["b.las"] == "no"
 
 
-def test_validate_point_cloud_crs_raises_when_crs_unreachable_from_3857():
+def test_crs_column_no_when_crs_unreachable_from_3857():
     # A local engineering CRS parses but has no transform to Web Mercator.
     local_crs = 'LOCAL_CS["unknown",UNIT["metre",1]]'
-    file_metadata = [("cloud.las", {"spatialreference": local_crs})]
-    with pytest.raises(ValueError, match="cannot be\\s+transformed to EPSG:3857"):
-        _validate_point_cloud_crs(file_metadata, spatial_reference=None)
+    assert _crs_status([("cloud.las", {"spatialreference": local_crs})])["cloud.las"] == "no"
 
 
-def test_validate_point_cloud_crs_raises_when_backup_unreachable_from_3857():
-    file_metadata = [("cloud.las", {"spatialreference": ""})]
-    with pytest.raises(ValueError, match="cannot be\\s+transformed to EPSG:3857"):
-        _validate_point_cloud_crs(
-            file_metadata, spatial_reference='LOCAL_CS["x",UNIT["metre",1]]'
-        )
+def test_crs_column_no_when_backup_unreachable_from_3857():
+    status = _crs_status(
+        [("cloud.las", {"spatialreference": ""})],
+        spatial_reference='LOCAL_CS["x",UNIT["metre",1]]',
+    )
+    assert status["cloud.las"] == "no"
 
 
 def test_load_input_sidecar_headered():

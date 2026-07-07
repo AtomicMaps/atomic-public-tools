@@ -80,6 +80,10 @@ sidecar_app = typer.Typer(
 _VIDEO_DATA_TYPES = {DataTypeEnum.video}
 _POINT_CLOUD_DATA_TYPES = {DataTypeEnum.point_cloud}
 
+# Customer-facing per-point-cloud status column: did the effective CRS convert to
+# Web Mercator? Populated by _add_crs_web_mercator_column.
+_CRS_WEB_MERCATOR_COL = "crs_web_mercator_ok"
+
 
 def _fail(message: str, exc: Exception) -> NoReturn:
     """Log a failure, surface AWS auth help if applicable, and exit non-zero."""
@@ -560,7 +564,9 @@ def build_sidecar_df(
         for filename, meta in file_metadata
     ]
     df = pd.DataFrame(rows, columns=columns)
-    df = df.sort_values(by="Filename", kind="stable", ignore_index=True)
+    # DEFAULT is always first (prepended below); the rest sort by DataType then
+    # Filename so rows of the same type group together, alphabetically within.
+    df = df.sort_values(by=["DataType", "Filename"], kind="stable", ignore_index=True)
 
     default_row = pd.DataFrame(
         [{"Filename": "DEFAULT", "DataType": "", **{col: "" for col in all_cols}}]
@@ -635,56 +641,81 @@ def _bbox_center_from_meta(meta: dict) -> tuple[float, float, float | None] | No
     return cx, cy, midpoint("bounds.minz", "bounds.maxz")
 
 
-def _validate_point_cloud_crs(
-    file_metadata: list[tuple[str, dict]],
+def _crs_reaches_web_mercator(meta: dict, crs: str) -> bool:
+    """True if ``crs`` transforms to EPSG:3857 for this file.
+
+    Prefers transforming the file's actual bounding-box center into EPSG:3857 (a
+    stricter test than merely building a transformer — it also catches a CRS that
+    maps real coordinates to non-finite values), falling back to a CRS-only check
+    when bounds are unavailable.
+    """
+    center = _bbox_center_from_meta(meta)
+    if center is not None:
+        return transform_center_to_web_mercator(*center, crs) is not None
+    return can_transform_to_web_mercator(crs)
+
+
+def _add_crs_web_mercator_column(
+    df,
+    pc_metadata: list[tuple[str, dict]],
     spatial_reference: str | None,
 ) -> None:
-    """Ensure every point cloud has a CRS reachable from EPSG:3857.
+    """Add a customer-facing ``crs_web_mercator_ok`` status column for point clouds.
 
-    Flow renders point clouds in Web Mercator, so each file must resolve to a
-    CRS pyproj can transform there. The CRS is whatever PDAL read from the file
-    header, falling back to the ``--spatial-reference`` backup when the header
-    has none. The transformability check actually transforms the file's
-    bounding-box center into EPSG:3857 (a stricter test than merely building a
-    transformer — it also catches a CRS that maps real coordinates to non-finite
-    values), falling back to a CRS-only check when bounds are unavailable. Raises
-    ``ValueError`` if any file ends up with no CRS at all, or with a CRS that
-    cannot be transformed to EPSG:3857.
+    Flow renders point clouds in Web Mercator, so each one must resolve to a CRS
+    pyproj can transform to EPSG:3857 — its header CRS (``file_srs``), else the
+    ``--spatial-reference`` fallback (``fallback_srs``). For every point-cloud row
+    this records ``"yes"`` when that effective CRS converts successfully and
+    ``"no"`` when it is missing or cannot be converted (a row the customer needs
+    to fix). Blank on non-point-cloud rows and the DEFAULT row. Rows marked
+    ``"no"`` are also reported as lint errors, so the status is a convenience, not
+    a substitute for the linter's blocking check.
     """
-    missing: list[str] = []
-    untransformable: list[str] = []
-
-    for label, meta in file_metadata:
+    status: dict[str, str] = {}
+    for label, meta in pc_metadata:
         crs = extract_pdal_crs(meta) or spatial_reference
-        if not crs:
-            missing.append(label)
-            continue
-        center = _bbox_center_from_meta(meta)
-        if center is not None:
-            transformable = transform_center_to_web_mercator(*center, crs) is not None
-        else:
-            transformable = can_transform_to_web_mercator(crs)
-        if not transformable:
-            untransformable.append(label)
+        status[label] = "yes" if crs and _crs_reaches_web_mercator(meta, crs) else "no"
+    df[_CRS_WEB_MERCATOR_COL] = df["Filename"].map(lambda name: status.get(name, ""))
 
-    if missing:
-        preview = ", ".join(missing[:10]) + (" …" if len(missing) > 10 else "")
-        raise ValueError(
-            f"PDAL could not determine a CRS for {len(missing)} point cloud "
-            f"file(s) and no backup CRS was provided. Re-run with "
-            f"--spatial-reference (e.g. 'EPSG:32612') to supply one. "
-            f"Affected files: {preview}"
-        )
 
-    if untransformable:
-        preview = ", ".join(untransformable[:10]) + (
-            " …" if len(untransformable) > 10 else ""
-        )
-        raise ValueError(
-            f"The CRS for {len(untransformable)} point cloud file(s) cannot be "
-            f"transformed to {WEB_MERCATOR_EPSG} by pyproj, so it cannot be "
-            f"used. Affected files: {preview}"
-        )
+def _crs_failures(df) -> list[str]:
+    """Filenames of point-cloud rows whose CRS could not convert to Web Mercator.
+
+    Reads the ``crs_web_mercator_ok`` column (present only when the scan found
+    point clouds); a row is a failure when that flag is ``"no"``.
+    """
+    if _CRS_WEB_MERCATOR_COL not in df.columns:
+        return []
+    flag = df[_CRS_WEB_MERCATOR_COL].astype(str).str.strip()
+    return df.loc[flag == "no", "Filename"].tolist()
+
+
+def _raise_crs_failures_loudly(crs_failures: list[str]) -> None:
+    """Print an unmissable bright-red error for point clouds that fail CRS conversion.
+
+    The linter already records these as errors (so the run exits non-zero); this
+    additionally surfaces them as a loud banner at the very end of the run, where
+    they won't be lost among the rest of the lint report. No-op when nothing failed.
+    """
+    if not crs_failures:
+        return
+    sample = crs_failures if len(crs_failures) <= 10 else crs_failures[:10] + ["…"]
+    click.secho(
+        f"\nERROR: {len(crs_failures)} point cloud(s) could not be converted to "
+        f"Web Mercator ({WEB_MERCATOR_EPSG}) — their CRS is missing or invalid, so "
+        f"Flow cannot ingest them: {sample}",
+        fg="bright_red",
+        bold=True,
+        err=True,
+        color=True,
+    )
+    click.secho(
+        f"  Fix the CRS in the file(s), or re-run with a valid --spatial-reference. "
+        f"See the '{_CRS_WEB_MERCATOR_COL}' column (rows marked 'no').",
+        fg="bright_red",
+        err=True,
+        color=True,
+    )
 
 
 def _union_include_extensions() -> list[str]:
@@ -702,25 +733,56 @@ def _union_include_extensions() -> list[str]:
     return union
 
 
+# Camera/software-generated derivative files (previews, thumbnails, annotation
+# sidecars) that are never source data. In auto-detect these fail classification
+# — they match a data type's ``exclude`` patterns — but they are expected noise,
+# not "unknown types", so they are skipped silently rather than warned about.
+_IGNORED_DERIVATIVE_SUFFIXES = (
+    "previewimage.jpg",
+    "thumbnailimage.jpg",
+    "_thumbnail.jpg",
+    "_thumbnail.jpeg",
+    "_thumbnail.png",
+    "annotation.json",
+)
+
+
+def _is_ignorable_derivative(key: str) -> bool:
+    """True for preview/thumbnail/derivative files that should be skipped quietly.
+
+    Matches the known derivative suffixes above — the exact patterns a data type's
+    ``exclude`` list rejects, which are what make ``infer_data_type`` return None
+    for these files in the first place.
+    """
+    return Path(key).name.lower().endswith(_IGNORED_DERIVATIVE_SUFFIXES)
+
+
 def _classify_keys(
     keys: list[str],
 ) -> tuple[dict[str, DataTypeEnum], list[str], list[str]]:
     """Filename-only classification of listed keys for auto-detect mode.
 
     Returns ``(types_by_key, unclassified, vector_keys)``. ``types_by_key`` holds
-    only supported (non-vector, classified) keys.
+    only supported (non-vector, classified) keys. Preview/thumbnail derivatives
+    are dropped silently (see ``_is_ignorable_derivative``) — they never reach
+    ``unclassified``, so they don't trigger the "no known data type" warning.
     """
     types_by_key: dict[str, DataTypeEnum] = {}
     unclassified: list[str] = []
     vector_keys: list[str] = []
+    ignored: list[str] = []
     for key in keys:
         inferred = infer_data_type(key)
         if inferred is None:
-            unclassified.append(key)
+            (ignored if _is_ignorable_derivative(key) else unclassified).append(key)
         elif inferred == DataTypeEnum.vector.value:
             vector_keys.append(key)
         else:
             types_by_key[key] = DataTypeEnum(inferred)
+    if ignored:
+        logger.debug(
+            f"Silently skipped {len(ignored)} preview/thumbnail derivative file(s)."
+        )
     return types_by_key, unclassified, vector_keys
 
 
@@ -730,6 +792,105 @@ def _warn_skipped(keys: list[str], message: str) -> None:
     logger.warning(f"{message}: {sample}{suffix}")
 
 
+def _warn_skipped_vectors(vector_keys: list[str]) -> None:
+    """Report vector files skipped during the scan (called once, at the end).
+
+    Vector sidecar generation isn't supported, so vector files are silently
+    passed over while scanning; this surfaces the skip after the run so it isn't
+    lost among the per-file progress output.
+    """
+    if not vector_keys:
+        return
+    sample = vector_keys[:5]
+    suffix = f" (+{len(vector_keys) - 5} more)" if len(vector_keys) > 5 else ""
+    click.secho(
+        f"\nNote: {len(vector_keys)} vector file(s) were skipped — vector sidecar "
+        f"generation is not supported: {sample}{suffix}",
+        fg="yellow",
+        err=True,
+    )
+
+
+_TIFF_SUFFIXES = {".tif", ".tiff"}
+
+
+def _drop_preview_tifs(keys: list[str]) -> list[str]:
+    """Drop ``.tif`` files that are generated previews of another file.
+
+    Some capture pipelines emit a ``.tif`` preview alongside the real asset —
+    e.g. ``R0010013.tif`` next to ``R0010013.JPG``. These are not unknown
+    filetypes, just rasterized previews, and must not become sidecar rows. A
+    ``.tif`` is treated as a preview when another (non-tiff) file in the *same
+    folder* shares its basename stem. Standalone ortho ``.tif`` files (no such
+    companion) are kept.
+    """
+    by_stem: dict[tuple[str, str], list[str]] = defaultdict(list)
+    for key in keys:
+        p = Path(key)
+        by_stem[(str(p.parent), p.stem.lower())].append(key)
+
+    kept: list[str] = []
+    dropped: list[str] = []
+    for key in keys:
+        p = Path(key)
+        if p.suffix.lower() in _TIFF_SUFFIXES and any(
+            other != key and Path(other).suffix.lower() not in _TIFF_SUFFIXES
+            for other in by_stem[(str(p.parent), p.stem.lower())]
+        ):
+            dropped.append(key)
+        else:
+            kept.append(key)
+
+    if dropped:
+        sample = dropped[:5]
+        suffix = f" (+{len(dropped) - 5} more)" if len(dropped) > 5 else ""
+        logger.info(
+            f"Ignored {len(dropped)} preview .tif file(s) that share a name with "
+            f"another file in the same folder: {sample}{suffix}"
+        )
+    return kept
+
+
+def _drop_all_empty_columns(df, keep: set[str] | None = None) -> None:
+    """Drop columns whose every value is blank, in place.
+
+    ``Filename`` and ``DataType`` are always kept, as is any column in ``keep``
+    (the required fields for the detected types — a blank required column is left
+    in place as a checklist of what still needs filling). A non-protected column
+    survives only if some cell (including the DEFAULT row) holds a value — so
+    ``fallback_srs`` (set only on DEFAULT) stays, while columns no file populated
+    are removed entirely.
+    """
+    protected = {"Filename", "DataType"} | (keep or set())
+    empty_cols = [
+        col
+        for col in df.columns
+        if col not in protected and not df[col].map(has_value).any()
+    ]
+    if empty_cols:
+        logger.info(
+            f"Dropping {len(empty_cols)} non-required column(s) with no values "
+            f"in any row: {empty_cols}"
+        )
+        df.drop(columns=empty_cols, inplace=True)
+
+
+def _move_blank_columns_to_end(df):
+    """Return ``df`` with every all-blank column moved to the right edge.
+
+    After ``_drop_all_empty_columns`` the only all-blank columns left are the
+    protected required fields; grouping them at the end keeps the populated
+    columns (``Filename``/``DataType`` first, then real data) together on the
+    left and pushes the empty checklist columns out of the way.
+    """
+    blank = [col for col in df.columns if not df[col].map(has_value).any()]
+    if not blank:
+        return df
+    non_blank = [col for col in df.columns if col not in blank]
+    logger.info(f"Moving {len(blank)} all-blank column(s) to the end: {blank}")
+    return df[non_blank + blank]
+
+
 def _build_sidecar(
     directory: str,
     data_type: DataTypeEnum | None,
@@ -737,14 +898,15 @@ def _build_sidecar(
     client_schema: str | None,
     full: bool = False,
     spatial_reference: str | None = None,
-) -> tuple["object", StorageBackend, set[DataTypeEnum]]:
+) -> tuple["object", StorageBackend, set[DataTypeEnum], list[str]]:
     """Scan a directory, extract metadata, and assemble the sidecar DataFrame.
 
     This is the shared core of both ``sidecar generate`` and ``validate``: it
     does everything up to (but not including) writing the CSV anywhere. Returns
-    ``(df, backend, detected_types)`` so callers can persist the sidecar
-    (``generate``) or lint it from a throwaway temp file (``validate``), and log
-    what was detected.
+    ``(df, backend, detected_types, skipped_vector_keys)`` so callers can persist
+    the sidecar (``generate``) or lint it from a throwaway temp file
+    (``validate``), log what was detected, and report skipped vector files at the
+    end of the run rather than mid-scan.
 
     ``data_type`` is an optional filter/override:
 
@@ -791,21 +953,19 @@ def _build_sidecar(
                 f"No valid files found for '{data_type.value}' in {backend.display_root}"
             )
         types_by_key: dict[str, DataTypeEnum] = {key: data_type for key in keys}
+        vector_keys: list[str] = []
     else:
         # --- Auto-detect: list everything, classify per file. ---
         keys = backend.list_keys(include=_union_include_extensions(), exclude=[])
+        keys = _drop_preview_tifs(keys)
         types_by_key, unclassified, vector_keys = _classify_keys(keys)
         if unclassified:
             _warn_skipped(
                 unclassified,
                 f"{len(unclassified)} file(s) matched no known data type and were skipped",
             )
-        if vector_keys:
-            _warn_skipped(
-                vector_keys,
-                f"vector sidecar generation is not supported; skipping "
-                f"{len(vector_keys)} file(s)",
-            )
+        # Vector files are unsupported, but we don't interrupt the scan to say so
+        # — the skip is reported once at the end (see _run_generate / _validate).
         if not types_by_key:
             raise RuntimeError(f"No supported files found in {backend.display_root}")
 
@@ -889,11 +1049,6 @@ def _build_sidecar(
     pc_labels = _labels_for(DataTypeEnum.point_cloud)
     pc_metadata = [(label, meta) for label, meta in file_metadata if label in pc_labels]
 
-    # Point clouds must carry a CRS that reaches Web Mercator; fail fast here
-    # (before merging/building) rather than emit a sidecar Flow can't ingest.
-    if pc_metadata:
-        _validate_point_cloud_crs(pc_metadata, spatial_reference)
-
     if client_sidecar:
         client_url = client_sidecar.strip()
         if not client_url:
@@ -949,6 +1104,10 @@ def _build_sidecar(
         # Record each point cloud's header CRS (with or without
         # --spatial-reference) so the linter can convert bounds into the goal CRS.
         _add_file_srs_column(df, pc_metadata)
+        # Customer-facing flag: did each point cloud's effective CRS convert to
+        # Web Mercator? (Uses the same fallback the linter does; rows marked "no"
+        # are also reported as lint errors.)
+        _add_crs_web_mercator_column(df, pc_metadata, spatial_reference)
 
     if spatial_reference:
         # Mixed content does BOTH: record the point-cloud fallback CRS on DEFAULT
@@ -966,7 +1125,18 @@ def _build_sidecar(
             )
             _reproject_dataframe(df, spatial_reference, only_labels=iv_labels)
 
-    return df, backend, detected_types
+    # Drop non-required columns no file populated (kept last so file_srs/
+    # fallback_srs, added above, are considered). Required fields for the
+    # detected types are protected even when blank — they stay as a checklist.
+    required_canonicals = {
+        group[0]
+        for detected in detected_types
+        for group in _REQUIRED_SIDECAR_FIELD_GROUPS.get(detected, [])
+    }
+    _drop_all_empty_columns(df, keep=required_canonicals)
+    df = _move_blank_columns_to_end(df)
+
+    return df, backend, detected_types, vector_keys
 
 
 def _generate(
@@ -978,7 +1148,7 @@ def _generate(
     full: bool = False,
     local_copy: bool = False,
     spatial_reference: str | None = None,
-) -> str:
+) -> tuple[str, list[str], list[str]]:
     logger.info(
         f"Starting sidecar CSV generation — directory={directory!r} "
         f"data_type={data_type} output={output_filename!r} "
@@ -986,7 +1156,7 @@ def _generate(
         f"full={full} local_copy={local_copy} spatial_reference={spatial_reference!r}"
     )
 
-    df, backend, _detected = _build_sidecar(
+    df, backend, _detected, vector_keys = _build_sidecar(
         directory=directory,
         data_type=data_type,
         client_sidecar=client_sidecar,
@@ -994,6 +1164,7 @@ def _generate(
         full=full,
         spatial_reference=spatial_reference,
     )
+    crs_failures = _crs_failures(df)
 
     local_copy_path: Path | None = None
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1015,7 +1186,7 @@ def _generate(
             f"Local copy at: {local_copy_path}", fg="green", bold=True, err=True
         )
 
-    return sidecar_path
+    return sidecar_path, vector_keys, crs_failures
 
 
 def _format_replay_command(
@@ -1218,7 +1389,7 @@ def _run_generate(result: WizardResult, *, wizard_ran: bool) -> None:
         )
 
     try:
-        sidecar_path = _generate(
+        sidecar_path, skipped_vector, crs_failures = _generate(
             directory=directory,
             data_type=data_type,
             output_filename=output_filename,
@@ -1246,7 +1417,11 @@ def _run_generate(result: WizardResult, *, wizard_ran: bool) -> None:
         _fail("Failed to lint generated sidecar", e)
 
     typer.echo(report.render())
-    if report.has_errors():
+    _warn_skipped_vectors(skipped_vector)
+    # A point cloud that can't reach Web Mercator is unusable to Flow; surface it
+    # loudly at the very end and force a non-zero exit even if nothing else failed.
+    _raise_crs_failures_loudly(crs_failures)
+    if report.has_errors() or crs_failures:
         raise typer.Exit(code=1)
 
 
