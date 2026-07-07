@@ -70,11 +70,6 @@ from atomic_tools.validators.values import parse_elevation, to_decimal_degree
 
 logger = logging.getLogger(__name__)
 
-sidecar_app = typer.Typer(
-    no_args_is_help=True,
-    help="Generate a sidecar CSV by scanning a local or remote directory.",
-)
-
 # Image data types share the EXIF extractor and are the only types COCO label
 # impact applies to — IMAGE_DATA_TYPES is the single source of truth (coco.py).
 _VIDEO_DATA_TYPES = {DataTypeEnum.video}
@@ -901,7 +896,7 @@ def _build_sidecar(
 ) -> tuple["object", StorageBackend, set[DataTypeEnum], list[str]]:
     """Scan a directory, extract metadata, and assemble the sidecar DataFrame.
 
-    This is the shared core of both ``sidecar generate`` and ``validate``: it
+    This is the shared core of both ``sidecar`` and ``validate``: it
     does everything up to (but not including) writing the CSV anywhere. Returns
     ``(df, backend, detected_types, skipped_vector_keys)`` so callers can persist
     the sidecar (``generate``) or lint it from a throwaway temp file
@@ -1204,11 +1199,11 @@ def _format_replay_command(
     local_copy: bool = False,
     coco: str | None = None,
 ) -> str:
-    """Build the copy-pasteable replay command for ``sidecar generate`` or
-    ``validate``. ``subcommand`` is the command words (e.g. ``["sidecar",
-    "generate"]`` or ``["validate"]``); the save-only flags are emitted only
-    when relevant (``validate`` passes neither). ``--datatype`` is emitted only
-    when an explicit filter was chosen (auto-detect is the default).
+    """Build the copy-pasteable replay command for ``sidecar`` or ``validate``.
+    ``subcommand`` is the command words (e.g. ``["sidecar"]`` or
+    ``["validate"]``); the save-only flags are emitted only when relevant
+    (``validate`` passes neither). ``--datatype`` is emitted only when an
+    explicit filter was chosen (auto-detect is the default).
     """
     parts = ["am-tools"]
     if verbosity == "verbose":
@@ -1349,7 +1344,7 @@ def _run_interactive_wizard(
 def _run_generate(result: WizardResult, *, wizard_ran: bool) -> None:
     """Generate and lint a sidecar from a fully-resolved set of options.
 
-    Shared by ``sidecar generate`` and the ``build-schema`` follow-on: it
+    Shared by ``sidecar`` and the ``build-schema`` follow-on: it
     normalises the output filename, echoes the replay command (only when a
     wizard ran), writes the sidecar, then lints it. ``result.verbosity`` is
     assumed to have already been applied to the root logger by the caller.
@@ -1373,7 +1368,7 @@ def _run_generate(result: WizardResult, *, wizard_ran: bool) -> None:
     if wizard_ran:
         _echo_replay_command(
             _format_replay_command(
-                ["sidecar", "generate"],
+                ["sidecar"],
                 directory=directory,
                 data_type=data_type,
                 output_filename=output_filename,
@@ -1480,7 +1475,6 @@ def offer_sidecar_after_schema(
     _run_generate(result, wizard_ran=True)
 
 
-@sidecar_app.command()
 def generate(
     ctx: typer.Context,
     directory: Annotated[

@@ -1,12 +1,12 @@
 """``am-tools validate`` — lint data without saving a sidecar.
 
-Does exactly what ``am-tools sidecar generate`` does — scan a directory,
+Does exactly what ``am-tools sidecar`` does — scan a directory,
 extract per-file metadata, assemble a sidecar, and lint it — but never writes
 the sidecar to the remote/local directory. It exists for the common case of
 "I just want to know whether my data is clean" without leaving a file behind.
 
 The metadata extraction, sidecar assembly, wizard prompts, and lint pathway are
-all shared with ``sidecar generate`` (see :mod:`atomic_tools.commands.sidecar`);
+all shared with ``sidecar`` (see :mod:`atomic_tools.commands.sidecar`);
 this module only swaps the persist step for an in-memory temp file that is
 linted and discarded.
 """
@@ -190,7 +190,7 @@ def validate(
 ) -> None:
     """Scan a directory, extract metadata, and lint it — without saving a sidecar.
 
-    Identical to ``sidecar generate`` except nothing is written: no sidecar is
+    Identical to ``sidecar`` except nothing is written: no sidecar is
     saved to the input directory or locally. With no flags, prompts
     interactively for each value. Any flag passed on the command line is used
     as-is and not prompted for.

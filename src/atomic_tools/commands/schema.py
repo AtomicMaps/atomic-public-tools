@@ -3,7 +3,7 @@
 ``am-tools build-schema`` reads a client-supplied sidecar CSV (local or remote),
 shows per-column statistics and samples, and walks the user through mapping each
 column to a canonical name. It writes a ``schema.json`` in the exact format
-consumed by ``sidecar generate --client-schema`` (see ``client_sidecar`` and
+consumed by ``sidecar --client-schema`` (see ``client_sidecar`` and
 ``validators/schema.py``):
 
   * CSV has a header row  -> ``{"column_name_mapping": {<original>: <canonical>}}``
@@ -566,7 +566,7 @@ def build_schema_command(
         typer.echo(report.render())
 
     # Offer to keep going: the schema we just wrote, the client sidecar it was
-    # built from, and the data type are exactly the inputs `sidecar generate`
+    # built from, and the data type are exactly the inputs `sidecar`
     # needs, so carry them over and ask only the remaining wizard questions.
     # Prefer a remote schema path for the follow-on so the printed replay
     # command matches what you'd run against object storage.
