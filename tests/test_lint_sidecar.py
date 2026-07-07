@@ -137,17 +137,18 @@ def test_final_missing_date_column_errors(tmp_path):
 
 
 def test_spherical_missing_orientation_columns_still_errors(tmp_path):
-    """Orientation stays required for spherical_image (unchanged)."""
-    header = ["Filename", "CreateDate", "GPSAltitude", "GPSLatitude", "GPSLongitude"]
+    """Orientation stays required for spherical_image. The row is typed spherical
+    via the DataType column (a .jpg would otherwise infer oriented)."""
+    header = ["Filename", "DataType", "CreateDate", "GPSAltitude", "GPSLatitude", "GPSLongitude"]
     rows = [
-        ["DEFAULT", "", "", "", ""],
-        ["1.jpg", "2024:06:15 10:30:00", "1000", "51.0", "-114.0"],
+        ["DEFAULT", "", "", "", "", ""],
+        ["1.jpg", "spherical_image", "2024:06:15 10:30:00", "1000", "51.0", "-114.0"],
     ]
     p = _write_csv(tmp_path, "s.csv", header, rows)
     report = lint_sidecar_file(
         str(p),
         final=True,
-        data_type=DataTypeEnum.spherical_image,
+        data_type=None,
         schema_path=None,
         input_files_path=None,
     )

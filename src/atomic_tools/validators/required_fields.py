@@ -155,7 +155,7 @@ REFERENCED_SIDECAR_FIELD_GROUPS: dict[str, list[list[str]]] = {
         ["ImageHeight", "ExifImageHeight", "FullPanoHeightPixels", "CroppedAreaImageHeightPixels"],
     ],
     DataTypeEnum.ortho_image: [
-        ["FocalLength", "FocalLengthIn35mmFormat"],
+        ["FocalLength", "FocalLengthIn35mmFormat", "FocalLength35efl"],
         ["Make"],
         ["Model"],
         ["ImageWidth", "ExifImageWidth"],

@@ -33,7 +33,7 @@ def captured_lint(monkeypatch):
                 {"Filename": "a.jpg", "GPSLatitude": "51.0", "GPSLongitude": "-114.0"},
             ]
         )
-        return df, object()
+        return df, object(), {DataTypeEnum.oriented_image}
 
     def fake_lint(path, **kwargs):
         calls["lint_path"] = path
@@ -64,6 +64,15 @@ def test_validate_runs_lint_in_final_mode(captured_lint, tmp_path):
     assert captured_lint["lint_kwargs"]["input_files_path"] == str(tmp_path)
     assert captured_lint["lint_kwargs"]["schema_path"] is None
     assert captured_lint["path_exists_during_lint"] is True
+
+
+def test_validate_without_datatype_runs_auto(captured_lint, tmp_path):
+    """No --datatype: the command runs non-interactively (auto-detect) and lint
+    receives data_type=None."""
+    result = runner.invoke(app, ["validate", "--directory", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    assert captured_lint["lint_kwargs"]["data_type"] is None
+    assert captured_lint["build_kwargs"]["data_type"] is None
 
 
 def test_validate_passes_coco_to_lint(captured_lint, tmp_path):
@@ -122,7 +131,7 @@ def test_validate_writes_no_sidecar(captured_lint, tmp_path):
 
 def test_validate_exits_nonzero_on_errors(monkeypatch, tmp_path):
     def fake_build_sidecar(**kwargs):
-        return pd.DataFrame([{"Filename": "DEFAULT"}]), object()
+        return pd.DataFrame([{"Filename": "DEFAULT"}]), object(), set()
 
     def fake_lint(path, **kwargs):
         report = LintReport()

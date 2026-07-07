@@ -421,7 +421,7 @@ def _print_column_summary(original: str, stats: dict[str, object]) -> None:
     )
     samples = stats["samples"]
     if samples:
-        rendered = ", ".join(repr(s) for s in samples)  # type: ignore[union-attr]
+        rendered = ", ".join(repr(s) for s in samples)
         click.secho(f"  samples: {rendered}", fg="bright_black", err=True)
 
 

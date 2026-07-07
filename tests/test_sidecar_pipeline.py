@@ -35,6 +35,17 @@ HEADERLESS_SIDECAR = EXAMPLE_DIR / "input sidecar" / "headerless_sidecar.csv"
 EXAMPLE_SCHEMA = REPO_ROOT / "schemas" / "column_names_example.json"
 
 ORIENTED_GROUPS = _ALL_SIDECAR_FIELD_GROUPS[DataTypeEnum.oriented_image]
+PC_GROUPS = _ALL_SIDECAR_FIELD_GROUPS[DataTypeEnum.point_cloud]
+
+
+def _build_single_type(metadata, groups, type_value, **kwargs):
+    """build_sidecar_df helper for a single-type scan (all rows one type)."""
+    return build_sidecar_df(
+        metadata,
+        field_groups_by_type={type_value: groups},
+        types_by_label={label: type_value for label, _ in metadata},
+        **kwargs,
+    )
 
 
 def _exif_like_metadata() -> list[tuple[str, dict]]:
@@ -85,10 +96,14 @@ def _exif_like_metadata() -> list[tuple[str, dict]]:
 
 
 def test_build_sidecar_df_layout_and_canonicalization():
-    df = build_sidecar_df(_exif_like_metadata(), required_field_groups=ORIENTED_GROUPS)
+    df = _build_single_type(_exif_like_metadata(), ORIENTED_GROUPS, "oriented_image")
 
     # DEFAULT first, then files sorted alphabetically.
     assert df["Filename"].tolist() == ["DEFAULT", "1.jpg", "2.jpeg", "3.jpg"]
+
+    # DataType is column 2, filled per file and blank on DEFAULT.
+    assert list(df.columns[:2]) == ["Filename", "DataType"]
+    assert df["DataType"].tolist() == ["", "oriented_image", "oriented_image", "oriented_image"]
 
     cols = list(df.columns)
     # Aliases canonicalized: GimbalPitchDegree → Pitch, etc.
@@ -107,9 +122,9 @@ def test_build_sidecar_df_layout_and_canonicalization():
 def test_build_sidecar_df_full_includes_extra_fields():
     metadata = _exif_like_metadata()
     metadata[0][1]["ExtraField"] = "kept-when-full"
-    df = build_sidecar_df(metadata, required_field_groups=ORIENTED_GROUPS, full=True)
+    df = _build_single_type(metadata, ORIENTED_GROUPS, "oriented_image", full=True)
     assert "ExtraField" in df.columns
-    df_filtered = build_sidecar_df(_exif_like_metadata(), required_field_groups=ORIENTED_GROUPS)
+    df_filtered = _build_single_type(_exif_like_metadata(), ORIENTED_GROUPS, "oriented_image")
     assert "ExtraField" not in df_filtered.columns
 
 
@@ -144,7 +159,7 @@ def _projected_metadata() -> list[tuple[str, dict]]:
 
 
 def test_reproject_dataframe_image_coordinates():
-    df = build_sidecar_df(_projected_metadata(), required_field_groups=ORIENTED_GROUPS)
+    df = _build_single_type(_projected_metadata(), ORIENTED_GROUPS, "oriented_image")
     _reproject_dataframe(df, "EPSG:32612")
 
     # DEFAULT row stays blank.
@@ -170,7 +185,7 @@ def test_reproject_dataframe_skips_unparseable_rows():
     metadata = _projected_metadata()
     metadata[1][1]["GPSLongitude"] = ""  # blank → skipped
     metadata[1][1]["GPSLatitude"] = ""
-    df = build_sidecar_df(metadata, required_field_groups=ORIENTED_GROUPS)
+    df = _build_single_type(metadata, ORIENTED_GROUPS, "oriented_image")
     _reproject_dataframe(df, "EPSG:32612")
 
     row_b = df[df["Filename"] == "b.jpg"].iloc[0]
@@ -179,11 +194,10 @@ def test_reproject_dataframe_skips_unparseable_rows():
 
 
 def test_add_spatial_reference_column_point_cloud():
-    pc_groups = _ALL_SIDECAR_FIELD_GROUPS[DataTypeEnum.point_cloud]
     metadata = [
         ("cloud.las", {"num_points": "1000", "bounds.minx": "0", "bounds.miny": "0"}),
     ]
-    df = build_sidecar_df(metadata, required_field_groups=pc_groups)
+    df = _build_single_type(metadata, PC_GROUPS, "point_cloud")
     _add_spatial_reference_column(df, "EPSG:2956")
 
     assert "fallback_srs" in df.columns
@@ -195,12 +209,11 @@ def test_add_spatial_reference_column_point_cloud():
 
 
 def test_add_file_srs_column_records_header_crs():
-    pc_groups = _ALL_SIDECAR_FIELD_GROUPS[DataTypeEnum.point_cloud]
     metadata = [
         ("with_crs.las", {"num_points": "1", "bounds.minx": "0", "spatialreference": "EPSG:32612"}),
         ("no_crs.las", {"num_points": "1", "bounds.minx": "0", "spatialreference": ""}),
     ]
-    df = build_sidecar_df(metadata, required_field_groups=pc_groups)
+    df = _build_single_type(metadata, PC_GROUPS, "point_cloud")
     _add_file_srs_column(df, metadata)
 
     assert "file_srs" in df.columns

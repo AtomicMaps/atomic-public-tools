@@ -28,7 +28,7 @@ from atomic_tools.commands.sidecar import (
     _format_replay_command,
     _run_interactive_wizard,
 )
-from atomic_tools.utils.utils import DataTypeEnum
+from atomic_tools.utils.utils import DataTypeEnum, DataTypeFilter
 from atomic_tools.validators.sidecar import lint_sidecar_file
 
 logger = logging.getLogger(__name__)
@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 def _validate(
     directory: str,
-    data_type: DataTypeEnum,
+    data_type: DataTypeEnum | None,
     client_sidecar: str | None,
     client_schema: str | None,
     full: bool = False,
@@ -51,7 +51,8 @@ def _validate(
         f"full={full} spatial_reference={spatial_reference!r} coco={coco!r}"
     )
 
-    df, _ = _build_sidecar(  # validate never persists, so the backend is unused
+    # validate never persists, so the backend is unused.
+    df, _, _detected = _build_sidecar(
         directory=directory,
         data_type=data_type,
         client_sidecar=client_sidecar,
@@ -93,11 +94,14 @@ def validate(
         ),
     ] = None,
     data_type: Annotated[
-        DataTypeEnum | None,
+        DataTypeFilter | None,
         typer.Option(
             "--datatype",
             "--data-type",
-            help="Data type of the input data (e.g. 'oriented_image', 'point_cloud').",
+            help=(
+                "Optional filter: restrict to this data type. By default every "
+                "file is auto-detected per file (recommended)."
+            ),
             case_sensitive=False,
         ),
     ] = None,
@@ -192,7 +196,14 @@ def validate(
     verbosity_choice = verbosity_state.choice
     verbosity_provided = verbosity_state.verbose or verbosity_state.silent
 
-    wizard_ran = directory is None or data_type is None
+    # --datatype is an optional filter; convert it to the full enum immediately.
+    data_type_enum: DataTypeEnum | None = (
+        DataTypeEnum(data_type.value) if data_type is not None else None
+    )
+
+    # The wizard now only runs when the directory is missing; --datatype being
+    # unset just means auto-detect, not "ask me".
+    wizard_ran = directory is None
     if wizard_ran:
         full_provided = (
             ctx.get_parameter_source("full") == click.core.ParameterSource.COMMANDLINE
@@ -205,7 +216,7 @@ def validate(
         # they're left at their defaults and ignored (hence save=False).
         result = _run_interactive_wizard(
             directory,
-            data_type,
+            data_type_enum,
             None,
             client_sidecar,
             client_schema,
@@ -222,7 +233,7 @@ def validate(
             save=False,
         )
         directory = result.directory
-        data_type = result.data_type
+        data_type_enum = result.data_type
         client_sidecar = result.client_sidecar
         client_schema = result.client_schema
         full = result.full
@@ -239,15 +250,14 @@ def validate(
 
     if not directory:
         raise typer.BadParameter("Directory is required.")
-    if data_type is None:
-        raise typer.BadParameter("Data type is required.")
+    # data_type is an optional filter now — None means auto-detect.
 
     if wizard_ran:
         _echo_replay_command(
             _format_replay_command(
                 ["validate"],
                 directory=directory,
-                data_type=data_type,
+                data_type=data_type_enum,
                 client_sidecar=client_sidecar,
                 client_schema=client_schema,
                 full=full,
@@ -261,7 +271,7 @@ def validate(
     try:
         report = _validate(
             directory=directory,
-            data_type=data_type,
+            data_type=data_type_enum,
             client_sidecar=client_sidecar,
             client_schema=client_schema,
             full=full,

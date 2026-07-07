@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+from atomic_tools import vendor_sync
 from atomic_tools.cli import app
 from atomic_tools.commands import update
 
@@ -18,6 +19,13 @@ class _Result:
 @pytest.fixture
 def fake_repo(tmp_path, monkeypatch):
     monkeypatch.setattr(update, "find_repo_root", lambda: tmp_path)
+    # Default: vendored refresh is unreachable (the client case) so it never
+    # touches disk or the network during these tests. Individual tests override.
+    monkeypatch.setattr(
+        update.vendor_sync,
+        "refresh",
+        lambda repo: vendor_sync.RefreshResult(available=False, changed={}),
+    )
     return tmp_path
 
 
@@ -116,6 +124,50 @@ def test_update_reports_missing_git(fake_repo, monkeypatch):
 
     assert result.exit_code == 1
     assert "PATH" in result.output
+
+
+def test_update_refresh_unreachable_still_succeeds(fake_repo, monkeypatch):
+    # The fake_repo fixture already stubs refresh() as unreachable; the update
+    # must complete successfully and mention the skip.
+    monkeypatch.setattr(
+        update.subprocess, "run", lambda cmd, cwd: _Result(0)
+    )
+
+    result = runner.invoke(app, ["update"])
+
+    assert result.exit_code == 0
+    assert "Skipping vendored refresh" in result.output
+
+
+def test_update_refresh_changed_prompts_commit(fake_repo, monkeypatch):
+    monkeypatch.setattr(update.subprocess, "run", lambda cmd, cwd: _Result(0))
+    monkeypatch.setattr(
+        update.vendor_sync,
+        "refresh",
+        lambda repo: vendor_sync.RefreshResult(
+            available=True, changed={"data_type_registry.py": True, "field_names.py": False}
+        ),
+    )
+
+    result = runner.invoke(app, ["update"])
+
+    assert result.exit_code == 0
+    assert "Refreshed vendored data-engineering files" in result.output
+    assert "data_type_registry.py" in result.output
+
+
+def test_update_refresh_error_never_aborts(fake_repo, monkeypatch):
+    monkeypatch.setattr(update.subprocess, "run", lambda cmd, cwd: _Result(0))
+
+    def boom(repo):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(update.vendor_sync, "refresh", boom)
+
+    result = runner.invoke(app, ["update"])
+
+    assert result.exit_code == 0
+    assert "Skipping vendored refresh" in result.output
 
 
 def test_update_listed_in_help():

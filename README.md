@@ -41,6 +41,13 @@ This switches your clone to `main`, pulls the latest code, and reinstalls it. Us
 development extras. The daily check can be disabled by setting
 `AM_TOOLS_NO_VERSION_CHECK=1`.
 
+`am-tools update` also refreshes the small set of files amtools vendors from the
+internal `data-engineering` repo (the data-type classifier and canonical field
+lists) — but **only on a machine that can reach that repo** (a `data-engineering`
+checkout sitting next to this one, or a GitHub token). Client machines can't
+reach it, so this step is silently skipped there; the vendored copies shipped in
+the release are used as-is.
+
 ## Authenticating with AWS
 
 When `--directory` (or `--client-sidecar`, `--client-schema`) is an `s3://` URI, `am-tools` uses your local AWS credentials via `boto3`. The recommended setup is AWS SSO through the AWS CLI:
@@ -68,8 +75,10 @@ The primary use of `am-tools sidecar generate` is to format a client-provided si
 
 - Directory
     - Where the files are that you want to build a sidecar for. This file can be local or on s3 or some other web object store. For S3, pass the whole s3 path. If the folder has subfolders, all files in the subfolders will also have the sidecar generated for them.
-- Data Type
-    - What type of data are you building a sidecar for? Different data types have different required columns and this handles that. Note: You can only generate a sidecar for one data type at at time. If you have multiple image types in the same folder (oriented images from a drone and spherical images in the same folder for example), the sidecar generation will fail.
+- Data Type *(optional filter — auto-detect by default)*
+    - **You no longer need to tell it the data type.** By default every file in the directory is classified individually (oriented image, spherical image, ortho image, point cloud, or video) using the exact same logic Atomic Flow uses, and the detected type is written into a `DataType` column in the sidecar. A **mixed** directory (drone images + point clouds + video in one folder) now works in a single run — each file gets its own type and its own required columns.
+    - Spherical vs oriented images are disambiguated from EXIF signals (GPano/`ProjectionType` tags, a ~2:1 equirectangular aspect ratio, or the e57 `UserComment` marker). A plain image with none of those signals is treated as oriented.
+    - You can still pass `--datatype <type>` (or pick a single type in the wizard) to **restrict** the scan to just that type. Files of other types are then skipped. An explicit `--datatype spherical_image` is taken at your word — those images are never reclassified to oriented. Valid filter values are `oriented_image`, `spherical_image`, `ortho_image`, `point_cloud`, and `full_motion_video`. Vector data is not supported for sidecar generation and is skipped (with a warning) in auto mode.
 - Output Filename
     - What would you like the sidecar to be named?
 - Client-Supplied Sidecar
@@ -94,30 +103,28 @@ You can use `sidecar generate` to reformat a sidecar you already have locally in
 **Reformat a local sidecar to the AM schema.** Provide a `--client-schema` to rename your columns into their canonical names (see *Sidecar Schemas* below):
 
 ```bash
+# Data type is auto-detected per file; add --datatype <type> only to restrict the scan.
 am-tools sidecar generate \
   --directory ./data \
-  --datatype oriented_image \
   --client-sidecar ./my_sidecar.csv \
   --client-schema ./schemas/my_schema.json
 ```
 
-**Reformat and reproject from an input EPSG.** If your sidecar coordinates are not already in `EPSG:4326` (WGS84), add `--spatial-reference`. For images/videos the lat/lon (and altitude) are treated as X/Y/Z in that CRS and reprojected to `EPSG:4326`; for point clouds the value is recorded in a `spatial_reference` column instead:
+**Reformat and reproject from an input EPSG.** If your sidecar coordinates are not already in `EPSG:4326` (WGS84), add `--spatial-reference`. For images/videos the lat/lon (and altitude) are treated as X/Y/Z in that CRS and reprojected to `EPSG:4326`; for point clouds the value is recorded in a `fallback_srs` column instead. In a mixed directory it does both:
 
 ```bash
 am-tools sidecar generate \
   --directory ./data \
-  --datatype oriented_image \
   --client-sidecar ./my_sidecar.csv \
   --spatial-reference EPSG:32612
 ```
 
-**Reformat and merge two local sidecars.** When `--client-sidecar` is a **directory** instead of a single file, every CSV in a subfolder *below* that directory is merged into one sidecar (the directory itself is not scanned, since that is where the generated sidecar gets written). Put each CSV in its own subfolder and point `--client-sidecar` at the parent — all of them must share the same column schema:
+**Reformat and merge two local sidecars.** When `--client-sidecar` is a **directory** instead of a single file, every CSV in a subfolder *below* that directory is merged into one sidecar (the directory itself is not scanned, since that is where the generated sidecar gets written). Put each CSV in its own subfolder and point `--client-sidecar` at the parent — all of them must share the same column schema (a client `DataType` column, if present, is dropped in favor of the detected type):
 
 ```bash
 # sidecars/flight-a/a.csv  and  sidecars/flight-b/b.csv  are merged
 am-tools sidecar generate \
   --directory ./data \
-  --datatype oriented_image \
   --client-sidecar ./sidecars
 ```
 
@@ -127,14 +134,12 @@ Sometimes you just want to know whether your data is clean without leaving a sid
 It shares all the same options and interactive wizard as `sidecar generate`, with the two save-related questions removed (it doesn't ask what to name the sidecar or whether to keep a local copy, because nothing is written). Like `generate`, it lints in "final" mode and prints the report; it exits non-zero if any errors are found.
 
 ```bash
-am-tools validate \
-  --directory ./data \
-  --datatype oriented_image
+# Auto-detects every file's type; no --datatype needed.
+am-tools validate --directory ./data
 
 # with a client sidecar, reprojection, and orientation ignored — same flags as generate
 am-tools validate \
   --directory ./data \
-  --datatype oriented_image \
   --client-sidecar ./my_sidecar.csv \
   --client-schema ./schemas/my_schema.json \
   --spatial-reference EPSG:32612 \
@@ -179,10 +184,12 @@ After running `am-tools lint schema`, if any errors are detected, it will tell y
 #### Linting a sidecar
 The command `am-tools lint sidecar` can lint both the client provided sidecar as well as the generated sidecar that `am-tools sidecar generate` builds. The first thing the linter wil ask you after a link to the sidecar is if the sidecar is generated or not. For linting a client provided sidecar, it will skip certain checks because it assumes that the files will have metadata that will be combined with the client sidecar.
 
-For linting the generated sidecar, it will ask for data type. This is used to make sure it has all of the required columns for that data type. There are some basic checks for required fields to make sure the values make sense. If any fields fail this test, the script will tell you possible fixes.
+For linting the generated sidecar, **each row's data type drives which columns are required**. A sidecar built by `am-tools sidecar generate` carries a `DataType` column, so the linter reads the type per row and applies that type's required/optional fields — a mixed sidecar is checked correctly (a missing point-cloud column only errors on point-cloud rows, and so on). If you lint an **older sidecar without a `DataType` column**, each row's type is inferred from its filename instead (an ambiguous image defaults to oriented). Rows whose type can't be determined are skipped for required-field checks. There are some basic checks for required fields to make sure the values make sense. If any fields fail this test, the script will tell you possible fixes.
+
+`--datatype <type>` is optional here too: it acts as a filter, restricting the required-field checks (and COCO impact) to rows of that type. It is no longer required with `--final`.
 
 ##### Orientation data for oriented images
-When the data type is `oriented_image` (either chosen in the wizard or passed with `--datatype oriented_image`), the wizard asks whether you want to ignore missing orientation data (`Pitch`/`Heading`/`Roll`). **By default — unless you explicitly opt to ignore it — missing orientation is treated as an error.** Choosing to ignore it (or passing `--ignore-missing-orientation`) downgrades it to a warning; the images still process and appear in Lens, just without orientation. The same option is available on `am-tools sidecar generate`, where it controls the automatic lint that runs on the generated sidecar. To skip the prompt non-interactively:
+For oriented-image rows the wizard asks whether you want to ignore missing orientation data (`Pitch`/`Heading`/`Roll`) — it offers this whenever oriented images could be present (auto-detect, or an explicit `--datatype oriented_image`). **By default — unless you explicitly opt to ignore it — missing orientation is treated as an error.** Choosing to ignore it (or passing `--ignore-missing-orientation`) downgrades it to a warning; the images still process and appear in Lens, just without orientation. The same option is available on `am-tools sidecar generate`, where it controls the automatic lint that runs on the generated sidecar. To skip the prompt non-interactively:
 
 ```
 am-tools lint sidecar my_sidecar.csv --final --datatype oriented_image --ignore-missing-orientation
@@ -233,11 +240,34 @@ src/atomic_tools/
 ├── commands/           # one module per subcommand group (lint, sidecar)
 ├── io/                 # storage backend abstraction (local + s3/gs/az)
 ├── utils/              # helpers: exiftool/pdal extractors, object-store I/O
+├── vendored/           # verbatim copies of data-engineering (do not hand-edit)
+├── vendor_sync.py      # discovers + regenerates the vendored files
 └── validators/         # schema/sidecar/value validators + lint reports
 schemas/                # example client schema JSONs
 example-fake-data/      # sample images + sidecars for trying the tool
 tests/                  # pytest suite
 ```
+
+### Contributor note: the vendored data-engineering files
+
+`src/atomic_tools/vendored/` holds byte-exact copies of the data-type classifier
+(`infer_data_type` + `DATA_TYPE_INFO`) and the canonical field-name lists from the
+internal `data-engineering` repo, so amtools classifies files with the exact same
+code as the backend. **Never edit these by hand** — `tests/test_vendored_drift.py`
+compares them (by AST) against the canonical source and fails on any drift.
+
+To re-vendor after the backend changes, run `am-tools update` on a machine that
+can reach `data-engineering`, then commit the refreshed files. `vendor_sync.py`
+finds the canonical source in this order:
+
+1. `AM_TOOLS_DATA_ENGINEERING_REPO` — path to a `data-engineering` checkout.
+2. A `data-engineering` checkout sitting **next to this repo's root** (its sibling).
+3. The GitHub contents API, using a token from `AM_TOOLS_DRIFT_TOKEN` or
+   `GITHUB_TOKEN` (the repo is private, so a token is required for this path).
+
+When none of these is reachable (the normal client case) the drift test **skips**
+with a warning rather than failing. The canonical branch is pinned in
+`vendor_sync.CANONICAL_REF`.
 
 ## In Depth Spec for Sidecars
 `am-tools sidecar generate` produces a sidecar that follows this spec automatically. The details below are mainly useful if you're hand-writing a client sidecar or debugging a generated one.
@@ -245,9 +275,10 @@ tests/                  # pytest suite
 ### Layout
 
 1. **The first column must be `Filename`.** Each row identifies the file it applies to by basename (e.g. `IMG_001.jpg`). If two files in the batch share a basename, use a path with enough parent directories to disambiguate (`subfolderA/IMG_001.jpg` vs `subfolderB/IMG_001.jpg`).
-2. **The first row after the header must be `DEFAULT`.** Values placed in this row apply to every file that doesn't have its own row or has an empty cell for that column. Resolution order, highest to lowest: value extracted from the file's own metadata → per-file row value → `DEFAULT` row value.
-3. **Column names are case-insensitive but otherwise exact.** Whitespace, punctuation, and spelling all matter (`GPS Latitude` is not `GPSLatitude`).
-4. **Cells may be left blank.** A blank cell means "fall back to the next source" per the resolution order above.
+2. **The second column is `DataType`.** A generated sidecar records each file's detected data type here (e.g. `oriented_image`, `point_cloud`, `full_motion_video`); it drives which columns are required per row. It is blank on the `DEFAULT` row (which stays type-agnostic and applies to every row). A hand-written client sidecar may omit this column — the linter then infers each row's type from its filename — and any `DataType` column in a client sidecar is dropped during generation in favor of the detected value.
+3. **The `DEFAULT` row applies to every file.** Values placed in this row apply to every file that doesn't have its own row or has an empty cell for that column. Resolution order, highest to lowest: value extracted from the file's own metadata → per-file row value → `DEFAULT` row value.
+4. **Column names are case-insensitive but otherwise exact.** Whitespace, punctuation, and spelling all matter (`GPS Latitude` is not `GPSLatitude`).
+5. **Cells may be left blank.** A blank cell means "fall back to the next source" per the resolution order above.
 
 ### Required columns by data type
 
@@ -290,4 +321,4 @@ If your CSV doesn't already match the spec, supply a schema JSON via `--client-s
 - Use `column_names` if your CSV has no header row.
 - Use `column_name_mapping` to rename columns into their canonical names.
 
-See the *Sidecar Schemas* section above for the schema format. Run `am-tools lint sidecar <your.csv> --schema <schema.json> --datatype <type>` to check it before generating.
+See the *Sidecar Schemas* section above for the schema format. Run `am-tools lint sidecar <your.csv> --schema <schema.json>` to check it before generating (add `--datatype <type>` only to restrict the checks to one type).

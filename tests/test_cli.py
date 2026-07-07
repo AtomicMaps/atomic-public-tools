@@ -44,6 +44,26 @@ def test_sidecar_generate_help_lists_options():
     assert "--bucket" not in result.stdout
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["sidecar", "generate", "--help"],
+        ["validate", "--help"],
+        ["lint", "sidecar", "--help"],
+    ],
+)
+def test_datatype_choices_exclude_non_scannable_types(argv):
+    """imagery / cad / vector must never appear as --datatype choices; the five
+    scannable filter types must."""
+    result = runner.invoke(app, argv, env={"COLUMNS": "300"})
+    assert result.exit_code == 0
+    out = result.stdout
+    for hidden in ("imagery", "cad", "vector"):
+        assert hidden not in out, f"{hidden!r} should not be a --datatype choice"
+    for shown in ("ortho_image", "oriented_image", "spherical_image", "point_cloud"):
+        assert shown in out
+
+
 def test_sidecar_generate_help_lists_spatial_reference():
     # Wide terminal so Rich doesn't truncate the long flag name.
     result = runner.invoke(app, ["sidecar", "generate", "--help"], env={"COLUMNS": "200"})

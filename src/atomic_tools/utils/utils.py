@@ -38,6 +38,11 @@ from atomic_tools.utils.object_store import (
     ObstoreBackend,
     store_for_bucket,
 )
+from atomic_tools.vendored.data_type_registry import (  # noqa: F401
+    DATA_TYPE_INFO,
+    DataTypeEnum,
+    infer_data_type,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,67 +50,22 @@ BYTES_TO_GB = 1e9
 CHUNK_SIZE = 100 * 1024 * 1024  # 100 MB
 MAX_RETRIES = 5
 
-DATA_TYPE_INFO: dict = {
-    "ortho_image": {
-        "include": [".tif", ".tiff"],
-        "exclude": ["_rgb.tif"],
-        "sidecars": [".ecw"],
-    },
-    "spherical_image": {
-        "include": [".jpg", ".jp2", "jpeg", ".png"],
-        "exclude": ["PreviewImage.jpg", "ThumbnailImage.jpg", "annotation.json"],
-        "sidecars": [],
-    },
-    "oriented_image": {
-        "include": [".jpg", ".jp2", "jpeg", ".png"],
-        "exclude": [
-            ".tif",
-            ".tiff",
-            "PreviewImage.jpg",
-            "ThumbnailImage.jpg",
-            "annotation.json",
-        ],
-        "sidecars": [],
-        "sub_types": ["rgb", "ir", "thermal"],
-    },
-    "point_cloud": {
-        "include": [".las", ".laz", "zlas", ".e57"],
-        "exclude": [".copc.las", ".copc.laz"],
-        "sidecars": [],
-    },
-    "full_motion_video": {
-        "include": [".mp4", ".mov", ".ts", ".avi", ".tts"],
-        "exclude": [],
-        "sidecars": [".gpx", ".kmz", ".srt"],
-    },
-    "vector": {
-        "include": [".gdb", ".gdb.zip", ".gpkg", ".geojson", ".shp"],
-        "exclude": [
-            ".shx",
-            ".dbf",
-            ".prj",
-            ".cpg",
-            ".sbn",
-            ".sbx",
-            ".shp.xml",
-            ".qpj",
-            ".pmtiles",
-            ".parquet",
-            "_thumbnail.jpg",
-        ],
-        "sidecars": [],
-        "sub_types": [],
-    },
-}
 
+class DataTypeFilter(str, Enum):
+    """``--datatype`` choices: the five types amtools can scan/lint.
 
-class DataTypeEnum(str, Enum):
+    The vendored :class:`DataTypeEnum` also contains ``imagery`` and ``cad``,
+    which :func:`infer_data_type` never returns and which must not appear in
+    ``--datatype`` help/choices; ``vector`` is excluded because generation is
+    unsupported and lint has no field groups for it. Commands convert a filter
+    to the full enum immediately: ``DataTypeEnum(filter_value.value)``.
+    """
+
     ortho_image = "ortho_image"
     oriented_image = "oriented_image"
     spherical_image = "spherical_image"
     point_cloud = "point_cloud"
     video = "full_motion_video"
-    vector = "vector"
 
 
 def normalize_object_store_path(path: str) -> str:

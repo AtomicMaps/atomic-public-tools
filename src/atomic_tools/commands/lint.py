@@ -15,12 +15,11 @@ import typer
 from atomic_tools.commands.sidecar import (
     _ask_client_schema,
     _ask_coco,
-    _ask_data_type,
     _ask_ignore_missing_orientation,
     _ask_verbosity,
     ask_schema_uri,
 )
-from atomic_tools.utils.utils import DataTypeEnum, uri_stem
+from atomic_tools.utils.utils import DataTypeEnum, DataTypeFilter, uri_stem
 from atomic_tools.validators.coco import IMAGE_DATA_TYPES
 from atomic_tools.validators.report import LintReport
 from atomic_tools.validators.schema import lint_schema_file
@@ -83,8 +82,9 @@ def _write_missing_data_report(report: LintReport, report_path: str) -> None:
     table = report.missing_data
     if table is None:
         click.secho(
-            "Cannot write a missing-data report without a datatype "
-            "(it determines which fields are required). Re-run with --datatype.",
+            "No missing-data report to write: the sidecar had no rows that could "
+            "be classified to a data type (no DataType column and no inferable "
+            "filenames), so no required fields apply.",
             fg="yellow",
             err=True,
         )
@@ -238,10 +238,14 @@ def lint_sidecar_cmd(
         ),
     ] = False,
     datatype: Annotated[
-        DataTypeEnum | None,
+        DataTypeFilter | None,
         typer.Option(
             "--datatype",
-            help="Data type of the input data (e.g. 'oriented_image', 'point_cloud').",
+            help=(
+                "Optional filter: restrict checks to this data type. By default "
+                "each row's type is read from the sidecar's DataType column (or "
+                "inferred from its filename)."
+            ),
             case_sensitive=False,
         ),
     ] = None,
@@ -321,19 +325,24 @@ def lint_sidecar_cmd(
     )
     coco_provided = ctx.get_parameter_source("coco") == click.core.ParameterSource.COMMANDLINE
 
-    # If the user didn't provide required info via arguments, ask interactively
-    wizard_ran = path is None or (datatype is None and not final_provided)
+    # --datatype is an optional filter; convert it to the full enum immediately.
+    datatype_enum: DataTypeEnum | None = (
+        DataTypeEnum(datatype.value) if datatype is not None else None
+    )
+
+    # The wizard now runs only when the sidecar path is missing; --datatype being
+    # unset just means "detect per row", not "ask me".
+    wizard_ran = path is None
     if wizard_ran:
         try:
             if path is None:
                 path = _ask_sidecar_path()
             if not final_provided:
                 final = _ask_final()
-            if final and datatype is None:
-                datatype = _ask_data_type()
+            # Show unless an explicit filter rules it out.
             if (
                 final
-                and datatype == DataTypeEnum.oriented_image
+                and datatype_enum in (None, DataTypeEnum.oriented_image)
                 and not ignore_orientation_provided
             ):
                 ignore_missing_orientation = _ask_ignore_missing_orientation()
@@ -341,8 +350,10 @@ def lint_sidecar_cmd(
                 schema = _ask_client_schema()
             if input_files is None and not input_files_provided:
                 input_files = _ask_input_files()
-            # COCO label impact only applies to imagery and needs a datatype.
-            if not coco_provided and datatype in IMAGE_DATA_TYPES:
+            # COCO label impact applies to imagery; offer it in auto mode too.
+            if not coco_provided and (
+                datatype_enum is None or datatype_enum in IMAGE_DATA_TYPES
+            ):
                 coco = _ask_coco()
             if not verbosity_provided:
                 verbosity_choice = _ask_verbosity()
@@ -357,15 +368,14 @@ def lint_sidecar_cmd(
 
     if not path:
         raise typer.BadParameter("Sidecar path is required.")
-    if final and datatype is None:
-        raise typer.BadParameter("--datatype is required when --final is set.")
+    # --datatype is optional now (auto per-row); --final no longer requires it.
 
     if wizard_ran:
         _echo_replay_command(
             _format_sidecar_replay_command(
                 path=path,
                 final=final,
-                datatype=datatype,
+                datatype=datatype_enum,
                 schema=schema,
                 input_files=input_files,
                 verbosity=verbosity_choice,
@@ -377,7 +387,7 @@ def lint_sidecar_cmd(
     report = lint_sidecar_file(
         path,
         final=final,
-        data_type=datatype,
+        data_type=datatype_enum,
         schema_path=schema,
         input_files_path=input_files,
         ignore_missing_orientation=ignore_missing_orientation,

@@ -15,7 +15,8 @@ import shutil
 import subprocess
 from typing import TYPE_CHECKING
 
-from atomic_tools.utils.utils import run_exiftool
+from atomic_tools.utils.utils import has_value, run_exiftool
+from atomic_tools.vendored import field_names
 
 if TYPE_CHECKING:
     from timezonefinder import TimezoneFinder
@@ -324,6 +325,79 @@ def extract_pdal_metadata(local_path: str, filename: str) -> dict:
     except Exception as exc:
         logger.warning(f"PDAL extraction failed for {filename}: {exc}")
         return {}
+
+
+_IMAGE_SIZE_COMBINED_RE = re.compile(r"\s*(\d+(?:\.\d+)?)\s*[xX×]\s*(\d+(?:\.\d+)?)")
+
+
+def _positive_float(value: object) -> float | None:
+    """Parse ``value`` as a float, returning it only when strictly positive."""
+    try:
+        num = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return num if num > 0 else None
+
+
+def _aspect_ratio_from_exif(meta: dict) -> float | None:
+    """Resolve an image aspect ratio (width/height) from flat exiftool tags.
+
+    Tries the ``IMAGE_SIZE_FIELDS`` (width_tag, height_tag) pairs in priority
+    order, then falls back to parsing the combined ``ImageSize`` ("WxH") field.
+    Returns None unless both dimensions parse as positive numbers.
+    """
+    for width_tag, height_tag in field_names.IMAGE_SIZE_FIELDS:
+        width = _positive_float(meta.get(width_tag))
+        height = _positive_float(meta.get(height_tag))
+        if width is not None and height is not None:
+            return width / height
+
+    combined = meta.get(field_names.IMAGE_SIZE_COMBINED_FIELD)
+    if combined:
+        match = _IMAGE_SIZE_COMBINED_RE.match(str(combined))
+        if match:
+            width = float(match.group(1))
+            height = float(match.group(2))
+            if width > 0 and height > 0:
+                return width / height
+    return None
+
+
+def spherical_signals_from_exif(meta: dict) -> dict:
+    """Map flat exiftool ``-j`` tags onto ``infer_data_type``'s keyword signals.
+
+    exiftool ``-j`` returns flat tags, not a raw XMP packet, so the ``xmp_packet``
+    is synthesized from tags that only exist in the GPano/XMP namespace. Parity
+    limitation vs the backend (which gets raw bytes): a GPano packet carrying
+    none of ProjectionType/UsePanoramaViewer/FullPano*Pixels would be missed —
+    acceptable; ProjectionType is mandatory per the GPano spec. We deliberately
+    do NOT run a second exiftool invocation to fetch the raw packet.
+
+    Returns a kwargs dict (subset of ``user_comment`` / ``aspect_ratio`` /
+    ``xmp_packet``) suitable for ``infer_data_type(filename, **signals)``.
+    """
+    signals: dict = {}
+
+    user_comment = meta.get("UserComment")
+    if user_comment is not None:
+        signals["user_comment"] = str(user_comment)
+
+    aspect_ratio = _aspect_ratio_from_exif(meta)
+    if aspect_ratio is not None:
+        signals["aspect_ratio"] = aspect_ratio
+
+    projection_type = meta.get("ProjectionType")
+    if projection_type and has_value(projection_type):
+        signals["xmp_packet"] = f'ProjectionType="{projection_type}"'.encode()
+    elif any(
+        tag in meta
+        for tag in ("UsePanoramaViewer", "FullPanoWidthPixels", "FullPanoHeightPixels")
+    ):
+        # A GPano-namespace tag is present but ProjectionType wasn't surfaced;
+        # signal spherical via a synthetic packet the XMP scanner recognises.
+        signals["xmp_packet"] = b"GPano:present"
+
+    return signals
 
 
 def extract_pdal_crs(meta: dict) -> str | None:

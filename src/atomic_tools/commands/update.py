@@ -20,6 +20,7 @@ from typing import Annotated
 import typer
 
 import atomic_tools
+from atomic_tools import vendor_sync
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,50 @@ def _run(cmd: list[str], cwd: Path) -> None:
             err=True,
         )
         raise typer.Exit(result.returncode)
+
+
+def _refresh_vendored(repo: Path) -> None:
+    """Best-effort refresh of the vendored data-engineering files.
+
+    On a machine that can reach the canonical source (sibling checkout or a
+    GitHub token) this regenerates the vendored files to the latest canonical
+    version. It is purely advisory: any failure or unreachable source is
+    reported in a single line and never aborts the update (clients have no
+    access to the private repo).
+    """
+    try:
+        result = vendor_sync.refresh(repo)
+    except Exception as exc:  # noqa: BLE001 — never fail the update over this
+        logger.debug("Vendored refresh errored: %s", exc)
+        typer.secho(
+            "Skipping vendored refresh — regeneration failed (harmless).",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+        return
+
+    if not result.available:
+        typer.secho(
+            "Skipping vendored refresh — data-engineering source not reachable.",
+            fg=typer.colors.BLUE,
+            err=True,
+        )
+        return
+
+    if result.any_changed:
+        changed = ", ".join(name for name, did in result.changed.items() if did)
+        typer.secho(
+            f"Refreshed vendored data-engineering files ({changed}); "
+            "review and commit the change.",
+            fg=typer.colors.GREEN,
+            err=True,
+        )
+    else:
+        typer.secho(
+            "Vendored data-engineering files already up to date.",
+            fg=typer.colors.BLUE,
+            err=True,
+        )
 
 
 _DEFAULT_BRANCH = "main"
@@ -108,6 +153,8 @@ def update_command(
     # branch has no upstream, and keeps every client on the same branch.
     _run(["git", "checkout", branch], cwd=repo)
     _run(["git", "pull", "origin", branch], cwd=repo)
+
+    _refresh_vendored(repo)
 
     target = ".[dev]" if dev else "."
     _run([sys.executable, "-m", "pip", "install", "-e", target], cwd=repo)
