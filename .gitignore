@@ -222,4 +222,3 @@ sidecar_csv_path
 Example-fake-data/Pictures/sidecar.csv
 .claude/settings.local.json
 sidecar.csv
-HANDOFF_auto_detect_data_type.md
