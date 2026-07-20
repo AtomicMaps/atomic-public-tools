@@ -27,6 +27,20 @@ pip install -e ".[dev]"
 ```
 This will install both `am-tools` as well as all requirements for `am-tools`.
 
+### Staying up to date
+
+The first time `am-tools` runs each day it checks the repo and prints a one-line
+notice if a newer version is available. To update, run:
+
+```bash
+am-tools update
+```
+
+This switches your clone to `main`, pulls the latest code, and reinstalls it. Use
+`--branch <name>` to update to a different branch, or `--no-dev` to skip the
+development extras. The daily check can be disabled by setting
+`AM_TOOLS_NO_VERSION_CHECK=1`.
+
 ## Authenticating with AWS
 
 When `--directory` (or `--client-sidecar`, `--client-schema`) is an `s3://` URI, `am-tools` uses your local AWS credentials via `boto3`. The recommended setup is AWS SSO through the AWS CLI:
