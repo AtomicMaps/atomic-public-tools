@@ -305,9 +305,14 @@ def refresh(repo_root: Path) -> RefreshResult:
     ``RefreshResult(available=False, ...)`` without touching disk. Otherwise
     renders and writes both vendored files, reporting which changed.
     """
+    # Short-circuit: if the first fetch can't reach the source, neither can the
+    # second. Worth skipping — a client with an unrelated GITHUB_TOKEN set does
+    # reach the network here, and this halves the 404 round-trip they wait on.
     utils_source = fetch_canonical_source(UTILS_PATH)
+    if utils_source is None:
+        return RefreshResult(available=False, changed={})
     field_registry_source = fetch_canonical_source(FIELD_REGISTRY_PATH)
-    if utils_source is None or field_registry_source is None:
+    if field_registry_source is None:
         return RefreshResult(available=False, changed={})
 
     vendored = _vendored_dir(repo_root)

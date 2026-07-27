@@ -69,26 +69,28 @@ def _refresh_vendored(repo: Path) -> None:
 
     On a machine that can reach the canonical source (sibling checkout or a
     GitHub token) this regenerates the vendored files to the latest canonical
-    version. It is purely advisory: any failure or unreachable source is
-    reported in a single line and never aborts the update (clients have no
-    access to the private repo).
+    version. It never aborts the update.
+
+    Every outcome except "files actually changed" is logged at INFO, i.e. shown
+    only under ``--verbose``. A client has no access to the private repo, so
+    "not reachable" is the *expected* result there, not a problem worth putting
+    in front of them — the vendored copies shipped in the release are correct
+    and are used as-is. Regeneration failures are quiet for the same reason: a
+    client can't act on one either, and on a dev machine stale vendored files
+    are caught by ``tests/test_vendored_drift.py``, which is the real guard.
+    Only a successful rewrite stays visible, because it leaves the dev's working
+    tree dirty and needs committing.
     """
     try:
         result = vendor_sync.refresh(repo)
     except Exception as exc:  # noqa: BLE001 — never fail the update over this
-        logger.debug("Vendored refresh errored: %s", exc)
-        typer.secho(
-            "Skipping vendored refresh — regeneration failed (harmless).",
-            fg=typer.colors.YELLOW,
-            err=True,
-        )
+        logger.info("Skipping vendored refresh — regeneration failed: %s", exc)
         return
 
     if not result.available:
-        typer.secho(
-            "Skipping vendored refresh — data-engineering source not reachable.",
-            fg=typer.colors.BLUE,
-            err=True,
+        logger.info(
+            "Skipping vendored refresh — data-engineering source not reachable "
+            "(expected without access to the private repo)."
         )
         return
 
@@ -101,11 +103,7 @@ def _refresh_vendored(repo: Path) -> None:
             err=True,
         )
     else:
-        typer.secho(
-            "Vendored data-engineering files already up to date.",
-            fg=typer.colors.BLUE,
-            err=True,
-        )
+        logger.info("Vendored data-engineering files already up to date.")
 
 
 _DEFAULT_BRANCH = "main"

@@ -45,8 +45,9 @@ development extras. The daily check can be disabled by setting
 internal `data-engineering` repo (the data-type classifier and canonical field
 lists) — but **only on a machine that can reach that repo** (a `data-engineering`
 checkout sitting next to this one, or a GitHub token). Client machines can't
-reach it, so this step is silently skipped there; the vendored copies shipped in
-the release are used as-is.
+reach it, so this step is silently skipped there — no warning, no non-zero exit;
+the vendored copies shipped in the release are used as-is. Run
+`am-tools -v update` to see whether the refresh ran and why it was skipped.
 
 ## Authenticating with AWS
 
