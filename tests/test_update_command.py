@@ -145,7 +145,7 @@ def test_update_refresh_changed_prompts_commit(fake_repo, monkeypatch):
         update.vendor_sync,
         "refresh",
         lambda repo: vendor_sync.RefreshResult(
-            available=True, changed={"data_type_registry.py": True, "field_names.py": False}
+            available=True, changed={"data_type_registry.py": True, "field_registry.json": False}
         ),
     )
 

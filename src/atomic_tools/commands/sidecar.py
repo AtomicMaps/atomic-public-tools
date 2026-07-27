@@ -32,7 +32,11 @@ from atomic_tools.client_sidecar import (
     load_and_clean_client_sidecar,
     merge_client_metadata,
 )
-from atomic_tools.io.storage import StorageBackend, from_directory
+from atomic_tools.io.storage import (
+    StorageBackend,
+    from_directory,
+    normalize_directory,
+)
 from atomic_tools.utils.aws_errors import find_auth_error, print_help_block
 from atomic_tools.utils.coordinates import (
     WEB_MERCATOR_EPSG,
@@ -103,7 +107,7 @@ def _list_local_schemas() -> list[Path]:
 
 
 def _ask_directory() -> str:
-    return (
+    answer = (
         questionary.text(
             "Directory to scan:",
             instruction="(Local folder or object-store URI like s3://bucket/prefix)",
@@ -112,6 +116,9 @@ def _ask_directory() -> str:
         .unsafe_ask()
         .strip()
     )
+    # Translate a pasted AWS console/HTTPS URL to its s3:// URI (with a warning)
+    # here so the replay command echoed after the wizard shows the s3 link.
+    return normalize_directory(answer)
 
 
 def _ask_data_type() -> DataTypeEnum:
@@ -150,7 +157,7 @@ def _ask_ignore_missing_orientation() -> bool:
         instruction=(
             "(No — the default — treats a missing orientation field as an error; "
             "Yes downgrades it to a warning so the images still process, "
-            "appearing in Lens without orientation)"
+            "appearing in Lens without orientation) [y/N]"
         ),
         default=False,
     ).unsafe_ask()

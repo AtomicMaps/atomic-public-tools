@@ -1,9 +1,10 @@
 """Discovery, regeneration, and refresh of the vendored data-engineering files.
 
 amtools carries verbatim copies of a handful of definitions from the private
-``data-engineering`` repo (the data-type registry + classifier and the canonical
-field-name lists) under :mod:`atomic_tools.vendored`. This module is the single
-code path that:
+``data-engineering`` repo (the data-type registry + classifier as
+``data_type_registry.py``, and the canonical source-field registry as
+``field_registry.json``) under :mod:`atomic_tools.vendored`. This module is the
+single code path that:
 
 * **discovers** the canonical source (env override → sibling checkout → GitHub
   API), returning ``None`` when it is unreachable — the normal case on a client
@@ -35,11 +36,9 @@ logger = logging.getLogger(__name__)
 # --- Canonical source coordinates -------------------------------------------
 
 CANONICAL_REPO_SLUG = "AtomicMaps/data-engineering"
-# TODO: flip to "main" once the unified_date_fields branch merges, or the drift
-# check compares the vendored files against a stale branch.
-CANONICAL_REF = "unified_date_fields"
+CANONICAL_REF = "main"
 UTILS_PATH = "atomicmapspy/atomicmapspy/utils/utils.py"
-FIELD_NAMES_PATH = "atomicmapspy/atomicmapspy/utils/field_names.py"
+FIELD_REGISTRY_PATH = "atomicmapspy/atomicmapspy/schemas/field_registry.json"
 
 # Top-level definitions vendored verbatim from the canonical utils.py, in the
 # order they should appear in the generated data_type_registry.py.
@@ -168,7 +167,9 @@ def _fetch_from_github(path: str) -> str | None:
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_SECONDS) as resp:  # noqa: S310
+        with urllib.request.urlopen(
+            req, timeout=_HTTP_TIMEOUT_SECONDS
+        ) as resp:  # noqa: S310
             return resp.read().decode("utf-8", errors="replace")
     except Exception as exc:  # noqa: BLE001 — best-effort, never raise
         logger.debug("GitHub fetch of %s failed: %s", path, exc)
@@ -241,16 +242,23 @@ def render_data_type_registry(upstream_utils_source: str) -> str:
         raise ValueError(
             f"Canonical utils.py is missing vendored definitions: {missing}"
         )
-    segments = [ast.get_source_segment(upstream_utils_source, nodes[n]) for n in VENDORED_NAMES]
+    segments = [
+        ast.get_source_segment(upstream_utils_source, nodes[n]) for n in VENDORED_NAMES
+    ]
     body = "\n\n\n".join(seg for seg in segments if seg)
     banner = _banner(UTILS_PATH, selected=True)
     return f"{banner}\n{_REGISTRY_IMPORTS}\n\n{body}\n"
 
 
-def render_field_names(upstream_source: str) -> str:
-    """Render the vendored ``field_names.py``: banner + upstream source verbatim."""
-    text = upstream_source if upstream_source.endswith("\n") else upstream_source + "\n"
-    return f"{_banner(FIELD_NAMES_PATH, selected=False)}\n{text}"
+def render_field_registry(upstream_source: str) -> str:
+    """Return the vendored ``field_registry.json`` content: the upstream JSON verbatim.
+
+    JSON can't carry a ``#`` banner, so unlike the Python copies there is no
+    header to prepend — the file is copied byte-for-byte (its own ``$comment``
+    already says "External repos: copy this file verbatim"). Drift is caught by
+    a structural (parsed-JSON) comparison in ``test_vendored_drift.py``.
+    """
+    return upstream_source
 
 
 # --- Refresh (used by ``am-tools update``) ----------------------------------
@@ -298,8 +306,8 @@ def refresh(repo_root: Path) -> RefreshResult:
     renders and writes both vendored files, reporting which changed.
     """
     utils_source = fetch_canonical_source(UTILS_PATH)
-    field_names_source = fetch_canonical_source(FIELD_NAMES_PATH)
-    if utils_source is None or field_names_source is None:
+    field_registry_source = fetch_canonical_source(FIELD_REGISTRY_PATH)
+    if utils_source is None or field_registry_source is None:
         return RefreshResult(available=False, changed={})
 
     vendored = _vendored_dir(repo_root)
@@ -308,9 +316,9 @@ def refresh(repo_root: Path) -> RefreshResult:
             vendored / "data_type_registry.py",
             render_data_type_registry(utils_source),
         ),
-        "field_names.py": _write_if_changed(
-            vendored / "field_names.py",
-            render_field_names(field_names_source),
+        "field_registry.json": _write_if_changed(
+            vendored / "field_registry.json",
+            render_field_registry(field_registry_source),
         ),
     }
     return RefreshResult(available=True, changed=changed)

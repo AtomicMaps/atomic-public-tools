@@ -5,14 +5,16 @@ canonical source is unreachable (no sibling checkout, no env override, no token)
 this test emits a warning and *skips* — it must never fail for that reason. Only
 genuine content drift between the vendored copy and the canonical source fails.
 
-Comparison is AST-based (``ast.dump``), so it is insensitive to whitespace and
-line numbers but sensitive to docstrings and actual code — exactly the drift we
-care about.
+Comparison is structural — AST-based (``ast.dump``) for the Python copy and
+parsed-JSON equality for the registry — so it is insensitive to whitespace and
+line numbers but sensitive to docstrings, code, and data values: exactly the
+drift we care about.
 """
 
 from __future__ import annotations
 
 import ast
+import json
 import warnings
 from pathlib import Path
 
@@ -62,12 +64,12 @@ def test_data_type_registry_matches_canonical():
         )
 
 
-def test_field_names_matches_canonical():
-    upstream = _require_source(vendor_sync.FIELD_NAMES_PATH)
-    vendored_source = (_VENDORED_DIR / "field_names.py").read_text(encoding="utf-8")
+def test_field_registry_matches_canonical():
+    upstream = _require_source(vendor_sync.FIELD_REGISTRY_PATH)
+    vendored_source = (_VENDORED_DIR / "field_registry.json").read_text(encoding="utf-8")
 
-    assert ast.dump(ast.parse(vendored_source)) == ast.dump(ast.parse(upstream)), (
-        f"vendored field_names.py has drifted from the canonical source; {_FIX_HINT}"
+    assert json.loads(vendored_source) == json.loads(upstream), (
+        f"vendored field_registry.json has drifted from the canonical source; {_FIX_HINT}"
     )
 
 

@@ -1,0 +1,790 @@
+{
+  "$comment": "Vendorizable registry of every metadata source field the data-engineering pipeline checks, per data type. Chains are ordered fallback lists (first present wins); tuple entries are tried as a unit. 'stac_properties' names the STAC item properties a chain feeds; whether those are required is derived from the STAC schemas mirrored in 'stac_properties_by_data_type' (kept in lockstep by tests/atomicmapspy/test_field_registry.py). External repos: copy this file verbatim.",
+  "registry_version": 1,
+  "chains": {
+    "DATETIME_FIELDS": {
+      "namespace": "image_exif",
+      "applies_to": ["oriented_image", "spherical_image", "ortho_image"],
+      "kind": "list",
+      "stac_properties": ["datetime"],
+      "description": "Acquisition timestamp; ordered fallback of exiftool date tags.",
+      "fields": [
+        "DateTimeOriginal",
+        "CreateDate",
+        "ModifyDate",
+        "FirstPhotoDate",
+        "LastPhotoDate"
+      ]
+    },
+    "GPS_DATETIME_FIELDS": {
+      "namespace": "image_exif",
+      "applies_to": ["oriented_image", "spherical_image", "ortho_image"],
+      "kind": "list",
+      "stac_properties": ["datetime"],
+      "description": "GPS-derived datetime fallback; BOTH tags must be present and are combined into one timestamp.",
+      "fields": ["GPSDateStamp", "GPSTimeStamp"]
+    },
+    "FILE_MODIFY_DATETIME_FIELD": {
+      "namespace": "image_exif",
+      "applies_to": ["oriented_image", "spherical_image", "ortho_image"],
+      "kind": "scalar",
+      "stac_properties": ["datetime"],
+      "description": "Last-resort datetime fallback before filename inference.",
+      "field": "FileModifyDate"
+    },
+    "IMAGE_SIZE_FIELDS": {
+      "namespace": "image_exif",
+      "applies_to": ["oriented_image", "spherical_image"],
+      "kind": "tuple_list",
+      "columns": ["width", "height"],
+      "stac_properties": ["image_shape"],
+      "description": "Image dimensions; each (width_tag, height_tag) pair tried as a unit. Assembled into image_shape [height, width].",
+      "fields": [
+        ["ImageWidth", "ImageHeight"],
+        ["ExifImageWidth", "ExifImageHeight"],
+        ["FullPanoWidthPixels", "FullPanoHeightPixels"],
+        ["CroppedAreaImageWidthPixels", "CroppedAreaImageHeightPixels"]
+      ]
+    },
+    "IMAGE_SIZE_COMBINED_FIELD": {
+      "namespace": "image_exif",
+      "applies_to": ["oriented_image", "spherical_image"],
+      "kind": "scalar",
+      "combined_fallback_for": "IMAGE_SIZE_FIELDS",
+      "stac_properties": ["image_shape"],
+      "description": "Combined 'WxH' string fallback for IMAGE_SIZE_FIELDS.",
+      "field": "ImageSize"
+    },
+    "FOCAL_LENGTH_FIELD": {
+      "namespace": "image_exif",
+      "applies_to": ["oriented_image", "spherical_image"],
+      "kind": "scalar",
+      "stac_properties": ["focal_length"],
+      "description": "Focal length (mm).",
+      "field": "FocalLength"
+    },
+    "FOCAL_LENGTH_35MM_FIELD": {
+      "namespace": "image_exif",
+      "applies_to": ["oriented_image", "spherical_image"],
+      "kind": "scalar",
+      "stac_properties": ["focal_length_35mm"],
+      "description": "35mm-equivalent focal length (mm).",
+      "field": "FocalLengthIn35mmFormat"
+    },
+    "FOCAL_LENGTH_COMBINED_FIELD": {
+      "namespace": "image_exif",
+      "applies_to": ["oriented_image", "spherical_image"],
+      "kind": "scalar",
+      "combined_fallback_for": "FOCAL_LENGTH_FIELD",
+      "stac_properties": ["focal_length", "focal_length_35mm"],
+      "description": "Combined focal-length string parsed for both values when the dedicated tags are missing.",
+      "field": "FocalLength35efl"
+    },
+    "SCALE_FACTOR_35EFL_FIELD": {
+      "namespace": "image_exif",
+      "applies_to": ["oriented_image", "spherical_image"],
+      "kind": "scalar",
+      "stac_properties": ["hfov", "vfov"],
+      "description": "EXIF crop factor; FOV-derivation fallback when focal_length_35mm is missing.",
+      "field": "ScaleFactor35efl"
+    },
+    "GPS_LATITUDE_FIELD": {
+      "namespace": "image_exif",
+      "applies_to": ["oriented_image", "spherical_image"],
+      "kind": "scalar",
+      "stac_properties": ["lat", "exposure_point"],
+      "description": "Camera latitude (deg).",
+      "field": "GPSLatitude"
+    },
+    "GPS_LONGITUDE_FIELD": {
+      "namespace": "image_exif",
+      "applies_to": ["oriented_image", "spherical_image"],
+      "kind": "scalar",
+      "stac_properties": ["lon", "exposure_point"],
+      "description": "Camera longitude (deg).",
+      "field": "GPSLongitude"
+    },
+    "GPS_POSITION_COMBINED_FIELD": {
+      "namespace": "image_exif",
+      "applies_to": ["oriented_image", "spherical_image"],
+      "kind": "scalar",
+      "combined_fallback_for": "GPS_LATITUDE_FIELD",
+      "stac_properties": ["lat", "lon", "exposure_point"],
+      "description": "Combined '<lat>, <lon>' fallback for the dedicated GPS tags.",
+      "field": "GPSPosition"
+    },
+    "GPS_ALTITUDE_FIELD": {
+      "namespace": "image_exif",
+      "applies_to": ["oriented_image", "spherical_image"],
+      "kind": "scalar",
+      "stac_properties": ["elev_ellipsoid", "elev_msl"],
+      "description": "GPS altitude (WGS84 ellipsoidal, m); converted to orthometric elev_msl via geoid.",
+      "field": "GPSAltitude"
+    },
+    "GPS_XY_ACCURACY_FIELD": {
+      "namespace": "image_exif",
+      "applies_to": ["oriented_image", "spherical_image"],
+      "kind": "scalar",
+      "stac_properties": ["gps_xy_accuracy"],
+      "description": "Horizontal GPS accuracy (m).",
+      "field": "GPSXYAccuracy"
+    },
+    "GPS_Z_ACCURACY_FIELD": {
+      "namespace": "image_exif",
+      "applies_to": ["oriented_image"],
+      "kind": "scalar",
+      "stac_properties": ["gps_z_accuracy"],
+      "description": "Vertical GPS accuracy (m).",
+      "field": "GPSZAccuracy"
+    },
+    "CAM_ORIENTATION_PYR_FIELDS": {
+      "namespace": "image_exif",
+      "applies_to": ["oriented_image"],
+      "kind": "tuple_list",
+      "columns": ["pitch", "yaw", "roll"],
+      "stac_properties": ["cam_pitch", "cam_heading", "cam_roll"],
+      "description": "Camera orientation; each (pitch, yaw, roll) triple tried as a unit, in priority order. On-camera EXIF triples (e.g. CameraPitch/CameraYaw/CameraRoll) are listed first and therefore win over sidecar-supplied triples (Pitch/Heading/Roll): the on-camera IMU orientation is treated as authoritative, and camera-specific corrections (e.g. the DJI +90 pitch offset) only apply to a matched EXIF triple, never to sidecar values (see OrientedImage.get_orientation).",
+      "fields": [
+        ["CameraPitch", "CameraYaw", "CameraRoll"],
+        ["Pitch", "Yaw", "Roll"],
+        ["Pitch", "Heading", "Roll"],
+        ["CameraPitchDegree", "CameraYawDegree", "CameraRollDegree"],
+        ["GimbalPitchDegree", "GimbalYawDegree", "GimbalRollDegree"],
+        ["PosePitchDegrees", "PoseHeadingDegrees", "PoseRollDegrees"],
+        ["CameraOrientationNEDPitch", "CameraOrientationNEDYaw", "CameraOrientationNEDRoll"],
+        ["GPSIMUPitch", "GPSIMUYaw", "GPSIMURoll"],
+        ["PitchAngle", "YawAngle", "RollAngle"]
+      ]
+    },
+    "CAM_HEADING_ONLY_FIELDS": {
+      "namespace": "image_exif",
+      "applies_to": ["oriented_image"],
+      "kind": "list",
+      "stac_properties": ["cam_heading"],
+      "description": "Heading-only fallback when no full pitch/yaw/roll triple is available.",
+      "fields": ["GPSImgDirection", "imgDirection"]
+    },
+    "VENDOR_DETECTION_FIELDS": {
+      "namespace": "image_exif",
+      "applies_to": ["oriented_image"],
+      "kind": "list",
+      "stac_properties": [],
+      "description": "Vendor identification tags consulted for orientation-convention quirks (DJI, Nikon).",
+      "fields": ["Make", "Model", "About"]
+    },
+    "CAM_INTRINSICS_FIELDS": {
+      "namespace": "image_exif",
+      "applies_to": ["oriented_image"],
+      "kind": "list",
+      "stac_properties": ["hfov", "vfov"],
+      "description": "Calibrated camera intrinsics used to derive field of view.",
+      "fields": [
+        "CalibratedFocalLength",
+        "CalibratedFocalLengthX",
+        "CalibratedFocalLengthY",
+        "XResolution",
+        "YResolution",
+        "CalibratedOpticalCenterX",
+        "CalibratedOpticalCenterY"
+      ]
+    },
+    "EXIF_ORIENTATION_FIELD": {
+      "namespace": "image_exif",
+      "applies_to": ["oriented_image", "ortho_image"],
+      "kind": "scalar",
+      "stac_properties": ["exif_orientation"],
+      "description": "EXIF pixel-rotation hint (rotation is baked into derivatives during processing).",
+      "field": "Orientation"
+    },
+    "MIMETYPE_FIELD": {
+      "namespace": "image_exif",
+      "applies_to": ["oriented_image", "ortho_image"],
+      "kind": "scalar",
+      "stac_properties": [],
+      "description": "MIME type of the source file.",
+      "field": "MIMEType"
+    },
+    "SPHERICAL_QUATERNION_FIELDS": {
+      "namespace": "image_exif",
+      "applies_to": ["spherical_image"],
+      "kind": "list",
+      "stac_properties": ["orientation"],
+      "description": "Pose quaternion sources; values are space-separated 'w x y z'.",
+      "fields": ["CameraOrientation", "UserComment"]
+    },
+    "SPHERICAL_EULER_FIELDS": {
+      "namespace": "image_exif",
+      "applies_to": ["spherical_image"],
+      "kind": "tuple_list",
+      "columns": ["pitch", "yaw", "roll"],
+      "stac_properties": ["cam_pitch", "cam_heading", "cam_roll"],
+      "description": "Euler-angle fallback when no quaternion is present; each triple tried as a unit.",
+      "fields": [
+        ["PosePitchDegrees", "PoseHeadingDegrees", "PoseRollDegrees"],
+        ["Pitch", "Heading", "Roll"]
+      ]
+    },
+    "SPHERICAL_PROJECTION_FIELD": {
+      "namespace": "image_exif",
+      "applies_to": ["spherical_image"],
+      "kind": "scalar",
+      "stac_properties": ["hfov", "vfov"],
+      "description": "Panorama projection type; 'equirectangular' selects the pano-size FOV derivation.",
+      "field": "ProjectionType"
+    },
+    "SPHERICAL_PANO_SIZE_FIELDS": {
+      "namespace": "image_exif",
+      "applies_to": ["spherical_image"],
+      "kind": "tuple_list",
+      "columns": ["full_width", "full_height", "cropped_width", "cropped_height"],
+      "stac_properties": ["hfov", "vfov"],
+      "description": "Full vs cropped panorama dimensions used to derive FOV for partial panoramas.",
+      "fields": [
+        [
+          "FullPanoWidthPixels",
+          "FullPanoHeightPixels",
+          "CroppedAreaImageWidthPixels",
+          "CroppedAreaImageHeightPixels"
+        ]
+      ]
+    },
+    "SPHERICAL_INITIAL_VIEW_FIELDS": {
+      "namespace": "image_exif",
+      "applies_to": ["spherical_image"],
+      "kind": "tuple_list",
+      "columns": ["heading", "pitch", "roll"],
+      "stac_properties": ["initial_view_heading", "initial_view_pitch", "initial_view_roll"],
+      "description": "Recommended viewer start orientation; heading falls back to GPSImgDirection (see SPHERICAL_INITIAL_VIEW_HEADING_FALLBACK_FIELD).",
+      "fields": [
+        ["InitialViewHeadingDegrees", "InitialViewPitchDegrees", "InitialViewRollDegrees"]
+      ]
+    },
+    "SPHERICAL_INITIAL_VIEW_HEADING_FALLBACK_FIELD": {
+      "namespace": "image_exif",
+      "applies_to": ["spherical_image"],
+      "kind": "scalar",
+      "combined_fallback_for": "SPHERICAL_INITIAL_VIEW_FIELDS",
+      "stac_properties": ["initial_view_heading"],
+      "description": "Heading fallback when InitialViewHeadingDegrees is absent.",
+      "field": "GPSImgDirection"
+    },
+    "CAPTURE_SOFTWARE_FIELD": {
+      "namespace": "image_exif",
+      "applies_to": ["spherical_image"],
+      "kind": "scalar",
+      "stac_properties": ["capture_software"],
+      "description": "Capture software name.",
+      "field": "CaptureSoftware"
+    },
+    "VIDEO_DATETIME_FIELDS": {
+      "namespace": "video",
+      "applies_to": ["full_motion_video"],
+      "kind": "list",
+      "stac_properties": ["datetime", "start_datetime", "end_datetime"],
+      "description": "Per-frame timestamp columns; first/last frame give the video start/end.",
+      "fields": ["precision_time_stamp", "gpsdatetime"]
+    },
+    "VIDEO_CAMERA_LOCATION_FIELDS": {
+      "namespace": "video",
+      "applies_to": ["full_motion_video"],
+      "kind": "tuple_list",
+      "columns": ["lat", "lon"],
+      "stac_properties": [],
+      "description": "Camera location columns for per-frame OpenSearch docs; each (lat, lon) pair tried as a unit.",
+      "fields": [
+        ["gpslatitude", "gpslongitude"],
+        ["sensor_latitude", "sensor_longitude"]
+      ]
+    },
+    "VIDEO_FRAME_CENTER_LOCATION_FIELDS": {
+      "namespace": "video",
+      "applies_to": ["full_motion_video"],
+      "kind": "tuple_list",
+      "columns": ["lat", "lon"],
+      "stac_properties": [],
+      "description": "Frame-center location columns for per-frame OpenSearch docs.",
+      "fields": [["frame_center_latitude", "frame_center_longitude"]]
+    },
+    "VIDEO_FRAME_CENTER_ELEVATION_FIELDS": {
+      "namespace": "video",
+      "applies_to": ["full_motion_video"],
+      "kind": "list",
+      "stac_properties": [],
+      "description": "Frame-center elevation columns for per-frame OpenSearch docs.",
+      "fields": ["frame_center_elevation", "frame_center_height_above_ellipsoid"]
+    },
+    "VIDEO_CAMERA_ELEVATION_FIELDS": {
+      "namespace": "video",
+      "applies_to": ["full_motion_video"],
+      "kind": "annotated_list",
+      "columns": ["field", "datum"],
+      "datum_values": ["ellipsoidal", "orthometric"],
+      "stac_properties": [],
+      "description": "Camera elevation columns with vertical datum; ellipsoidal values need geoid conversion.",
+      "fields": [
+        { "field": "gpsaltitude", "datum": "ellipsoidal" },
+        { "field": "sensor_true_altitude", "datum": "orthometric" },
+        { "field": "sensor_ellipsoid_height", "datum": "ellipsoidal" }
+      ]
+    },
+    "VIDEO_HEIGHT_ABOVE_GROUND_FIELD": {
+      "namespace": "video",
+      "applies_to": ["full_motion_video"],
+      "kind": "scalar",
+      "stac_properties": [],
+      "description": "Height-above-ground column for per-frame OpenSearch docs.",
+      "field": "relaltitude"
+    },
+    "VIDEO_ORIENTATION_PYR_FIELDS": {
+      "namespace": "video",
+      "applies_to": ["full_motion_video"],
+      "kind": "tuple_list",
+      "columns": ["pitch", "yaw", "roll"],
+      "stac_properties": [],
+      "description": "Platform orientation columns for per-frame OpenSearch docs; each triple tried as a unit.",
+      "fields": [
+        ["platform_pitch_angle", "platform_heading_angle", "platform_roll_angle"],
+        ["platform_pitch_angle_full", "platform_heading_angle", "platform_roll_angle_full"],
+        ["pitch", "yaw", "roll"]
+      ]
+    },
+    "VIDEO_FOV_FIELDS": {
+      "namespace": "video",
+      "applies_to": ["full_motion_video"],
+      "kind": "tuple_list",
+      "columns": ["hfov", "vfov"],
+      "stac_properties": [],
+      "description": "Sensor field-of-view columns for per-frame OpenSearch docs.",
+      "fields": [
+        ["sensor_horizontal_field_of_view", "sensor_vertical_field_of_view"]
+      ]
+    },
+    "PC_FILTERS_INFO_STAGE": {
+      "namespace": "point_cloud_pdal",
+      "applies_to": ["point_cloud"],
+      "kind": "scalar",
+      "stac_properties": [],
+      "description": "PDAL stage name whose metadata dict carries num_points/dimensions/bbox/srs.",
+      "field": "filters.info"
+    },
+    "PC_HEXBIN_STAGE": {
+      "namespace": "point_cloud_pdal",
+      "applies_to": ["point_cloud"],
+      "kind": "scalar",
+      "stac_properties": [],
+      "description": "PDAL stage name whose metadata dict carries the boundary polygon.",
+      "field": "filters.hexbin"
+    },
+    "PC_E57_READER": {
+      "namespace": "point_cloud_pdal",
+      "applies_to": ["point_cloud"],
+      "kind": "scalar",
+      "stac_properties": [],
+      "description": "PDAL reader stage name for E57 files.",
+      "field": "readers.e57"
+    },
+    "PC_NUM_POINTS_KEY": {
+      "namespace": "point_cloud_pdal",
+      "applies_to": ["point_cloud"],
+      "kind": "scalar",
+      "stac_properties": ["pc:count"],
+      "description": "Point count key on the filters.info stage dict.",
+      "field": "num_points"
+    },
+    "PC_DIMENSIONS_KEY": {
+      "namespace": "point_cloud_pdal",
+      "applies_to": ["point_cloud"],
+      "kind": "scalar",
+      "stac_properties": ["pc:schemas"],
+      "description": "Per-dimension schema key on the filters.info stage dict.",
+      "field": "dimensions"
+    },
+    "PC_BBOX_KEY": {
+      "namespace": "point_cloud_pdal",
+      "applies_to": ["point_cloud"],
+      "kind": "scalar",
+      "stac_properties": [],
+      "description": "Bounding-box key on the filters.info stage dict; feeds the item-level bbox/geometry, not properties.",
+      "field": "bbox"
+    },
+    "PC_HEXBIN_BOUNDARY_KEY": {
+      "namespace": "point_cloud_pdal",
+      "applies_to": ["point_cloud"],
+      "kind": "scalar",
+      "stac_properties": [],
+      "description": "Boundary polygon key on the filters.hexbin stage dict; feeds item geometry and density derivation.",
+      "field": "boundary"
+    },
+    "PC_CAPTURE_DATE_LAS_FIELDS": {
+      "namespace": "point_cloud_pdal",
+      "applies_to": ["point_cloud"],
+      "kind": "tuple",
+      "columns": ["year", "day_of_year"],
+      "stac_properties": ["datetime"],
+      "description": "LAS/LAZ capture date as (creation year, day-of-year) on the reader metadata.",
+      "fields": ["creation_year", "creation_doy"]
+    },
+    "PC_E57_DATA3D_KEY": {
+      "namespace": "point_cloud_e57",
+      "applies_to": ["point_cloud"],
+      "kind": "scalar",
+      "stac_properties": ["datetime"],
+      "description": "E57 node containing per-scan metadata.",
+      "field": "data3D"
+    },
+    "PC_E57_ROOT_DATETIME_FIELD": {
+      "namespace": "point_cloud_e57",
+      "applies_to": ["point_cloud"],
+      "kind": "scalar",
+      "stac_properties": ["datetime"],
+      "description": "File-level E57 creation timestamp (GPS epoch, 1980-01-06).",
+      "field": "creationDateTime"
+    },
+    "PC_E57_SCAN_DATETIME_FIELDS": {
+      "namespace": "point_cloud_e57",
+      "applies_to": ["point_cloud"],
+      "kind": "list",
+      "stac_properties": ["datetime"],
+      "description": "Per-scan E57 capture-date fields under data3D[i], most specific first.",
+      "fields": ["acquisitionStart", "acquisitionEnd"]
+    },
+    "PC_E57_DATETIME_VALUE_KEY": {
+      "namespace": "point_cloud_e57",
+      "applies_to": ["point_cloud"],
+      "kind": "scalar",
+      "stac_properties": ["datetime"],
+      "description": "Sub-node carrying the numeric GPS-epoch seconds on each E57 datetime field.",
+      "field": "dateTimeValue"
+    },
+    "PC_SRS_CANDIDATES": {
+      "namespace": "point_cloud_pdal",
+      "applies_to": ["point_cloud"],
+      "kind": "srs_candidate_list",
+      "stac_properties": ["proj:code"],
+      "description": "Ordered SRS candidates; from_reader selects the reader metadata dict (true) or filters.info (false), key_path is walked into nested sub-dicts. First non-empty string wins.",
+      "fields": [
+        { "label": "filters.comp_spatialreference", "from_reader": false, "key_path": ["comp_spatialreference"] },
+        { "label": "filters.srs.compoundwkt", "from_reader": false, "key_path": ["srs", "compoundwkt"] },
+        { "label": "filters.spatialreference", "from_reader": false, "key_path": ["spatialreference"] },
+        { "label": "reader.srs.compoundwkt", "from_reader": true, "key_path": ["srs", "compoundwkt"] },
+        { "label": "reader.spatialreference", "from_reader": true, "key_path": ["spatialreference"] },
+        { "label": "reader.comp_spatialreference", "from_reader": true, "key_path": ["comp_spatialreference"] },
+        { "label": "reader.srs.proj4", "from_reader": true, "key_path": ["srs", "proj4"] }
+      ]
+    },
+    "PC_SRS_HORIZONTAL_UNIT_PATH": {
+      "namespace": "point_cloud_pdal",
+      "applies_to": ["point_cloud"],
+      "kind": "key_path",
+      "stac_properties": [],
+      "description": "Nested key path for the horizontal linear unit; checked on reader then filters metadata.",
+      "fields": ["srs", "units", "horizontal"]
+    },
+    "VECTOR_DATETIME_FIELD": {
+      "namespace": "vector",
+      "applies_to": ["vector"],
+      "kind": "scalar",
+      "stac_properties": ["datetime"],
+      "description": "Canonical vector attribute column for feature timestamps.",
+      "field": "capture_time"
+    }
+  },
+  "stac_properties_by_data_type":   {
+    "$comment": "Deliberate mirror of the STAC data-model schemas (schemas/stac/item.json#/$defs/atomic_common + extensions/*.json). 'required'/'optional' must match the schemas exactly; 'unsourced' lists schema properties intentionally NOT fed by any chain above (system fields, user input, or non-exif/PDAL derivations). test_field_registry.py fails on any drift.",
+    "oriented_image": {
+      "required": [
+        "_program",
+        "_project",
+        "_staging",
+        "_task_id",
+        "auth:schemes",
+        "bucket",
+        "cam_heading",
+        "cam_pitch",
+        "cam_roll",
+        "data_type",
+        "datetime",
+        "elev_msl",
+        "exposure_point",
+        "hfov",
+        "key",
+        "lat",
+        "lon",
+        "sub_type",
+        "vfov"
+      ],
+      "optional": [
+        "_site_asset",
+        "created",
+        "elev_ag",
+        "elev_ellipsoid",
+        "exif_orientation",
+        "focal_length",
+        "focal_length_35mm",
+        "gps_xy_accuracy",
+        "gps_z_accuracy",
+        "image_shape",
+        "name",
+        "title",
+        "updated"
+      ],
+      "unsourced": [
+        "_program",
+        "_project",
+        "_site_asset",
+        "_staging",
+        "_task_id",
+        "auth:schemes",
+        "bucket",
+        "created",
+        "data_type",
+        "elev_ag",
+        "key",
+        "name",
+        "sub_type",
+        "title",
+        "updated"
+      ]
+    },
+    "spherical_image": {
+      "required": [
+        "_program",
+        "_project",
+        "_staging",
+        "_task_id",
+        "auth:schemes",
+        "cam_heading",
+        "cam_pitch",
+        "cam_roll",
+        "data_type",
+        "datetime",
+        "elev_msl",
+        "exposure_point",
+        "lat",
+        "lon",
+        "sub_type"
+      ],
+      "optional": [
+        "bucket",
+        "capture_software",
+        "created",
+        "elev_ag",
+        "elev_ellipsoid",
+        "focal_length",
+        "focal_length_35mm",
+        "gps_xy_accuracy",
+        "hfov",
+        "image_shape",
+        "initial_view_heading",
+        "initial_view_pitch",
+        "initial_view_roll",
+        "key",
+        "name",
+        "orientation",
+        "title",
+        "updated",
+        "vfov"
+      ],
+      "unsourced": [
+        "_program",
+        "_project",
+        "_staging",
+        "_task_id",
+        "auth:schemes",
+        "bucket",
+        "created",
+        "data_type",
+        "elev_ag",
+        "key",
+        "name",
+        "sub_type",
+        "title",
+        "updated"
+      ]
+    },
+    "ortho_image": {
+      "required": [
+        "_program",
+        "_project",
+        "_staging",
+        "_task_id",
+        "auth:schemes",
+        "bounds",
+        "bucket",
+        "crs",
+        "data_type",
+        "datetime",
+        "image_shape",
+        "key",
+        "sub_type"
+      ],
+      "optional": [
+        "_site_asset",
+        "asset_types",
+        "created",
+        "exif_orientation",
+        "exposure_point",
+        "name",
+        "title",
+        "updated"
+      ],
+      "unsourced": [
+        "_program",
+        "_project",
+        "_site_asset",
+        "_staging",
+        "_task_id",
+        "asset_types",
+        "auth:schemes",
+        "bounds",
+        "bucket",
+        "created",
+        "crs",
+        "data_type",
+        "exposure_point",
+        "image_shape",
+        "key",
+        "name",
+        "sub_type",
+        "title",
+        "updated"
+      ]
+    },
+    "point_cloud": {
+      "required": [
+        "_program",
+        "_project",
+        "_staging",
+        "_task_id",
+        "auth:schemes",
+        "avg_pt_spacing",
+        "data_type",
+        "datetime",
+        "pc:count",
+        "pc:density",
+        "pc:encoding",
+        "sub_type"
+      ],
+      "optional": [
+        "asset_types",
+        "created",
+        "exposure_point",
+        "name",
+        "pc:schemas",
+        "pc:statistics",
+        "pc:type",
+        "proj:code",
+        "title",
+        "updated"
+      ],
+      "unsourced": [
+        "_program",
+        "_project",
+        "_staging",
+        "_task_id",
+        "asset_types",
+        "auth:schemes",
+        "avg_pt_spacing",
+        "created",
+        "data_type",
+        "exposure_point",
+        "name",
+        "pc:density",
+        "pc:encoding",
+        "pc:statistics",
+        "pc:type",
+        "sub_type",
+        "title",
+        "updated"
+      ]
+    },
+    "vector": {
+      "required": [
+        "_program",
+        "_project",
+        "_staging",
+        "_task_id",
+        "auth:schemes",
+        "bbox",
+        "data_type",
+        "dataset_name",
+        "datetime",
+        "geometry_types",
+        "layers",
+        "table:columns",
+        "table:primary_geometry",
+        "table:row_count"
+      ],
+      "optional": [
+        "created",
+        "exposure_point",
+        "name",
+        "sub_type",
+        "title",
+        "updated"
+      ],
+      "unsourced": [
+        "_program",
+        "_project",
+        "_staging",
+        "_task_id",
+        "auth:schemes",
+        "bbox",
+        "created",
+        "data_type",
+        "dataset_name",
+        "exposure_point",
+        "geometry_types",
+        "layers",
+        "name",
+        "sub_type",
+        "table:columns",
+        "table:primary_geometry",
+        "table:row_count",
+        "title",
+        "updated"
+      ]
+    },
+    "full_motion_video": {
+      "required": [
+        "_program",
+        "_project",
+        "_staging",
+        "_task_id",
+        "auth:schemes",
+        "data_type",
+        "datetime",
+        "end_datetime",
+        "frame_count",
+        "frame_rate",
+        "start_datetime",
+        "sub_type",
+        "video_duration"
+      ],
+      "optional": [
+        "created",
+        "exposure_point",
+        "name",
+        "title",
+        "updated"
+      ],
+      "unsourced": [
+        "_program",
+        "_project",
+        "_staging",
+        "_task_id",
+        "auth:schemes",
+        "created",
+        "data_type",
+        "exposure_point",
+        "frame_count",
+        "frame_rate",
+        "name",
+        "sub_type",
+        "title",
+        "updated",
+        "video_duration"
+      ]
+    }
+  }
+}

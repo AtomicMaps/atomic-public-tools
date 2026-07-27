@@ -17,8 +17,8 @@ import subprocess
 import tempfile
 from typing import TYPE_CHECKING
 
+from atomic_tools.schemas import field_registry
 from atomic_tools.utils.utils import has_value, run_exiftool
-from atomic_tools.vendored import field_names
 
 if TYPE_CHECKING:
     from timezonefinder import TimezoneFinder
@@ -532,13 +532,13 @@ def _aspect_ratio_from_exif(meta: dict) -> float | None:
     order, then falls back to parsing the combined ``ImageSize`` ("WxH") field.
     Returns None unless both dimensions parse as positive numbers.
     """
-    for width_tag, height_tag in field_names.IMAGE_SIZE_FIELDS:
+    for width_tag, height_tag in field_registry.IMAGE_SIZE_FIELDS:
         width = _positive_float(meta.get(width_tag))
         height = _positive_float(meta.get(height_tag))
         if width is not None and height is not None:
             return width / height
 
-    combined = meta.get(field_names.IMAGE_SIZE_COMBINED_FIELD)
+    combined = meta.get(field_registry.IMAGE_SIZE_COMBINED_FIELD)
     if combined:
         match = _IMAGE_SIZE_COMBINED_RE.match(str(combined))
         if match:
