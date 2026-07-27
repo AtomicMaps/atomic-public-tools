@@ -21,10 +21,12 @@ from atomic_tools.utils.utils import (
     DataTypeEnum,
     _is_path_tail_suffix,
     _split_path_components,
+    drop_preview_tifs,
     has_value,
     infer_data_type,
     load_sidecar_df,
 )
+from atomic_tools.validators.coco import IMAGE_DATA_TYPES
 from atomic_tools.validators.constants import DEFAULT_ROW_NAME, MAX_LISTED_FILES
 from atomic_tools.validators.geography import analyze_spatial_distribution
 from atomic_tools.validators.report import MISSING_MARKER, LintReport, MissingDataReport
@@ -128,6 +130,20 @@ def lint_sidecar_file(
         rule_types.append(data_type)
     rules_by_type = _rules_by_type(rule_types, ignore_missing_orientation)
 
+    if final and not rule_types:
+        # Nothing to check against: with no rule type there are no required
+        # fields and no file inventory, so every check below would no-op and the
+        # sidecar would be reported as passing without having been validated.
+        report.add_error(
+            "No sidecar row could be classified to a data type, so no "
+            "required-field checks ran.",
+            fix_hint=(
+                "Add a 'DataType' column with one of "
+                f"{[t.value for t in DataTypeEnum]}, use filenames the scanner "
+                "recognizes, or pass --datatype <type> to state it explicitly."
+            ),
+        )
+
     # default_satisfied is keyed by (type_value, canonical).
     default_satisfied: dict[tuple[str, str], bool] = {}
     if final:
@@ -186,7 +202,20 @@ def lint_sidecar_file(
             not_on_disk_is_error=coco_not_on_disk_is_error,
         )
 
-    analyze_spatial_distribution(df, report)
+    # An explicit --datatype restricts every other check to the matching rows, so
+    # it must restrict the spatial checks too — otherwise filtered-out point
+    # clouds still raise blocking CRS errors for rows the user excluded. Without
+    # a filter, pass the whole frame: unclassifiable rows still get their
+    # coordinates outlier-checked.
+    analyze_spatial_distribution(
+        df,
+        report,
+        only_indices=(
+            {idx for idx, t in row_types.items() if t is not None}
+            if data_type is not None
+            else None
+        ),
+    )
 
     if not report.findings:
         mode = "final" if final else "client"
@@ -608,6 +637,12 @@ def _check_file_inventory(
     try:
         backend = from_directory(input_files_path)
         keys = backend.list_keys(include=include, exclude=exclude)
+        if data_type_filter is None:
+            # Mirror generation's auto-detect listing, which drops preview .tif
+            # files (see utils.drop_preview_tifs). Without this the linter flags
+            # every preview tif as an input file with no sidecar row — on a
+            # sidecar the generator just produced correctly.
+            keys, _ = drop_preview_tifs(keys)
     except S3AuthError as e:
         report.add_error(
             f"Could not enumerate input files at {input_files_path}: {e}",
@@ -628,20 +663,33 @@ def _check_file_inventory(
         )
         return
 
-    # Classify each listed key to a type; in auto mode drop keys whose type isn't
-    # among the detected row types (or is unclassifiable).
-    detected_values = {t.value for t in detected_types}
-    key_type: dict[str, DataTypeEnum] = {}
+    # Classify each listed key to the type(s) it could be; in auto mode drop keys
+    # that can't be any of the detected row types (or are unclassifiable).
+    #
+    # A key maps to *candidate* types, not one: filename-only inference cannot
+    # tell oriented from spherical images (it always answers oriented_image), so
+    # a .jpg in a spherical_image batch would otherwise be discarded and the whole
+    # inventory check would silently no-op. Any image key is therefore a candidate
+    # for every image type the sidecar detected.
+    image_types = [t for t in detected_types if t in IMAGE_DATA_TYPES]
+    key_types: dict[str, list[DataTypeEnum]] = {}
     kept_keys: list[str] = []
     for key in keys:
         if data_type_filter is not None:
-            key_type[key] = data_type_filter
+            key_types[key] = [data_type_filter]
             kept_keys.append(key)
             continue
         inferred = infer_data_type(key)
-        if inferred is None or inferred not in detected_values:
+        if inferred is None:
             continue
-        key_type[key] = DataTypeEnum(inferred)
+        inferred_type = DataTypeEnum(inferred)
+        if inferred_type in detected_types:
+            candidates = [inferred_type]
+        elif inferred_type in IMAGE_DATA_TYPES and image_types:
+            candidates = image_types
+        else:
+            continue
+        key_types[key] = candidates
         kept_keys.append(key)
     keys = kept_keys
     if not keys:
@@ -715,8 +763,14 @@ def _check_file_inventory(
                 default_satisfied.get((detected.value, canonical), False)
                 for canonical in canonicals
             )
-        covered = [k for k in missing if covered_by_type.get(key_type[k].value, False)]
-        uncovered = [k for k in missing if not covered_by_type.get(key_type[k].value, False)]
+        # A key with several candidate types (an image that could be oriented or
+        # spherical) counts as covered only if DEFAULT covers every one of them.
+        is_covered = {
+            key: all(covered_by_type.get(t.value, False) for t in key_types[key])
+            for key in missing
+        }
+        covered = [k for k in missing if is_covered[k]]
+        uncovered = [k for k in missing if not is_covered[k]]
 
         if uncovered:
             report.add_error(

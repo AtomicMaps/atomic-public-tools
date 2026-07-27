@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from collections import defaultdict
 from collections.abc import Sequence
 from enum import Enum
 from fnmatch import fnmatch as _fnmatch  # noqa: F401  # kept for parity / future use
@@ -49,6 +50,14 @@ logger = logging.getLogger(__name__)
 BYTES_TO_GB = 1e9
 CHUNK_SIZE = 100 * 1024 * 1024  # 100 MB
 MAX_RETRIES = 5
+
+
+_TIFF_SUFFIXES = {".tif", ".tiff"}
+# Only a same-stem *photo* marks a .tif as that photo's rasterized preview. Any
+# other same-stem neighbour is a legitimate companion: an ortho ``site.tif``
+# routinely ships beside a ``site.geojson`` footprint, or a ``site.las`` from the
+# same photogrammetry run.
+_PREVIEW_TIF_COMPANION_SUFFIXES = {".jpg", ".jpeg", ".jp2", ".png"}
 
 
 class DataTypeFilter(str, Enum):
@@ -405,7 +414,9 @@ def get_keys_and_metadata(store: ObstoreBackend, prefix: str) -> dict:
     ) as e:
         raise RuntimeError(f"Failed to list keys with prefix {prefix}: {e}") from e
     except Exception as e:
-        raise RuntimeError(f"Unexpected error during listing keys with prefix {prefix}: {e}") from e
+        raise RuntimeError(
+            f"Unexpected error during listing keys with prefix {prefix}: {e}"
+        ) from e
 
 
 def _is_preview_image(key: str) -> bool:
@@ -417,6 +428,38 @@ def _is_preview_image(key: str) -> bool:
     """
     stem = key.rsplit("/", 1)[-1].rsplit(".", 1)[0]
     return stem.lower().endswith("_previewimage")
+
+
+def drop_preview_tifs(keys: list[str]) -> tuple[list[str], list[str]]:
+    """Split ``keys`` into ``(kept, dropped)``, dropping preview ``.tif`` files.
+
+    Some capture pipelines emit a ``.tif`` preview alongside the real asset —
+    e.g. ``R0010013.tif`` next to ``R0010013.JPG``. These are not unknown
+    filetypes, just rasterized previews, and must not become sidecar rows. A
+    ``.tif`` is treated as a preview when a photo in the *same folder* shares its
+    basename stem. Standalone ortho ``.tif`` files are kept.
+
+    Shared by generation and lint so the two agree on which files are expected to
+    have a sidecar row.
+    """
+    by_stem: dict[tuple[str, str], list[str]] = defaultdict(list)
+    for key in keys:
+        p = Path(key)
+        by_stem[(str(p.parent), p.stem.lower())].append(key)
+
+    kept: list[str] = []
+    dropped: list[str] = []
+    for key in keys:
+        p = Path(key)
+        if p.suffix.lower() in _TIFF_SUFFIXES and any(
+            other != key
+            and Path(other).suffix.lower() in _PREVIEW_TIF_COMPANION_SUFFIXES
+            for other in by_stem[(str(p.parent), p.stem.lower())]
+        ):
+            dropped.append(key)
+        else:
+            kept.append(key)
+    return kept, dropped
 
 
 def filter_keys(
@@ -495,7 +538,9 @@ def get_object_keys(
     return filter_keys(key_sizes, include, exclude)
 
 
-def download(store: ObstoreBackend, key: str, destination_dir: str, buffer_size: int = 5) -> str:
+def download(
+    store: ObstoreBackend, key: str, destination_dir: str, buffer_size: int = 5
+) -> str:
     """Download an object from the store to `destination_dir` in chunks.
 
     Performs a free-space precheck (file_size + buffer_size GB) and a chunked,
@@ -526,7 +571,9 @@ def download(store: ObstoreBackend, key: str, destination_dir: str, buffer_size:
             )
 
         destination_path = storage_path / Path(key).name
-        logger.debug(f"Downloading {key} ({file_size / BYTES_TO_GB:.2f} GB) to {destination_path}")
+        logger.debug(
+            f"Downloading {key} ({file_size / BYTES_TO_GB:.2f} GB) to {destination_path}"
+        )
 
         current_gb = 0
         with open(destination_path, "wb") as local_file:
@@ -534,7 +581,9 @@ def download(store: ObstoreBackend, key: str, destination_dir: str, buffer_size:
                 end = min(start + CHUNK_SIZE, file_size)
 
                 if start >= end:
-                    logger.error(f"Invalid byte range detected: start={start}, end={end} for {key}")
+                    logger.error(
+                        f"Invalid byte range detected: start={start}, end={end} for {key}"
+                    )
                     raise ValueError(f"Invalid byte range: start={start}, end={end}")
 
                 for attempt in range(MAX_RETRIES):
@@ -621,4 +670,6 @@ def upload(
     ) as e:
         raise RuntimeError(f"Failed to upload {source} to {key}: {e}") from e
     except Exception as e:
-        raise RuntimeError(f"Unexpected error during upload {source} to {key}: {e}") from e
+        raise RuntimeError(
+            f"Unexpected error during upload {source} to {key}: {e}"
+        ) from e

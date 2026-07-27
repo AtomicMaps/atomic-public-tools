@@ -38,6 +38,7 @@ from atomic_tools.utils.coordinates import (
     transform_coordinates,
     vertical_meters_per_unit,
 )
+from atomic_tools.utils.utils import infer_data_type
 from atomic_tools.validators.constants import DEFAULT_ROW_NAME, MAX_LISTED_FILES
 from atomic_tools.validators.values import parse_elevation, to_decimal_degree
 
@@ -259,15 +260,24 @@ def _check_point_cloud_crs(
 
     In a mixed sidecar the ``file_srs`` column exists for every row, but only
     point-cloud rows require a CRS — image/video rows legitimately have none. So
-    when a ``DataType`` column is present, restrict the check to point-cloud rows;
-    older sidecars with no ``DataType`` column fall back to checking every row.
+    when a ``DataType`` column is present, restrict the check to point-cloud rows.
+
+    A row's type resolves the same way the linter's ``_row_types`` resolves it:
+    the ``DataType`` cell when non-empty, else filename inference. A blank cell
+    must not skip the row — hand-edited and client-authored sidecars routinely
+    leave the column empty, and skipping would let a CRS-less point cloud pass.
+    When neither source answers (and for older sidecars with no ``DataType``
+    column at all) the row is treated as a point cloud: these rows only reach
+    here because the sidecar is point-cloud-shaped, and erring toward the check
+    is the safe direction.
     """
     if not _is_point_cloud_sidecar(rows):
         return
-    if _DATA_TYPE_COL in rows.columns:
-        types = rows[_DATA_TYPE_COL].astype(str).str.strip().tolist()
-    else:
-        types = [_POINT_CLOUD_TYPE] * len(rows)
+    has_type_col = _DATA_TYPE_COL in rows.columns
+    types: list[str] = []
+    for (_, row), name in zip(rows.iterrows(), filenames, strict=True):
+        raw = str(row[_DATA_TYPE_COL]).strip() if has_type_col else ""
+        types.append(raw or infer_data_type(name) or _POINT_CLOUD_TYPE)
 
     missing: list[str] = []
     untransformable: list[str] = []
@@ -320,10 +330,23 @@ def _row_crs_reaches_web_mercator(row: pd.Series, crs: str) -> bool:
     return can_transform_to_web_mercator(crs)
 
 
-def analyze_spatial_distribution(df: pd.DataFrame, report: LintReport) -> None:
-    """Add batch-level spatial outlier findings to ``report`` (no-op if no coords)."""
+def analyze_spatial_distribution(
+    df: pd.DataFrame,
+    report: LintReport,
+    *,
+    only_indices: set[int] | None = None,
+) -> None:
+    """Add batch-level spatial outlier findings to ``report`` (no-op if no coords).
+
+    ``only_indices`` restricts the analysis to those row indices — used when the
+    caller applied a ``--datatype`` filter, so rows the user excluded don't raise
+    findings. The DEFAULT row is always excluded from the analysis but is still
+    read for the batch ``fallback_srs``.
+    """
     fallback = _fallback_crs(df)
     rows = _non_default_rows(df)
+    if only_indices is not None:
+        rows = rows.loc[[idx for idx in rows.index if int(idx) in only_indices]]
     if rows.empty:
         return
 

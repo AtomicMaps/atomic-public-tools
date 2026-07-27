@@ -371,3 +371,46 @@ def test_point_cloud_untransformable_crs_is_flagged(tmp_path):
         "cannot be transformed" in f.message and "a.las" in f.message
         for f in report.errors()
     ), _messages(report)
+
+
+def test_point_cloud_crs_checked_when_datatype_cell_is_blank(tmp_path):
+    """A present-but-blank DataType cell (hand-edited sidecars) must fall back to
+    filename inference, not skip the point cloud's CRS check."""
+    header = ["Filename", "DataType", "file_srs", "bounds.minx", "bounds.maxx",
+              "bounds.miny", "bounds.maxy"]
+    rows = [
+        ["DEFAULT", "", "", "", "", "", ""],
+        ["a.las", "", "", "100", "200", "100", "200"],
+    ]
+    p = _write_csv(tmp_path, "s.csv", header, rows)
+    report = lint_sidecar_file(
+        str(p), final=True, data_type=None, schema_path=None, input_files_path=None
+    )
+    assert any("no CRS" in e.message for e in report.errors())
+
+
+def test_datatype_filter_excludes_other_types_from_crs_check(tmp_path):
+    """--datatype restricts every other check to matching rows; the point-cloud
+    CRS check must not error on rows the user filtered out."""
+    header = ["Filename", "DataType", "CreateDate", "GPSLatitude", "GPSLongitude",
+              "GPSAltitude", "Pitch", "Heading", "Roll", "file_srs",
+              "bounds.minx", "bounds.maxx", "bounds.miny", "bounds.maxy"]
+    rows = [
+        ["DEFAULT"] + [""] * 13,
+        ["a.jpg", "oriented_image", "2024:06:15 10:30:00", "51", "-114", "1000",
+         "0", "0", "0", "", "", "", "", ""],
+        ["b.las", "point_cloud", "", "", "", "", "", "", "", "", "100", "200",
+         "100", "200"],
+    ]
+    p = _write_csv(tmp_path, "mixed.csv", header, rows)
+
+    filtered = lint_sidecar_file(
+        str(p), final=True, data_type=DataTypeEnum.oriented_image,
+        schema_path=None, input_files_path=None,
+    )
+    assert "b.las" not in filtered.render()
+
+    unfiltered = lint_sidecar_file(
+        str(p), final=True, data_type=None, schema_path=None, input_files_path=None
+    )
+    assert "b.las" in unfiltered.render()

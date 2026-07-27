@@ -330,9 +330,12 @@ def lint_sidecar_cmd(
         DataTypeEnum(datatype.value) if datatype is not None else None
     )
 
-    # The wizard now runs only when the sidecar path is missing; --datatype being
-    # unset just means "detect per row", not "ask me".
-    wizard_ran = path is None
+    # The wizard runs when we still need an answer the flags didn't give us: the
+    # sidecar path, or which mode to lint in. --datatype being unset is no longer
+    # a reason to ask (it just means "detect per row"), but --final still is —
+    # without it we would silently lint a generated sidecar in permissive client
+    # mode, skipping every required-column and required-value check.
+    wizard_ran = path is None or not final_provided
     if wizard_ran:
         try:
             if path is None:

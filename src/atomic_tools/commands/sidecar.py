@@ -58,6 +58,7 @@ from atomic_tools.utils.utils import (
     DataTypeEnum,
     DataTypeFilter,
     _split_path_components,
+    drop_preview_tifs,
     has_value,
     infer_data_type,
     is_remote_uri,
@@ -65,6 +66,9 @@ from atomic_tools.utils.utils import (
 from atomic_tools.validators.coco import IMAGE_DATA_TYPES
 from atomic_tools.validators.required_fields import (
     ALL_SIDECAR_FIELD_GROUPS as _ALL_SIDECAR_FIELD_GROUPS,
+)
+from atomic_tools.validators.required_fields import (
+    OPTIONAL_SIDECAR_FIELD_GROUPS as _OPTIONAL_SIDECAR_FIELD_GROUPS,
 )
 from atomic_tools.validators.required_fields import (
     REQUIRED_SIDECAR_FIELD_GROUPS as _REQUIRED_SIDECAR_FIELD_GROUPS,
@@ -599,7 +603,13 @@ def _reproject_dataframe(df, in_srs: str, only_labels: set[str] | None = None) -
     When ``only_labels`` is given, only rows whose Filename is in that set are
     reprojected — used in mixed scans to reproject image/video rows while
     leaving point-cloud rows (which carry a CRS per-file) untouched.
+
+    No-op when the frame has no GPS columns at all: video field groups carry no
+    coordinates, so a video-only (or point-cloud + video) scan reaches here with
+    neither column present.
     """
+    if "GPSLongitude" not in df.columns or "GPSLatitude" not in df.columns:
+        return
     for idx in df.index:
         if df.at[idx, "Filename"] == "DEFAULT":
             continue
@@ -690,6 +700,22 @@ def _crs_failures(df) -> list[str]:
         return []
     flag = df[_CRS_WEB_MERCATOR_COL].astype(str).str.strip()
     return df.loc[flag == "no", "Filename"].tolist()
+
+
+class PointCloudCRSError(RuntimeError):
+    """Point clouds whose CRS can't reach Web Mercator, raised before any write.
+
+    Carries the offending filenames (for the loud end-of-run banner) and the path
+    of the local diagnostic CSV written in place of the real sidecar.
+    """
+
+    def __init__(self, filenames: list[str], diagnostic_path: Path) -> None:
+        super().__init__(
+            f"{len(filenames)} point cloud(s) could not be converted to "
+            f"Web Mercator ({WEB_MERCATOR_EPSG})."
+        )
+        self.filenames = filenames
+        self.diagnostic_path = diagnostic_path
 
 
 def _raise_crs_failures_loudly(crs_failures: list[str]) -> None:
@@ -813,42 +839,20 @@ def _warn_skipped_vectors(vector_keys: list[str]) -> None:
     )
 
 
-_TIFF_SUFFIXES = {".tif", ".tiff"}
-
-
 def _drop_preview_tifs(keys: list[str]) -> list[str]:
-    """Drop ``.tif`` files that are generated previews of another file.
+    """Drop generated preview ``.tif`` files, logging what was skipped.
 
-    Some capture pipelines emit a ``.tif`` preview alongside the real asset —
-    e.g. ``R0010013.tif`` next to ``R0010013.JPG``. These are not unknown
-    filetypes, just rasterized previews, and must not become sidecar rows. A
-    ``.tif`` is treated as a preview when another (non-tiff) file in the *same
-    folder* shares its basename stem. Standalone ortho ``.tif`` files (no such
-    companion) are kept.
+    The rule itself lives in ``utils.drop_preview_tifs`` so the linter's
+    ``--input-files`` inventory applies the same one and doesn't flag the files
+    generation deliberately left out.
     """
-    by_stem: dict[tuple[str, str], list[str]] = defaultdict(list)
-    for key in keys:
-        p = Path(key)
-        by_stem[(str(p.parent), p.stem.lower())].append(key)
-
-    kept: list[str] = []
-    dropped: list[str] = []
-    for key in keys:
-        p = Path(key)
-        if p.suffix.lower() in _TIFF_SUFFIXES and any(
-            other != key and Path(other).suffix.lower() not in _TIFF_SUFFIXES
-            for other in by_stem[(str(p.parent), p.stem.lower())]
-        ):
-            dropped.append(key)
-        else:
-            kept.append(key)
-
+    kept, dropped = drop_preview_tifs(keys)
     if dropped:
         sample = dropped[:5]
         suffix = f" (+{len(dropped) - 5} more)" if len(dropped) > 5 else ""
         logger.info(
             f"Ignored {len(dropped)} preview .tif file(s) that share a name with "
-            f"another file in the same folder: {sample}{suffix}"
+            f"an image in the same folder: {sample}{suffix}"
         )
     return kept
 
@@ -857,11 +861,11 @@ def _drop_all_empty_columns(df, keep: set[str] | None = None) -> None:
     """Drop columns whose every value is blank, in place.
 
     ``Filename`` and ``DataType`` are always kept, as is any column in ``keep``
-    (the required fields for the detected types — a blank required column is left
-    in place as a checklist of what still needs filling). A non-protected column
-    survives only if some cell (including the DEFAULT row) holds a value — so
-    ``fallback_srs`` (set only on DEFAULT) stays, while columns no file populated
-    are removed entirely.
+    (the required and optional fields for the detected types — a blank one is
+    left in place as a checklist of what still needs filling). A non-protected
+    column survives only if some cell (including the DEFAULT row) holds a value —
+    so ``fallback_srs`` (set only on DEFAULT) stays, while columns no file
+    populated are removed entirely.
     """
     protected = {"Filename", "DataType"} | (keep or set())
     empty_cols = [
@@ -871,7 +875,7 @@ def _drop_all_empty_columns(df, keep: set[str] | None = None) -> None:
     ]
     if empty_cols:
         logger.info(
-            f"Dropping {len(empty_cols)} non-required column(s) with no values "
+            f"Dropping {len(empty_cols)} unfillable column(s) with no values "
             f"in any row: {empty_cols}"
         )
         df.drop(columns=empty_cols, inplace=True)
@@ -881,7 +885,7 @@ def _move_blank_columns_to_end(df):
     """Return ``df`` with every all-blank column moved to the right edge.
 
     After ``_drop_all_empty_columns`` the only all-blank columns left are the
-    protected required fields; grouping them at the end keeps the populated
+    protected checklist fields; grouping them at the end keeps the populated
     columns (``Filename``/``DataType`` first, then real data) together on the
     left and pushes the empty checklist columns out of the way.
     """
@@ -1127,15 +1131,24 @@ def _build_sidecar(
             )
             _reproject_dataframe(df, spatial_reference, only_labels=iv_labels)
 
-    # Drop non-required columns no file populated (kept last so file_srs/
-    # fallback_srs, added above, are considered). Required fields for the
-    # detected types are protected even when blank — they stay as a checklist.
-    required_canonicals = {
+    # Drop columns no file populated (kept last so file_srs/fallback_srs, added
+    # above, are considered). Both required *and* optional fields for the
+    # detected types are protected even when blank — they stay as a checklist for
+    # the customer to fill in. Optional matters as much as required here:
+    # orientation (Pitch/Heading/Roll) is optional-by-default for oriented images
+    # but the lint that immediately follows promotes it to required unless
+    # --ignore-missing-orientation, so dropping the blank columns would tell the
+    # customer to add back a column this tool just removed.
+    checklist_canonicals = {
         group[0]
         for detected in detected_types
-        for group in _REQUIRED_SIDECAR_FIELD_GROUPS.get(detected, [])
+        for groups in (
+            _REQUIRED_SIDECAR_FIELD_GROUPS.get(detected, []),
+            _OPTIONAL_SIDECAR_FIELD_GROUPS.get(detected, []),
+        )
+        for group in groups
     }
-    _drop_all_empty_columns(df, keep=required_canonicals)
+    _drop_all_empty_columns(df, keep=checklist_canonicals)
     df = _move_blank_columns_to_end(df)
 
     return df, backend, detected_types, vector_keys
@@ -1150,7 +1163,7 @@ def _generate(
     full: bool = False,
     local_copy: bool = False,
     spatial_reference: str | None = None,
-) -> tuple[str, list[str], list[str]]:
+) -> tuple[str, list[str]]:
     logger.info(
         f"Starting sidecar CSV generation — directory={directory!r} "
         f"data_type={data_type} output={output_filename!r} "
@@ -1172,6 +1185,15 @@ def _generate(
     with tempfile.TemporaryDirectory() as tmp_dir:
         local_csv = Path(tmp_dir) / output_filename
         df.to_csv(local_csv, index=False)
+        if crs_failures:
+            # Flow cannot ingest this sidecar, so it must not land in the input
+            # directory — that is usually the customer's intake bucket, where a
+            # downstream watcher would pick it up. Keep a local diagnostic copy
+            # (its crs_web_mercator_ok column marks the offending rows) and stop
+            # before writing anything remote.
+            diagnostic_path = Path.cwd() / output_filename
+            shutil.copy2(local_csv, diagnostic_path)
+            raise PointCloudCRSError(crs_failures, diagnostic_path)
         logger.info(f"Writing sidecar CSV to {backend.display_root}/{output_filename}")
         sidecar_path = backend.write_output(output_filename, local_csv)
         if local_copy:
@@ -1188,7 +1210,7 @@ def _generate(
             f"Local copy at: {local_copy_path}", fg="green", bold=True, err=True
         )
 
-    return sidecar_path, vector_keys, crs_failures
+    return sidecar_path, vector_keys
 
 
 def _format_replay_command(
@@ -1391,7 +1413,7 @@ def _run_generate(result: WizardResult, *, wizard_ran: bool) -> None:
         )
 
     try:
-        sidecar_path, skipped_vector, crs_failures = _generate(
+        sidecar_path, skipped_vector = _generate(
             directory=directory,
             data_type=data_type,
             output_filename=output_filename,
@@ -1401,6 +1423,17 @@ def _run_generate(result: WizardResult, *, wizard_ran: bool) -> None:
             local_copy=result.local_copy,
             spatial_reference=result.spatial_reference,
         )
+    except PointCloudCRSError as e:
+        # Nothing was written to the input directory; report loudly and stop.
+        _raise_crs_failures_loudly(e.filenames)
+        click.secho(
+            f"  No sidecar was written to {directory}. A diagnostic copy is at: "
+            f"{e.diagnostic_path}",
+            fg="bright_red",
+            err=True,
+            color=True,
+        )
+        raise typer.Exit(code=1) from None
     except Exception as e:
         _fail("Failed to generate sidecar CSV", e)
 
@@ -1420,10 +1453,7 @@ def _run_generate(result: WizardResult, *, wizard_ran: bool) -> None:
 
     typer.echo(report.render())
     _warn_skipped_vectors(skipped_vector)
-    # A point cloud that can't reach Web Mercator is unusable to Flow; surface it
-    # loudly at the very end and force a non-zero exit even if nothing else failed.
-    _raise_crs_failures_loudly(crs_failures)
-    if report.has_errors() or crs_failures:
+    if report.has_errors():
         raise typer.Exit(code=1)
 
 

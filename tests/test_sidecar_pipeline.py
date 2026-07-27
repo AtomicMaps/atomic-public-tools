@@ -7,27 +7,35 @@ headerless rename) the real example CSVs and schema are read.
 
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from atomic_tools.client_sidecar import (
     load_and_clean_client_sidecar,
     merge_client_metadata,
 )
+from atomic_tools.commands import sidecar as sidecar_mod
 from atomic_tools.commands.sidecar import (
     _ALL_SIDECAR_FIELD_GROUPS,
     _CRS_WEB_MERCATOR_COL,
+    _OPTIONAL_SIDECAR_FIELD_GROUPS,
+    _REQUIRED_SIDECAR_FIELD_GROUPS,
+    PointCloudCRSError,
     _add_crs_web_mercator_column,
     _add_file_srs_column,
     _add_spatial_reference_column,
     _disambiguate_filenames,
+    _drop_all_empty_columns,
     _fill_missing_dates_from_filepath,
+    _move_blank_columns_to_end,
     _reproject_dataframe,
     _split_gps_position,
     _warn_missing_required_fields,
     build_sidecar_df,
 )
+from atomic_tools.io.storage import from_directory
 from atomic_tools.utils.extractors import extract_pdal_crs
-from atomic_tools.utils.utils import DataTypeEnum
+from atomic_tools.utils.utils import DataTypeEnum, drop_preview_tifs
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXAMPLE_DIR = REPO_ROOT / "example-fake-data"
@@ -817,3 +825,131 @@ def test_merge_does_not_match_unrelated_paths(tmp_path):
     )
     merge_client_metadata(file_metadata, client_df)
     assert "GPSAltitude" not in dict(file_metadata)["a/1.jpg"]
+
+
+# ---- generation-side regressions ---------------------------------------------
+
+
+def test_reproject_skips_frames_without_gps_columns():
+    """A video-only scan has no GPS columns; --spatial-reference must not crash."""
+    df = build_sidecar_df(
+        [("a.mp4", {"Make": "DJI", "CreateDate": "2024:06:15 10:30:00"})],
+        field_groups_by_type={
+            "full_motion_video": _ALL_SIDECAR_FIELD_GROUPS[DataTypeEnum.video]
+        },
+        types_by_label={"a.mp4": "full_motion_video"},
+    )
+    assert "GPSLongitude" not in df.columns
+    _reproject_dataframe(df, "EPSG:32612", only_labels={"a.mp4"})
+
+
+def test_drop_preview_tifs_keeps_ortho_with_non_image_companions():
+    """Only a same-stem *photo* marks a .tif as a preview; footprints/point
+    clouds sharing the stem are legitimate companions of a real ortho."""
+    kept, dropped = drop_preview_tifs(
+        [
+            "ortho/site.tif",
+            "ortho/site.geojson",
+            "pc/scan.tif",
+            "pc/scan.las",
+            "img/R001.tif",
+            "img/R001.JPG",
+        ]
+    )
+    assert dropped == ["img/R001.tif"]
+    assert "ortho/site.tif" in kept and "pc/scan.tif" in kept
+
+
+def test_blank_optional_columns_survive_as_a_checklist():
+    """Orientation is blank when EXIF carries none, but the lint that follows
+    promotes it to required — the columns must stay for the customer to fill."""
+    df = _build_single_type(
+        [
+            (
+                "a.jpg",
+                {
+                    "GPSLatitude": "51",
+                    "GPSLongitude": "-114",
+                    "GPSAltitude": "1000",
+                    "CreateDate": "2024:06:15 10:30:00",
+                },
+            )
+        ],
+        ORIENTED_GROUPS,
+        "oriented_image",
+    )
+    keep = {
+        group[0]
+        for groups in (
+            _REQUIRED_SIDECAR_FIELD_GROUPS[DataTypeEnum.oriented_image],
+            _OPTIONAL_SIDECAR_FIELD_GROUPS[DataTypeEnum.oriented_image],
+        )
+        for group in groups
+    }
+    _drop_all_empty_columns(df, keep=keep)
+    df = _move_blank_columns_to_end(df)
+    assert {"Pitch", "Heading", "Roll"} <= set(df.columns)
+
+
+def _stub_build_sidecar(monkeypatch, df, backend):
+    monkeypatch.setattr(
+        sidecar_mod,
+        "_build_sidecar",
+        lambda **kwargs: (df, backend, {DataTypeEnum.point_cloud}, []),
+    )
+
+
+def _pc_df(flag: str):
+    return pd.DataFrame(
+        [
+            {"Filename": "DEFAULT", "DataType": "", _CRS_WEB_MERCATOR_COL: ""},
+            {
+                "Filename": "a.las",
+                "DataType": "point_cloud",
+                _CRS_WEB_MERCATOR_COL: flag,
+            },
+        ]
+    )
+
+
+def test_generate_does_not_write_unusable_sidecar_to_input_dir(tmp_path, monkeypatch):
+    """A point cloud that can't reach Web Mercator must not leave a sidecar Flow
+    can't ingest sitting in the customer's intake directory."""
+    indir = tmp_path / "client-bucket"
+    indir.mkdir()
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    _stub_build_sidecar(monkeypatch, _pc_df("no"), from_directory(str(indir)))
+
+    with pytest.raises(PointCloudCRSError) as excinfo:
+        sidecar_mod._generate(
+            directory=str(indir),
+            data_type=None,
+            output_filename="sidecar.csv",
+            client_sidecar=None,
+            client_schema=None,
+        )
+
+    assert excinfo.value.filenames == ["a.las"]
+    assert not (indir / "sidecar.csv").exists()
+    # A local diagnostic copy is still produced so the customer can see which
+    # rows failed (the crs_web_mercator_ok column).
+    assert excinfo.value.diagnostic_path == cwd / "sidecar.csv"
+    assert excinfo.value.diagnostic_path.exists()
+
+
+def test_generate_writes_when_crs_is_usable(tmp_path, monkeypatch):
+    indir = tmp_path / "client-bucket"
+    indir.mkdir()
+    monkeypatch.chdir(tmp_path)
+    _stub_build_sidecar(monkeypatch, _pc_df("yes"), from_directory(str(indir)))
+
+    sidecar_mod._generate(
+        directory=str(indir),
+        data_type=None,
+        output_filename="sidecar.csv",
+        client_sidecar=None,
+        client_schema=None,
+    )
+    assert (indir / "sidecar.csv").exists()

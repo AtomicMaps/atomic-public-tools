@@ -328,15 +328,34 @@ def test_lint_csv_without_datatype_column_infers(tmp_path):
 
 
 def test_lint_unknown_datatype_value_warns_and_skips(tmp_path):
+    header = ["Filename", "DataType", "CreateDate", "GPSLatitude", "GPSLongitude",
+              "GPSAltitude", "Pitch", "Heading", "Roll"]
+    rows = [
+        ["DEFAULT"] + [""] * (len(header) - 1),
+        ["a.jpg", "oriented_image", "2024:06:15 10:30:00", "51", "-114", "1000",
+         "-90", "0", "0"],
+        ["weird.bin", "not_a_type"] + [""] * (len(header) - 2),
+    ]
+    p = _write_csv(tmp_path / "s.csv", header, rows)
+    report = lint_sidecar_file(
+        str(p), final=True, data_type=None, schema_path=None, input_files_path=None
+    )
+    assert any("unrecognized DataType" in w.message for w in report.warnings())
+    # The bad row was skipped for required checks; the good row still validates.
+    assert not report.has_errors()
+
+
+def test_lint_final_errors_when_no_row_classifies(tmp_path):
+    """Final mode must not report PASSED when it had nothing to check."""
     header = ["Filename", "DataType", "CreateDate"]
     rows = [["DEFAULT", "", ""], ["weird.bin", "not_a_type", ""]]
     p = _write_csv(tmp_path / "s.csv", header, rows)
     report = lint_sidecar_file(
         str(p), final=True, data_type=None, schema_path=None, input_files_path=None
     )
-    assert any("unrecognized DataType" in w.message for w in report.warnings())
-    # The row was skipped for required checks → no required-field errors.
-    assert not report.has_errors()
+    assert any(
+        "No sidecar row could be classified" in e.message for e in report.errors()
+    )
 
 
 def test_lint_filter_excludes_other_type_rows(tmp_path):
@@ -449,3 +468,81 @@ def test_client_datatype_column_dropped(tmp_path, patched_extractors, caplog):
     # Detected type wins; the client DataType column is dropped with a warning.
     assert df[df["Filename"] == "a.jpg"].iloc[0]["DataType"] == "oriented_image"
     assert any("DataType" in rec.message for rec in caplog.records)
+
+
+# ---- lint-side regressions ---------------------------------------------------
+
+
+def test_inventory_check_covers_spherical_image_rows(tmp_path):
+    """Filename-only inference always answers oriented_image for a .jpg, so a
+    spherical batch must still have its --input-files inventory checked."""
+    data = tmp_path / "data"
+    data.mkdir()
+    for name in ("a.jpg", "b.jpg", "c.jpg"):
+        (data / name).write_bytes(b"x" * 10)
+    header = ["Filename", "DataType", "CreateDate", "GPSLatitude", "GPSLongitude",
+              "GPSAltitude"]
+    rows = [
+        ["DEFAULT", "", "", "", "", ""],
+        ["a.jpg", "spherical_image", "2024:06:15 10:30:00", "51", "-114", "1000"],
+        ["b.jpg", "spherical_image", "2024:06:15 10:30:00", "51", "-114", "1000"],
+    ]
+    p = _write_csv(tmp_path / "s.csv", header, rows)
+    report = lint_sidecar_file(
+        str(p), final=True, data_type=None, schema_path=None,
+        input_files_path=str(data),
+    )
+    assert "c.jpg" in report.render()
+
+
+def test_inventory_check_ignores_preview_tifs(tmp_path):
+    """Generation drops preview .tif files, so lint must not report them as
+    input files with no sidecar row."""
+    data = tmp_path / "data"
+    data.mkdir()
+    for name in ("R001.JPG", "R001.tif", "site.tif"):
+        (data / name).write_bytes(b"x" * 10)
+    header = ["Filename", "DataType", "CreateDate", "GPSLatitude", "GPSLongitude",
+              "GPSAltitude", "Pitch", "Heading", "Roll"]
+    rows = [
+        ["DEFAULT"] + [""] * 8,
+        ["R001.JPG", "oriented_image", "2024:06:15 10:30:00", "51", "-114", "1000",
+         "0", "0", "0"],
+        ["site.tif", "ortho_image", "2024:06:15 10:30:00", "51", "-114", "1000",
+         "", "", ""],
+    ]
+    p = _write_csv(tmp_path / "s.csv", header, rows)
+    report = lint_sidecar_file(
+        str(p), final=True, data_type=None, schema_path=None,
+        input_files_path=str(data),
+    )
+    assert "R001.tif" not in report.render()
+
+
+def test_bare_lint_sidecar_prompts_for_final(tmp_path, monkeypatch):
+    """`am-tools lint sidecar <path>` with no flags must ask which mode to lint
+    in — defaulting to client mode silently skips every required-field check."""
+    from typer.testing import CliRunner
+
+    from atomic_tools.cli import app
+    from atomic_tools.commands import lint as lint_mod
+
+    header = ["Filename", "DataType"]
+    p = _write_csv(tmp_path / "s.csv", header, [["DEFAULT", ""], ["a.jpg", "oriented_image"]])
+
+    asked: list[str] = []
+    monkeypatch.setattr(lint_mod, "_ask_final", lambda: (asked.append("final"), True)[1])
+    monkeypatch.setattr(lint_mod, "_ask_ignore_missing_orientation", lambda: False)
+    monkeypatch.setattr(lint_mod, "_ask_client_schema", lambda: None)
+    monkeypatch.setattr(lint_mod, "_ask_input_files", lambda: None)
+    monkeypatch.setattr(lint_mod, "_ask_coco", lambda: None)
+    monkeypatch.setattr(lint_mod, "_ask_verbosity", lambda: "default")
+
+    result = CliRunner().invoke(app, ["lint", "sidecar", str(p)])
+    assert asked == ["final"]
+    # Final mode ran: the sidecar is missing every required column.
+    assert result.exit_code == 1
+
+    asked.clear()
+    CliRunner().invoke(app, ["lint", "sidecar", str(p), "--final"])
+    assert asked == []
