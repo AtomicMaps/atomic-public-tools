@@ -33,10 +33,12 @@ import numpy as np
 
 from atomic_tools.utils.coordinates import (
     WEB_MERCATOR_EPSG,
+    can_transform_to_web_mercator,
     transform_center_to_web_mercator,
     transform_coordinates,
     vertical_meters_per_unit,
 )
+from atomic_tools.utils.utils import infer_data_type
 from atomic_tools.validators.constants import DEFAULT_ROW_NAME, MAX_LISTED_FILES
 from atomic_tools.validators.values import parse_elevation, to_decimal_degree
 
@@ -55,6 +57,8 @@ _ALT_COL = "GPSAltitude"
 # sidecar._add_spatial_reference_column).
 _FILE_SRS_COL = "file_srs"
 _FALLBACK_SRS_COL = "fallback_srs"
+_DATA_TYPE_COL = "DataType"
+_POINT_CLOUD_TYPE = "point_cloud"
 
 # Point-cloud bounding-box columns (see extractors.extract_pdal_metadata).
 _BOUNDS_MINX = "bounds.minx"
@@ -246,14 +250,46 @@ def _check_point_cloud_crs(
     fallback: str | None,
     report: LintReport,
 ) -> None:
-    """Error if any point-cloud row has no CRS in either ``file_srs`` or ``fallback_srs``."""
+    """Error on point-cloud rows whose CRS is missing or can't reach Web Mercator.
+
+    Flow renders point clouds in Web Mercator, so every point-cloud row must have
+    a CRS (its ``file_srs``, else the batch ``fallback_srs``) that pyproj can
+    transform to EPSG:3857. Two failure modes are reported separately: no CRS at
+    all, and a CRS present but not transformable (these are the rows the generated
+    sidecar flags ``no`` in ``crs_web_mercator_ok``).
+
+    In a mixed sidecar the ``file_srs`` column exists for every row, but only
+    point-cloud rows require a CRS — image/video rows legitimately have none. So
+    when a ``DataType`` column is present, restrict the check to point-cloud rows.
+
+    A row's type resolves the same way the linter's ``_row_types`` resolves it:
+    the ``DataType`` cell when non-empty, else filename inference. A blank cell
+    must not skip the row — hand-edited and client-authored sidecars routinely
+    leave the column empty, and skipping would let a CRS-less point cloud pass.
+    When neither source answers (and for older sidecars with no ``DataType``
+    column at all) the row is treated as a point cloud: these rows only reach
+    here because the sidecar is point-cloud-shaped, and erring toward the check
+    is the safe direction.
+    """
     if not _is_point_cloud_sidecar(rows):
         return
-    missing = [
-        name
-        for name, (_, row) in zip(filenames, rows.iterrows(), strict=True)
-        if _row_crs(row, fallback) is None
-    ]
+    has_type_col = _DATA_TYPE_COL in rows.columns
+    types: list[str] = []
+    for (_, row), name in zip(rows.iterrows(), filenames, strict=True):
+        raw = str(row[_DATA_TYPE_COL]).strip() if has_type_col else ""
+        types.append(raw or infer_data_type(name) or _POINT_CLOUD_TYPE)
+
+    missing: list[str] = []
+    untransformable: list[str] = []
+    for name, (_, row), dtype in zip(filenames, rows.iterrows(), types, strict=True):
+        if dtype != _POINT_CLOUD_TYPE:
+            continue
+        crs = _row_crs(row, fallback)
+        if crs is None:
+            missing.append(name)
+        elif not _row_crs_reaches_web_mercator(row, crs):
+            untransformable.append(name)
+
     if missing:
         report.add_error(
             f"{len(missing)} point cloud row(s) have no CRS in either "
@@ -265,12 +301,52 @@ def _check_point_cloud_crs(
                 f"'{_FALLBACK_SRS_COL}'."
             ),
         )
+    if untransformable:
+        report.add_error(
+            f"{len(untransformable)} point cloud row(s) have a CRS that cannot be "
+            f"transformed to {WEB_MERCATOR_EPSG}: "
+            f"{_truncated_listing([repr(n) for n in untransformable])}",
+            fix_hint=(
+                "Flow renders point clouds in Web Mercator; the CRS in "
+                f"'{_FILE_SRS_COL}' (or the '{_FALLBACK_SRS_COL}' fallback) must be "
+                "convertible to it. Correct the CRS or pass a valid "
+                "--spatial-reference."
+            ),
+        )
 
 
-def analyze_spatial_distribution(df: pd.DataFrame, report: LintReport) -> None:
-    """Add batch-level spatial outlier findings to ``report`` (no-op if no coords)."""
+def _row_crs_reaches_web_mercator(row: pd.Series, crs: str) -> bool:
+    """True if ``crs`` transforms to Web Mercator for this row.
+
+    Prefers transforming the row's bbox center (when ``bounds.*`` are present) —
+    stricter than merely building a transformer, since it also catches a CRS that
+    maps real coordinates to non-finite values — and falls back to a CRS-only
+    check otherwise.
+    """
+    cx = _bounds_centroid(row, _BOUNDS_MINX, _BOUNDS_MAXX)
+    cy = _bounds_centroid(row, _BOUNDS_MINY, _BOUNDS_MAXY)
+    if cx is not None and cy is not None:
+        return transform_center_to_web_mercator(cx, cy, None, crs) is not None
+    return can_transform_to_web_mercator(crs)
+
+
+def analyze_spatial_distribution(
+    df: pd.DataFrame,
+    report: LintReport,
+    *,
+    only_indices: set[int] | None = None,
+) -> None:
+    """Add batch-level spatial outlier findings to ``report`` (no-op if no coords).
+
+    ``only_indices`` restricts the analysis to those row indices — used when the
+    caller applied a ``--datatype`` filter, so rows the user excluded don't raise
+    findings. The DEFAULT row is always excluded from the analysis but is still
+    read for the batch ``fallback_srs``.
+    """
     fallback = _fallback_crs(df)
     rows = _non_default_rows(df)
+    if only_indices is not None:
+        rows = rows.loc[[idx for idx in rows.index if int(idx) in only_indices]]
     if rows.empty:
         return
 

@@ -20,6 +20,7 @@ from typing import Annotated
 import typer
 
 import atomic_tools
+from atomic_tools import vendor_sync
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,48 @@ def _run(cmd: list[str], cwd: Path) -> None:
             err=True,
         )
         raise typer.Exit(result.returncode)
+
+
+def _refresh_vendored(repo: Path) -> None:
+    """Best-effort refresh of the vendored data-engineering files.
+
+    On a machine that can reach the canonical source (sibling checkout or a
+    GitHub token) this regenerates the vendored files to the latest canonical
+    version. It never aborts the update.
+
+    Every outcome except "files actually changed" is logged at INFO, i.e. shown
+    only under ``--verbose``. A client has no access to the private repo, so
+    "not reachable" is the *expected* result there, not a problem worth putting
+    in front of them — the vendored copies shipped in the release are correct
+    and are used as-is. Regeneration failures are quiet for the same reason: a
+    client can't act on one either, and on a dev machine stale vendored files
+    are caught by ``tests/test_vendored_drift.py``, which is the real guard.
+    Only a successful rewrite stays visible, because it leaves the dev's working
+    tree dirty and needs committing.
+    """
+    try:
+        result = vendor_sync.refresh(repo)
+    except Exception as exc:  # noqa: BLE001 — never fail the update over this
+        logger.info("Skipping vendored refresh — regeneration failed: %s", exc)
+        return
+
+    if not result.available:
+        logger.info(
+            "Skipping vendored refresh — data-engineering source not reachable "
+            "(expected without access to the private repo)."
+        )
+        return
+
+    if result.any_changed:
+        changed = ", ".join(name for name, did in result.changed.items() if did)
+        typer.secho(
+            f"Refreshed vendored data-engineering files ({changed}); "
+            "review and commit the change.",
+            fg=typer.colors.GREEN,
+            err=True,
+        )
+    else:
+        logger.info("Vendored data-engineering files already up to date.")
 
 
 _DEFAULT_BRANCH = "main"
@@ -108,6 +151,8 @@ def update_command(
     # branch has no upstream, and keeps every client on the same branch.
     _run(["git", "checkout", branch], cwd=repo)
     _run(["git", "pull", "origin", branch], cwd=repo)
+
+    _refresh_vendored(repo)
 
     target = ".[dev]" if dev else "."
     _run([sys.executable, "-m", "pip", "install", "-e", target], cwd=repo)

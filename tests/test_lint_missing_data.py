@@ -85,8 +85,26 @@ def test_default_row_coverage_means_not_missing(tmp_path):
     assert table.is_empty(), table.rows
 
 
-def test_no_datatype_means_no_table(tmp_path):
+def test_no_datatype_infers_from_filename(tmp_path):
+    """With no --datatype, each row's type is inferred from its filename. A .jpg
+    infers oriented_image, so its required fields apply and a table is produced."""
     rows = [["Filename", "CreateDate"], ["1.jpg", ""]]
+    p = _write_csv(tmp_path, "s.csv", rows[0], rows[1:])
+    report = lint_sidecar_file(
+        str(p),
+        final=False,
+        data_type=None,
+        schema_path=None,
+        input_files_path=None,
+    )
+    assert report.missing_data is not None
+    assert any(row["Filename"] == "1.jpg" for row in report.missing_data.rows)
+
+
+def test_uninferable_filename_means_no_table(tmp_path):
+    """A row whose filename infers no type (and no DataType column) is skipped —
+    no required fields apply, so there's no table."""
+    rows = [["Filename", "CreateDate"], ["mystery.dat", ""]]
     p = _write_csv(tmp_path, "s.csv", rows[0], rows[1:])
     report = lint_sidecar_file(
         str(p),

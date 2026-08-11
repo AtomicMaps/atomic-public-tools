@@ -20,7 +20,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from obstore.exceptions import PermissionDeniedError, UnauthenticatedError
 
@@ -167,6 +167,68 @@ class ObjectStoreBackend(StorageBackend):
         return f"{self._scheme}://{self._bucket}/{output_key}"
 
 
+def _join_s3(bucket: str, prefix: str) -> str:
+    prefix = prefix.strip("/")
+    return f"s3://{bucket}/{prefix}" if prefix else f"s3://{bucket}"
+
+
+def console_url_to_s3_uri(directory: str) -> str | None:
+    """Translate an AWS S3 *console* or HTTPS URL to an ``s3://bucket/prefix`` URI.
+
+    Returns ``None`` for anything that isn't a recognisable AWS S3 web URL
+    (already-``s3://`` URIs, local paths, other https links). Handles the three
+    shapes users paste from a browser:
+
+      * console:        ``https://<region>.console.aws.amazon.com/s3/buckets/<bucket>?prefix=<prefix>``
+      * virtual-hosted: ``https://<bucket>.s3[.<region>].amazonaws.com/<key>``
+      * path-style:     ``https://s3[.<region>].amazonaws.com/<bucket>/<key>``
+    """
+    parsed = urlparse(directory.strip())
+    if parsed.scheme not in ("http", "https"):
+        return None
+    host = parsed.netloc.lower().split("@")[-1].split(":")[0]
+
+    # S3 web console — bucket is a path segment, prefix is a query parameter.
+    if host.endswith("console.aws.amazon.com"):
+        parts = [p for p in parsed.path.split("/") if p]
+        if len(parts) >= 3 and parts[0] == "s3" and parts[1] == "buckets":
+            prefix = parse_qs(parsed.query).get("prefix", [""])[0]
+            return _join_s3(parts[2], prefix)
+        return None
+
+    if host.endswith(".amazonaws.com"):
+        labels = host.split(".")
+        # path-style: s3.amazonaws.com/<bucket>/<key> (or s3.<region>.amazonaws.com/...)
+        if labels[0] == "s3":
+            parts = [p for p in parsed.path.split("/") if p]
+            if parts:
+                bucket, *key = parts
+                return _join_s3(bucket, "/".join(key))
+            return None
+        # virtual-hosted: <bucket>.s3[.<region>].amazonaws.com/<key>
+        if "s3" in labels:
+            bucket = ".".join(labels[: labels.index("s3")])
+            if bucket:
+                return _join_s3(bucket, parsed.path.lstrip("/"))
+    return None
+
+
+def normalize_directory(directory: str) -> str:
+    """Return ``directory`` as an ``s3://`` URI when it's an AWS console/HTTPS URL.
+
+    Warns when a translation happens; a no-op for ``s3://`` URIs and local paths.
+    """
+    s3_uri = console_url_to_s3_uri(directory)
+    if s3_uri is not None:
+        logger.warning(
+            "Interpreting the AWS console URL as %s "
+            "(paste the s3:// URI directly to skip this step).",
+            s3_uri,
+        )
+        return s3_uri
+    return directory
+
+
 def from_directory(directory: str) -> StorageBackend:
     """Return a `StorageBackend` for `directory`.
 
@@ -177,6 +239,7 @@ def from_directory(directory: str) -> StorageBackend:
     if not directory or not directory.strip():
         raise ValueError("--directory cannot be empty.")
 
+    directory = normalize_directory(directory)
     raw = directory.strip().rstrip("/")
     parsed = urlparse(raw)
     scheme = parsed.scheme.lower() if parsed.scheme else ""

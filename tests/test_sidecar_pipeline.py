@@ -7,26 +7,35 @@ headerless rename) the real example CSVs and schema are read.
 
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from atomic_tools.client_sidecar import (
     load_and_clean_client_sidecar,
     merge_client_metadata,
 )
+from atomic_tools.commands import sidecar as sidecar_mod
 from atomic_tools.commands.sidecar import (
     _ALL_SIDECAR_FIELD_GROUPS,
+    _CRS_WEB_MERCATOR_COL,
+    _OPTIONAL_SIDECAR_FIELD_GROUPS,
+    _REQUIRED_SIDECAR_FIELD_GROUPS,
+    PointCloudCRSError,
+    _add_crs_web_mercator_column,
     _add_file_srs_column,
     _add_spatial_reference_column,
     _disambiguate_filenames,
+    _drop_all_empty_columns,
     _fill_missing_dates_from_filepath,
+    _move_blank_columns_to_end,
     _reproject_dataframe,
     _split_gps_position,
-    _validate_point_cloud_crs,
     _warn_missing_required_fields,
     build_sidecar_df,
 )
+from atomic_tools.io.storage import from_directory
 from atomic_tools.utils.extractors import extract_pdal_crs
-from atomic_tools.utils.utils import DataTypeEnum
+from atomic_tools.utils.utils import DataTypeEnum, drop_preview_tifs
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXAMPLE_DIR = REPO_ROOT / "example-fake-data"
@@ -35,6 +44,17 @@ HEADERLESS_SIDECAR = EXAMPLE_DIR / "input sidecar" / "headerless_sidecar.csv"
 EXAMPLE_SCHEMA = REPO_ROOT / "schemas" / "column_names_example.json"
 
 ORIENTED_GROUPS = _ALL_SIDECAR_FIELD_GROUPS[DataTypeEnum.oriented_image]
+PC_GROUPS = _ALL_SIDECAR_FIELD_GROUPS[DataTypeEnum.point_cloud]
+
+
+def _build_single_type(metadata, groups, type_value, **kwargs):
+    """build_sidecar_df helper for a single-type scan (all rows one type)."""
+    return build_sidecar_df(
+        metadata,
+        field_groups_by_type={type_value: groups},
+        types_by_label={label: type_value for label, _ in metadata},
+        **kwargs,
+    )
 
 
 def _exif_like_metadata() -> list[tuple[str, dict]]:
@@ -85,10 +105,14 @@ def _exif_like_metadata() -> list[tuple[str, dict]]:
 
 
 def test_build_sidecar_df_layout_and_canonicalization():
-    df = build_sidecar_df(_exif_like_metadata(), required_field_groups=ORIENTED_GROUPS)
+    df = _build_single_type(_exif_like_metadata(), ORIENTED_GROUPS, "oriented_image")
 
     # DEFAULT first, then files sorted alphabetically.
     assert df["Filename"].tolist() == ["DEFAULT", "1.jpg", "2.jpeg", "3.jpg"]
+
+    # DataType is column 2, filled per file and blank on DEFAULT.
+    assert list(df.columns[:2]) == ["Filename", "DataType"]
+    assert df["DataType"].tolist() == ["", "oriented_image", "oriented_image", "oriented_image"]
 
     cols = list(df.columns)
     # Aliases canonicalized: GimbalPitchDegree → Pitch, etc.
@@ -107,9 +131,9 @@ def test_build_sidecar_df_layout_and_canonicalization():
 def test_build_sidecar_df_full_includes_extra_fields():
     metadata = _exif_like_metadata()
     metadata[0][1]["ExtraField"] = "kept-when-full"
-    df = build_sidecar_df(metadata, required_field_groups=ORIENTED_GROUPS, full=True)
+    df = _build_single_type(metadata, ORIENTED_GROUPS, "oriented_image", full=True)
     assert "ExtraField" in df.columns
-    df_filtered = build_sidecar_df(_exif_like_metadata(), required_field_groups=ORIENTED_GROUPS)
+    df_filtered = _build_single_type(_exif_like_metadata(), ORIENTED_GROUPS, "oriented_image")
     assert "ExtraField" not in df_filtered.columns
 
 
@@ -144,7 +168,7 @@ def _projected_metadata() -> list[tuple[str, dict]]:
 
 
 def test_reproject_dataframe_image_coordinates():
-    df = build_sidecar_df(_projected_metadata(), required_field_groups=ORIENTED_GROUPS)
+    df = _build_single_type(_projected_metadata(), ORIENTED_GROUPS, "oriented_image")
     _reproject_dataframe(df, "EPSG:32612")
 
     # DEFAULT row stays blank.
@@ -170,7 +194,7 @@ def test_reproject_dataframe_skips_unparseable_rows():
     metadata = _projected_metadata()
     metadata[1][1]["GPSLongitude"] = ""  # blank → skipped
     metadata[1][1]["GPSLatitude"] = ""
-    df = build_sidecar_df(metadata, required_field_groups=ORIENTED_GROUPS)
+    df = _build_single_type(metadata, ORIENTED_GROUPS, "oriented_image")
     _reproject_dataframe(df, "EPSG:32612")
 
     row_b = df[df["Filename"] == "b.jpg"].iloc[0]
@@ -179,11 +203,10 @@ def test_reproject_dataframe_skips_unparseable_rows():
 
 
 def test_add_spatial_reference_column_point_cloud():
-    pc_groups = _ALL_SIDECAR_FIELD_GROUPS[DataTypeEnum.point_cloud]
     metadata = [
         ("cloud.las", {"num_points": "1000", "bounds.minx": "0", "bounds.miny": "0"}),
     ]
-    df = build_sidecar_df(metadata, required_field_groups=pc_groups)
+    df = _build_single_type(metadata, PC_GROUPS, "point_cloud")
     _add_spatial_reference_column(df, "EPSG:2956")
 
     assert "fallback_srs" in df.columns
@@ -195,12 +218,11 @@ def test_add_spatial_reference_column_point_cloud():
 
 
 def test_add_file_srs_column_records_header_crs():
-    pc_groups = _ALL_SIDECAR_FIELD_GROUPS[DataTypeEnum.point_cloud]
     metadata = [
         ("with_crs.las", {"num_points": "1", "bounds.minx": "0", "spatialreference": "EPSG:32612"}),
         ("no_crs.las", {"num_points": "1", "bounds.minx": "0", "spatialreference": ""}),
     ]
-    df = build_sidecar_df(metadata, required_field_groups=pc_groups)
+    df = _build_single_type(metadata, PC_GROUPS, "point_cloud")
     _add_file_srs_column(df, metadata)
 
     assert "file_srs" in df.columns
@@ -226,6 +248,15 @@ def test_extract_pdal_crs_prefers_top_level_spatialreference():
     assert extract_pdal_crs(meta) == _UTM12N_WKT
 
 
+def test_extract_pdal_crs_prefers_compound_over_plain():
+    # Aligns with atomicmapspy PointCloud.get_srs: the compound WKT (horizontal +
+    # vertical) wins over the plain horizontal-only spatialreference, so a file
+    # with a vertical datum keeps its full definition.
+    compound = 'COMPD_CS["UTM12N + NAVD88",' + _UTM12N_WKT + ',VERT_CS["NAVD88"]]'
+    meta = {"srs.compoundwkt": compound, "spatialreference": _UTM12N_WKT}
+    assert extract_pdal_crs(meta) == compound
+
+
 def test_extract_pdal_crs_falls_back_to_srs_keys():
     # PDAL leaves the top-level key empty but populates the srs.* block.
     meta = {"spatialreference": "", "comp_spatialreference": "", "srs.wkt": _UTM12N_WKT}
@@ -238,17 +269,177 @@ def test_extract_pdal_crs_none_when_header_has_no_crs():
     assert extract_pdal_crs(meta) is None
 
 
-def test_validate_point_cloud_crs_passes_with_embedded_crs():
-    file_metadata = [("cloud.las", {"spatialreference": _UTM12N_WKT})]
-    _validate_point_cloud_crs(file_metadata, spatial_reference=None)
+def test_meta_from_filters_info_maps_bounds_num_points_and_srs():
+    from atomic_tools.utils.extractors import _meta_from_filters_info
+
+    fi = {
+        "bbox": {"minx": 0.0, "maxx": 1.0, "miny": 2.0, "maxy": 3.0, "minz": 4.0, "maxz": 5.0},
+        "num_points": 42,
+        "srs": {"compoundwkt": _UTM12N_WKT, "units": {"horizontal": "metre"}},
+    }
+    out = _meta_from_filters_info(fi)
+    assert out["bounds.minx"] == 0.0 and out["bounds.maxz"] == 5.0
+    assert out["num_points"] == 42
+    # srs sub-keys flatten under the srs. prefix so extract_pdal_crs finds them.
+    assert out["srs.compoundwkt"] == _UTM12N_WKT
+    assert out["srs.units.horizontal"] == "metre"
+    assert extract_pdal_crs(out) == _UTM12N_WKT
 
 
-def test_validate_point_cloud_crs_uses_backup_when_header_missing():
-    file_metadata = [("cloud.las", {"spatialreference": ""})]
-    _validate_point_cloud_crs(file_metadata, spatial_reference="EPSG:32612")
+def test_extract_pdal_metadata_falls_back_to_filters_info_when_header_empty(monkeypatch):
+    # E57 (and any reader whose header block is empty): `pdal info --metadata`
+    # returns nothing, so extraction must fall back to a filters.info pipeline.
+    from atomic_tools.utils import extractors
+
+    fi = {
+        "bbox": {"minx": 10.0, "maxx": 20.0, "miny": 30.0, "maxy": 40.0, "minz": 1.0, "maxz": 2.0},
+        "num_points": 7,
+        "srs": {"compoundwkt": _UTM12N_WKT},
+    }
+    monkeypatch.setattr(extractors, "find_pdal_bin", lambda: "/fake/pdal")
+    monkeypatch.setattr(extractors, "_run_pdal_info", lambda *a, **k: {"metadata": {}})
+    called = {}
+
+    def fake_filters_info(pdal_bin, local_path):
+        called["path"] = local_path
+        return fi
+
+    monkeypatch.setattr(extractors, "_run_pdal_filters_info", fake_filters_info)
+
+    meta = extractors.extract_pdal_metadata("scan.e57", "scan.e57")
+    assert called["path"] == "scan.e57"  # fallback actually ran
+    assert meta["bounds.minx"] == 10.0 and meta["bounds.maxx"] == 20.0
+    assert meta["num_points"] == 7
+    assert extract_pdal_crs(meta) == _UTM12N_WKT
 
 
-def test_validate_point_cloud_crs_transforms_bbox_center():
+def test_extract_pdal_metadata_skips_filters_info_when_header_has_bounds(monkeypatch):
+    # LAS/LAZ: the header block already carries bounds, so no pipeline fallback.
+    from atomic_tools.utils import extractors
+
+    monkeypatch.setattr(extractors, "find_pdal_bin", lambda: "/fake/pdal")
+    monkeypatch.setattr(
+        extractors,
+        "_run_pdal_info",
+        lambda *a, **k: {"metadata": {"minx": 1, "maxx": 2, "miny": 3, "maxy": 4, "count": 9}},
+    )
+
+    def boom(*a, **k):
+        raise AssertionError("filters.info fallback should not run for a populated header")
+
+    monkeypatch.setattr(extractors, "_run_pdal_filters_info", boom)
+
+    meta = extractors.extract_pdal_metadata("cloud.las", "cloud.las")
+    assert meta["bounds.minx"] == 1
+    assert meta["num_points"] == 9  # count → num_points
+
+
+def test_e57_seconds_to_datetime_valid_and_invalid():
+    import datetime
+
+    from atomic_tools.utils.extractors import _E57_EPOCH, _e57_seconds_to_datetime
+
+    target = datetime.datetime(2024, 6, 15, 10, 30, 0, tzinfo=datetime.timezone.utc)
+    secs = (target - _E57_EPOCH).total_seconds()
+    got = _e57_seconds_to_datetime(secs)
+    assert got == target
+    assert got.year == 2024 and got.timetuple().tm_yday == 167  # leap-year DOY
+    # Rejected values fall back to None (→ filename/client-sidecar date).
+    assert _e57_seconds_to_datetime(float("nan")) is None
+    assert _e57_seconds_to_datetime(float("inf")) is None
+    assert _e57_seconds_to_datetime(-1) is None
+    assert _e57_seconds_to_datetime("nope") is None
+    assert _e57_seconds_to_datetime(10**15) is None  # beyond the ~2100 ceiling
+
+
+def test_parse_e57_datetime_node_reads_and_missing():
+    import datetime
+
+    from atomic_tools.utils.extractors import _E57_EPOCH, _parse_e57_datetime_node
+
+    target = datetime.datetime(2023, 3, 1, tzinfo=datetime.timezone.utc)
+    secs = (target - _E57_EPOCH).total_seconds()
+
+    class _Val:
+        def value(self):
+            return secs
+
+    node = {"creationDateTime": {"dateTimeValue": _Val()}}
+    assert _parse_e57_datetime_node(node, "creationDateTime") == target
+    assert _parse_e57_datetime_node({}, "creationDateTime") is None  # absent → None
+
+
+def test_extract_pdal_metadata_populates_e57_creation_date(monkeypatch):
+    # E57 header/filters.info carry no date; the pye57-derived capture datetime
+    # supplies creation_year / creation_doy.
+    import datetime
+
+    from atomic_tools.utils import extractors
+
+    monkeypatch.setattr(extractors, "find_pdal_bin", lambda: "/fake/pdal")
+    monkeypatch.setattr(extractors, "_run_pdal_info", lambda *a, **k: {"metadata": {}})
+    monkeypatch.setattr(
+        extractors,
+        "_run_pdal_filters_info",
+        lambda *a, **k: {
+            "bbox": {"minx": 0, "maxx": 1, "miny": 0, "maxy": 1, "minz": 0, "maxz": 1},
+            "num_points": 5,
+        },
+    )
+    monkeypatch.setattr(
+        extractors,
+        "_extract_e57_capture_datetime",
+        lambda p: datetime.datetime(2024, 6, 15, tzinfo=datetime.timezone.utc),
+    )
+    meta = extractors.extract_pdal_metadata("scan.e57", "scan.e57")
+    assert meta["creation_year"] == 2024
+    assert meta["creation_doy"] == 167
+    assert meta["num_points"] == 5
+
+
+def test_extract_pdal_metadata_e57_without_date_leaves_creation_fields_absent(monkeypatch):
+    # When pye57 yields no date, creation fields stay absent (→ filename fallback),
+    # not fabricated.
+    from atomic_tools.utils import extractors
+
+    monkeypatch.setattr(extractors, "find_pdal_bin", lambda: "/fake/pdal")
+    monkeypatch.setattr(extractors, "_run_pdal_info", lambda *a, **k: {"metadata": {}})
+    monkeypatch.setattr(
+        extractors,
+        "_run_pdal_filters_info",
+        lambda *a, **k: {"bbox": {"minx": 0, "maxx": 1, "miny": 0, "maxy": 1}, "num_points": 5},
+    )
+    monkeypatch.setattr(extractors, "_extract_e57_capture_datetime", lambda p: None)
+    meta = extractors.extract_pdal_metadata("scan.e57", "scan.e57")
+    assert "creation_year" not in meta and "creation_doy" not in meta
+
+
+def _crs_status(pc_metadata, spatial_reference=None):
+    """Run _add_crs_web_mercator_column over a minimal df and return the per-row
+    crs_web_mercator_ok value keyed by filename (DEFAULT included)."""
+    import pandas as pd
+
+    labels = [label for label, _ in pc_metadata]
+    df = pd.DataFrame([{"Filename": "DEFAULT"}] + [{"Filename": lb} for lb in labels])
+    _add_crs_web_mercator_column(df, pc_metadata, spatial_reference)
+    return dict(zip(df["Filename"], df[_CRS_WEB_MERCATOR_COL], strict=True))
+
+
+def test_crs_column_yes_with_embedded_crs():
+    status = _crs_status([("cloud.las", {"spatialreference": _UTM12N_WKT})])
+    assert status["cloud.las"] == "yes"
+    # DEFAULT (and any non-point-cloud row) stays blank.
+    assert status["DEFAULT"] == ""
+
+
+def test_crs_column_yes_with_backup_when_header_missing():
+    status = _crs_status(
+        [("cloud.las", {"spatialreference": ""})], spatial_reference="EPSG:32612"
+    )
+    assert status["cloud.las"] == "yes"
+
+
+def test_crs_column_yes_transforms_bbox_center():
     # Bounds present → the check transforms the actual bbox center to EPSG:3857.
     meta = {
         "spatialreference": _UTM12N_WKT,
@@ -259,11 +450,11 @@ def test_validate_point_cloud_crs_transforms_bbox_center():
         "bounds.minz": 10.0,
         "bounds.maxz": 20.0,
     }
-    _validate_point_cloud_crs([("cloud.las", meta)], spatial_reference=None)
+    assert _crs_status([("cloud.las", meta)])["cloud.las"] == "yes"
 
 
-def test_validate_point_cloud_crs_raises_when_center_unreachable_with_bounds():
-    # Even with bounds present, a CRS with no path to Web Mercator is rejected.
+def test_crs_column_no_when_center_unreachable_with_bounds():
+    # Even with bounds present, a CRS with no path to Web Mercator is "no".
     meta = {
         "spatialreference": 'LOCAL_CS["unknown",UNIT["metre",1]]',
         "bounds.minx": 0.0,
@@ -271,30 +462,27 @@ def test_validate_point_cloud_crs_raises_when_center_unreachable_with_bounds():
         "bounds.miny": 0.0,
         "bounds.maxy": 100.0,
     }
-    with pytest.raises(ValueError, match="cannot be\\s+transformed to EPSG:3857"):
-        _validate_point_cloud_crs([("cloud.las", meta)], spatial_reference=None)
+    assert _crs_status([("cloud.las", meta)])["cloud.las"] == "no"
 
 
-def test_validate_point_cloud_crs_raises_when_no_crs_and_no_backup():
-    file_metadata = [("a.las", {"spatialreference": ""}), ("b.las", {})]
-    with pytest.raises(ValueError, match="could not determine a CRS"):
-        _validate_point_cloud_crs(file_metadata, spatial_reference=None)
+def test_crs_column_no_when_no_crs_and_no_backup():
+    status = _crs_status([("a.las", {"spatialreference": ""}), ("b.las", {})])
+    assert status["a.las"] == "no"
+    assert status["b.las"] == "no"
 
 
-def test_validate_point_cloud_crs_raises_when_crs_unreachable_from_3857():
+def test_crs_column_no_when_crs_unreachable_from_3857():
     # A local engineering CRS parses but has no transform to Web Mercator.
     local_crs = 'LOCAL_CS["unknown",UNIT["metre",1]]'
-    file_metadata = [("cloud.las", {"spatialreference": local_crs})]
-    with pytest.raises(ValueError, match="cannot be\\s+transformed to EPSG:3857"):
-        _validate_point_cloud_crs(file_metadata, spatial_reference=None)
+    assert _crs_status([("cloud.las", {"spatialreference": local_crs})])["cloud.las"] == "no"
 
 
-def test_validate_point_cloud_crs_raises_when_backup_unreachable_from_3857():
-    file_metadata = [("cloud.las", {"spatialreference": ""})]
-    with pytest.raises(ValueError, match="cannot be\\s+transformed to EPSG:3857"):
-        _validate_point_cloud_crs(
-            file_metadata, spatial_reference='LOCAL_CS["x",UNIT["metre",1]]'
-        )
+def test_crs_column_no_when_backup_unreachable_from_3857():
+    status = _crs_status(
+        [("cloud.las", {"spatialreference": ""})],
+        spatial_reference='LOCAL_CS["x",UNIT["metre",1]]',
+    )
+    assert status["cloud.las"] == "no"
 
 
 def test_load_input_sidecar_headered():
@@ -637,3 +825,131 @@ def test_merge_does_not_match_unrelated_paths(tmp_path):
     )
     merge_client_metadata(file_metadata, client_df)
     assert "GPSAltitude" not in dict(file_metadata)["a/1.jpg"]
+
+
+# ---- generation-side regressions ---------------------------------------------
+
+
+def test_reproject_skips_frames_without_gps_columns():
+    """A video-only scan has no GPS columns; --spatial-reference must not crash."""
+    df = build_sidecar_df(
+        [("a.mp4", {"Make": "DJI", "CreateDate": "2024:06:15 10:30:00"})],
+        field_groups_by_type={
+            "full_motion_video": _ALL_SIDECAR_FIELD_GROUPS[DataTypeEnum.video]
+        },
+        types_by_label={"a.mp4": "full_motion_video"},
+    )
+    assert "GPSLongitude" not in df.columns
+    _reproject_dataframe(df, "EPSG:32612", only_labels={"a.mp4"})
+
+
+def test_drop_preview_tifs_keeps_ortho_with_non_image_companions():
+    """Only a same-stem *photo* marks a .tif as a preview; footprints/point
+    clouds sharing the stem are legitimate companions of a real ortho."""
+    kept, dropped = drop_preview_tifs(
+        [
+            "ortho/site.tif",
+            "ortho/site.geojson",
+            "pc/scan.tif",
+            "pc/scan.las",
+            "img/R001.tif",
+            "img/R001.JPG",
+        ]
+    )
+    assert dropped == ["img/R001.tif"]
+    assert "ortho/site.tif" in kept and "pc/scan.tif" in kept
+
+
+def test_blank_optional_columns_survive_as_a_checklist():
+    """Orientation is blank when EXIF carries none, but the lint that follows
+    promotes it to required — the columns must stay for the customer to fill."""
+    df = _build_single_type(
+        [
+            (
+                "a.jpg",
+                {
+                    "GPSLatitude": "51",
+                    "GPSLongitude": "-114",
+                    "GPSAltitude": "1000",
+                    "CreateDate": "2024:06:15 10:30:00",
+                },
+            )
+        ],
+        ORIENTED_GROUPS,
+        "oriented_image",
+    )
+    keep = {
+        group[0]
+        for groups in (
+            _REQUIRED_SIDECAR_FIELD_GROUPS[DataTypeEnum.oriented_image],
+            _OPTIONAL_SIDECAR_FIELD_GROUPS[DataTypeEnum.oriented_image],
+        )
+        for group in groups
+    }
+    _drop_all_empty_columns(df, keep=keep)
+    df = _move_blank_columns_to_end(df)
+    assert {"Pitch", "Heading", "Roll"} <= set(df.columns)
+
+
+def _stub_build_sidecar(monkeypatch, df, backend):
+    monkeypatch.setattr(
+        sidecar_mod,
+        "_build_sidecar",
+        lambda **kwargs: (df, backend, {DataTypeEnum.point_cloud}, []),
+    )
+
+
+def _pc_df(flag: str):
+    return pd.DataFrame(
+        [
+            {"Filename": "DEFAULT", "DataType": "", _CRS_WEB_MERCATOR_COL: ""},
+            {
+                "Filename": "a.las",
+                "DataType": "point_cloud",
+                _CRS_WEB_MERCATOR_COL: flag,
+            },
+        ]
+    )
+
+
+def test_generate_does_not_write_unusable_sidecar_to_input_dir(tmp_path, monkeypatch):
+    """A point cloud that can't reach Web Mercator must not leave a sidecar Flow
+    can't ingest sitting in the customer's intake directory."""
+    indir = tmp_path / "client-bucket"
+    indir.mkdir()
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    _stub_build_sidecar(monkeypatch, _pc_df("no"), from_directory(str(indir)))
+
+    with pytest.raises(PointCloudCRSError) as excinfo:
+        sidecar_mod._generate(
+            directory=str(indir),
+            data_type=None,
+            output_filename="sidecar.csv",
+            client_sidecar=None,
+            client_schema=None,
+        )
+
+    assert excinfo.value.filenames == ["a.las"]
+    assert not (indir / "sidecar.csv").exists()
+    # A local diagnostic copy is still produced so the customer can see which
+    # rows failed (the crs_web_mercator_ok column).
+    assert excinfo.value.diagnostic_path == cwd / "sidecar.csv"
+    assert excinfo.value.diagnostic_path.exists()
+
+
+def test_generate_writes_when_crs_is_usable(tmp_path, monkeypatch):
+    indir = tmp_path / "client-bucket"
+    indir.mkdir()
+    monkeypatch.chdir(tmp_path)
+    _stub_build_sidecar(monkeypatch, _pc_df("yes"), from_directory(str(indir)))
+
+    sidecar_mod._generate(
+        directory=str(indir),
+        data_type=None,
+        output_filename="sidecar.csv",
+        client_sidecar=None,
+        client_schema=None,
+    )
+    assert (indir / "sidecar.csv").exists()

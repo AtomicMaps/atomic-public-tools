@@ -1,12 +1,12 @@
 """``am-tools validate`` — lint data without saving a sidecar.
 
-Does exactly what ``am-tools sidecar generate`` does — scan a directory,
+Does exactly what ``am-tools sidecar`` does — scan a directory,
 extract per-file metadata, assemble a sidecar, and lint it — but never writes
 the sidecar to the remote/local directory. It exists for the common case of
 "I just want to know whether my data is clean" without leaving a file behind.
 
 The metadata extraction, sidecar assembly, wizard prompts, and lint pathway are
-all shared with ``sidecar generate`` (see :mod:`atomic_tools.commands.sidecar`);
+all shared with ``sidecar`` (see :mod:`atomic_tools.commands.sidecar`);
 this module only swaps the persist step for an in-memory temp file that is
 linted and discarded.
 """
@@ -23,12 +23,15 @@ import typer
 
 from atomic_tools.commands.sidecar import (
     _build_sidecar,
+    _crs_failures,
     _echo_replay_command,
     _fail,
     _format_replay_command,
+    _raise_crs_failures_loudly,
     _run_interactive_wizard,
+    _warn_skipped_vectors,
 )
-from atomic_tools.utils.utils import DataTypeEnum
+from atomic_tools.utils.utils import DataTypeEnum, DataTypeFilter
 from atomic_tools.validators.sidecar import lint_sidecar_file
 
 logger = logging.getLogger(__name__)
@@ -36,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 def _validate(
     directory: str,
-    data_type: DataTypeEnum,
+    data_type: DataTypeEnum | None,
     client_sidecar: str | None,
     client_schema: str | None,
     full: bool = False,
@@ -51,7 +54,8 @@ def _validate(
         f"full={full} spatial_reference={spatial_reference!r} coco={coco!r}"
     )
 
-    df, _ = _build_sidecar(  # validate never persists, so the backend is unused
+    # validate never persists, so the backend is unused.
+    df, _, _detected, skipped_vector = _build_sidecar(
         directory=directory,
         data_type=data_type,
         client_sidecar=client_sidecar,
@@ -59,6 +63,7 @@ def _validate(
         full=full,
         spatial_reference=spatial_reference,
     )
+    crs_failures = _crs_failures(df)
 
     # Lint reads from a path, so stage the assembled sidecar in a throwaway temp
     # file rather than writing it back to the (possibly remote) input directory.
@@ -66,7 +71,7 @@ def _validate(
         local_csv = Path(tmp_dir) / "sidecar.csv"
         df.to_csv(local_csv, index=False)
         logger.info("Linting in-memory sidecar (not saved)…")
-        return lint_sidecar_file(
+        report = lint_sidecar_file(
             str(local_csv),
             final=True,
             data_type=data_type,
@@ -79,6 +84,7 @@ def _validate(
             # failure (it blocks only when generating a sidecar that ships).
             coco_not_on_disk_is_error=False,
         )
+        return report, skipped_vector, crs_failures
 
 
 def validate(
@@ -93,11 +99,14 @@ def validate(
         ),
     ] = None,
     data_type: Annotated[
-        DataTypeEnum | None,
+        DataTypeFilter | None,
         typer.Option(
             "--datatype",
             "--data-type",
-            help="Data type of the input data (e.g. 'oriented_image', 'point_cloud').",
+            help=(
+                "Optional filter: restrict to this data type. By default every "
+                "file is auto-detected per file (recommended)."
+            ),
             case_sensitive=False,
         ),
     ] = None,
@@ -181,7 +190,7 @@ def validate(
 ) -> None:
     """Scan a directory, extract metadata, and lint it — without saving a sidecar.
 
-    Identical to ``sidecar generate`` except nothing is written: no sidecar is
+    Identical to ``sidecar`` except nothing is written: no sidecar is
     saved to the input directory or locally. With no flags, prompts
     interactively for each value. Any flag passed on the command line is used
     as-is and not prompted for.
@@ -192,7 +201,14 @@ def validate(
     verbosity_choice = verbosity_state.choice
     verbosity_provided = verbosity_state.verbose or verbosity_state.silent
 
-    wizard_ran = directory is None or data_type is None
+    # --datatype is an optional filter; convert it to the full enum immediately.
+    data_type_enum: DataTypeEnum | None = (
+        DataTypeEnum(data_type.value) if data_type is not None else None
+    )
+
+    # The wizard now only runs when the directory is missing; --datatype being
+    # unset just means auto-detect, not "ask me".
+    wizard_ran = directory is None
     if wizard_ran:
         full_provided = (
             ctx.get_parameter_source("full") == click.core.ParameterSource.COMMANDLINE
@@ -205,7 +221,7 @@ def validate(
         # they're left at their defaults and ignored (hence save=False).
         result = _run_interactive_wizard(
             directory,
-            data_type,
+            data_type_enum,
             None,
             client_sidecar,
             client_schema,
@@ -222,7 +238,7 @@ def validate(
             save=False,
         )
         directory = result.directory
-        data_type = result.data_type
+        data_type_enum = result.data_type
         client_sidecar = result.client_sidecar
         client_schema = result.client_schema
         full = result.full
@@ -239,15 +255,14 @@ def validate(
 
     if not directory:
         raise typer.BadParameter("Directory is required.")
-    if data_type is None:
-        raise typer.BadParameter("Data type is required.")
+    # data_type is an optional filter now — None means auto-detect.
 
     if wizard_ran:
         _echo_replay_command(
             _format_replay_command(
                 ["validate"],
                 directory=directory,
-                data_type=data_type,
+                data_type=data_type_enum,
                 client_sidecar=client_sidecar,
                 client_schema=client_schema,
                 full=full,
@@ -259,9 +274,9 @@ def validate(
         )
 
     try:
-        report = _validate(
+        report, skipped_vector, crs_failures = _validate(
             directory=directory,
-            data_type=data_type,
+            data_type=data_type_enum,
             client_sidecar=client_sidecar,
             client_schema=client_schema,
             full=full,
@@ -273,5 +288,7 @@ def validate(
         _fail("Failed to validate data", e)
 
     typer.echo(report.render())
-    if report.has_errors():
+    _warn_skipped_vectors(skipped_vector)
+    _raise_crs_failures_loudly(crs_failures)
+    if report.has_errors() or crs_failures:
         raise typer.Exit(code=1)

@@ -1,9 +1,11 @@
+import logging
 import sys
 from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
 
+from atomic_tools import vendor_sync
 from atomic_tools.cli import app
 from atomic_tools.commands import update
 
@@ -18,6 +20,13 @@ class _Result:
 @pytest.fixture
 def fake_repo(tmp_path, monkeypatch):
     monkeypatch.setattr(update, "find_repo_root", lambda: tmp_path)
+    # Default: vendored refresh is unreachable (the client case) so it never
+    # touches disk or the network during these tests. Individual tests override.
+    monkeypatch.setattr(
+        update.vendor_sync,
+        "refresh",
+        lambda repo: vendor_sync.RefreshResult(available=False, changed={}),
+    )
     return tmp_path
 
 
@@ -116,6 +125,74 @@ def test_update_reports_missing_git(fake_repo, monkeypatch):
 
     assert result.exit_code == 1
     assert "PATH" in result.output
+
+
+def test_update_refresh_unreachable_is_silent_for_clients(fake_repo, monkeypatch, caplog):
+    """A client has no access to data-engineering, so the skip is a non-event:
+    the update succeeds and says nothing about it at default verbosity."""
+    monkeypatch.setattr(
+        update.subprocess, "run", lambda cmd, cwd: _Result(0)
+    )
+
+    with caplog.at_level(logging.INFO, logger="atomic_tools.commands.update"):
+        result = runner.invoke(app, ["update"])
+
+    assert result.exit_code == 0
+    assert "vendored" not in result.output.lower()
+    # …but the reason is there under --verbose.
+    assert any("not reachable" in rec.getMessage() for rec in caplog.records)
+
+
+def test_update_refresh_error_is_silent_for_clients(fake_repo, monkeypatch, caplog):
+    """Same for a regeneration failure — a client can't act on it, and drift on
+    a dev machine is caught by tests/test_vendored_drift.py, not by this line."""
+    monkeypatch.setattr(update.subprocess, "run", lambda cmd, cwd: _Result(0))
+
+    def boom(repo):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(update.vendor_sync, "refresh", boom)
+
+    with caplog.at_level(logging.INFO, logger="atomic_tools.commands.update"):
+        result = runner.invoke(app, ["update"])
+
+    assert result.exit_code == 0
+    assert "vendored" not in result.output.lower()
+    assert any("kaboom" in rec.getMessage() for rec in caplog.records)
+
+
+def test_update_refresh_up_to_date_is_silent(fake_repo, monkeypatch):
+    """Nothing changed is also a non-event — no console line."""
+    monkeypatch.setattr(update.subprocess, "run", lambda cmd, cwd: _Result(0))
+    monkeypatch.setattr(
+        update.vendor_sync,
+        "refresh",
+        lambda repo: vendor_sync.RefreshResult(
+            available=True, changed={"data_type_registry.py": False}
+        ),
+    )
+
+    result = runner.invoke(app, ["update"])
+
+    assert result.exit_code == 0
+    assert "vendored" not in result.output.lower()
+
+
+def test_update_refresh_changed_prompts_commit(fake_repo, monkeypatch):
+    monkeypatch.setattr(update.subprocess, "run", lambda cmd, cwd: _Result(0))
+    monkeypatch.setattr(
+        update.vendor_sync,
+        "refresh",
+        lambda repo: vendor_sync.RefreshResult(
+            available=True, changed={"data_type_registry.py": True, "field_registry.json": False}
+        ),
+    )
+
+    result = runner.invoke(app, ["update"])
+
+    assert result.exit_code == 0
+    assert "Refreshed vendored data-engineering files" in result.output
+    assert "data_type_registry.py" in result.output
 
 
 def test_update_listed_in_help():

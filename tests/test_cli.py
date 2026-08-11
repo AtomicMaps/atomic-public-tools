@@ -24,14 +24,15 @@ def test_root_help():
     assert "lint" in result.stdout
 
 
-def test_sidecar_help_lists_generate():
+def test_sidecar_is_a_direct_command():
+    # `am-tools sidecar` is the command itself now (no `generate` subcommand).
     result = runner.invoke(app, ["sidecar", "--help"])
     assert result.exit_code == 0
-    assert "generate" in result.stdout
+    assert "--directory" in result.stdout
 
 
-def test_sidecar_generate_help_lists_options():
-    result = runner.invoke(app, ["sidecar", "generate", "--help"])
+def test_sidecar_help_lists_options():
+    result = runner.invoke(app, ["sidecar", "--help"])
     assert result.exit_code == 0
     for flag in (
         "--directory",
@@ -44,9 +45,29 @@ def test_sidecar_generate_help_lists_options():
     assert "--bucket" not in result.stdout
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["sidecar", "--help"],
+        ["validate", "--help"],
+        ["lint", "sidecar", "--help"],
+    ],
+)
+def test_datatype_choices_exclude_non_scannable_types(argv):
+    """imagery / cad / vector must never appear as --datatype choices; the five
+    scannable filter types must."""
+    result = runner.invoke(app, argv, env={"COLUMNS": "300"})
+    assert result.exit_code == 0
+    out = result.stdout
+    for hidden in ("imagery", "cad", "vector"):
+        assert hidden not in out, f"{hidden!r} should not be a --datatype choice"
+    for shown in ("ortho_image", "oriented_image", "spherical_image", "point_cloud"):
+        assert shown in out
+
+
 def test_sidecar_generate_help_lists_spatial_reference():
     # Wide terminal so Rich doesn't truncate the long flag name.
-    result = runner.invoke(app, ["sidecar", "generate", "--help"], env={"COLUMNS": "200"})
+    result = runner.invoke(app, ["sidecar", "--help"], env={"COLUMNS": "200"})
     assert result.exit_code == 0
     assert "--spatial-reference" in result.stdout
 
@@ -104,7 +125,7 @@ def test_validate_help_omits_save_only_options():
 @pytest.mark.parametrize(
     "argv",
     [
-        ["sidecar", "generate", "--help"],
+        ["sidecar", "--help"],
         ["validate", "--help"],
         ["lint", "sidecar", "--help"],
     ],

@@ -15,7 +15,7 @@ import shlex
 import shutil
 import sys
 import tempfile
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, NamedTuple, NoReturn
 
@@ -32,7 +32,11 @@ from atomic_tools.client_sidecar import (
     load_and_clean_client_sidecar,
     merge_client_metadata,
 )
-from atomic_tools.io.storage import from_directory
+from atomic_tools.io.storage import (
+    StorageBackend,
+    from_directory,
+    normalize_directory,
+)
 from atomic_tools.utils.aws_errors import find_auth_error, print_help_block
 from atomic_tools.utils.coordinates import (
     WEB_MERCATOR_EPSG,
@@ -47,17 +51,24 @@ from atomic_tools.utils.extractors import (
     extract_pdal_metadata,
     find_pdal_bin,
     infer_date_from_filepath,
+    spherical_signals_from_exif,
 )
 from atomic_tools.utils.utils import (
     DATA_TYPE_INFO,
     DataTypeEnum,
+    DataTypeFilter,
     _split_path_components,
+    drop_preview_tifs,
     has_value,
+    infer_data_type,
     is_remote_uri,
 )
 from atomic_tools.validators.coco import IMAGE_DATA_TYPES
 from atomic_tools.validators.required_fields import (
     ALL_SIDECAR_FIELD_GROUPS as _ALL_SIDECAR_FIELD_GROUPS,
+)
+from atomic_tools.validators.required_fields import (
+    OPTIONAL_SIDECAR_FIELD_GROUPS as _OPTIONAL_SIDECAR_FIELD_GROUPS,
 )
 from atomic_tools.validators.required_fields import (
     REQUIRED_SIDECAR_FIELD_GROUPS as _REQUIRED_SIDECAR_FIELD_GROUPS,
@@ -67,15 +78,14 @@ from atomic_tools.validators.values import parse_elevation, to_decimal_degree
 
 logger = logging.getLogger(__name__)
 
-sidecar_app = typer.Typer(
-    no_args_is_help=True,
-    help="Generate a sidecar CSV by scanning a local or remote directory.",
-)
-
 # Image data types share the EXIF extractor and are the only types COCO label
 # impact applies to — IMAGE_DATA_TYPES is the single source of truth (coco.py).
 _VIDEO_DATA_TYPES = {DataTypeEnum.video}
 _POINT_CLOUD_DATA_TYPES = {DataTypeEnum.point_cloud}
+
+# Customer-facing per-point-cloud status column: did the effective CRS convert to
+# Web Mercator? Populated by _add_crs_web_mercator_column.
+_CRS_WEB_MERCATOR_COL = "crs_web_mercator_ok"
 
 
 def _fail(message: str, exc: Exception) -> NoReturn:
@@ -101,7 +111,7 @@ def _list_local_schemas() -> list[Path]:
 
 
 def _ask_directory() -> str:
-    return (
+    answer = (
         questionary.text(
             "Directory to scan:",
             instruction="(Local folder or object-store URI like s3://bucket/prefix)",
@@ -110,6 +120,9 @@ def _ask_directory() -> str:
         .unsafe_ask()
         .strip()
     )
+    # Translate a pasted AWS console/HTTPS URL to its s3:// URI (with a warning)
+    # here so the replay command echoed after the wizard shows the s3 link.
+    return normalize_directory(answer)
 
 
 def _ask_data_type() -> DataTypeEnum:
@@ -120,13 +133,35 @@ def _ask_data_type() -> DataTypeEnum:
     return DataTypeEnum(choice)
 
 
+_AUTO_DETECT_CHOICE = "Auto-detect (recommended)"
+
+
+def _ask_data_type_filter() -> DataTypeEnum | None:
+    """Prompt for an optional data-type filter; default is auto-detect.
+
+    Returns None for auto-detect (classify every file), else the chosen type.
+    """
+    choice = questionary.select(
+        "Data type filter:",
+        instruction=(
+            "(Auto-detect classifies every file; choose a type only to restrict "
+            "the scan to it)"
+        ),
+        choices=[_AUTO_DETECT_CHOICE, *(v.value for v in DataTypeFilter)],
+        default=_AUTO_DETECT_CHOICE,
+    ).unsafe_ask()
+    if choice == _AUTO_DETECT_CHOICE:
+        return None
+    return DataTypeEnum(choice)
+
+
 def _ask_ignore_missing_orientation() -> bool:
     return questionary.confirm(
         "Ignore missing orientation data (Pitch/Heading/Roll)?",
         instruction=(
             "(No — the default — treats a missing orientation field as an error; "
             "Yes downgrades it to a warning so the images still process, "
-            "appearing in Lens without orientation)"
+            "appearing in Lens without orientation) [y/N]"
         ),
         default=False,
     ).unsafe_ask()
@@ -379,16 +414,20 @@ def _fill_missing_dates_from_filepath(
 def _warn_missing_required_fields(
     file_metadata: list[tuple[str, dict]],
     required_field_groups: list[list[str]],
+    type_label: str | None = None,
 ) -> None:
     """Emit a loud warning when files lack required fields after the merge.
 
     A group is "satisfied" for a file if any field in the group is present
     (non-empty) in that file's metadata. For each unsatisfied group we log a
     structured WARNING and also print a bright-red message to stderr so the
-    operator notices that the client sidecar needs to be updated.
+    operator notices that the client sidecar needs to be updated. ``type_label``
+    prefixes the messages with the data type when a scan detected more than one.
     """
     if not file_metadata or not required_field_groups:
         return
+
+    prefix = f"[{type_label}] " if type_label else ""
 
     missing_by_group: list[tuple[str, list[str], list[str]]] = []
     for group in required_field_groups:
@@ -406,13 +445,14 @@ def _warn_missing_required_fields(
 
     total = len(file_metadata)
     logger.warning(
-        "Missing required metadata after client sidecar merge — see details below."
+        f"{prefix}Missing required metadata after client sidecar merge — "
+        "see details below."
     )
 
     header = (
-        f"MISSING REQUIRED METADATA: {len(missing_by_group)} required field(s) "
-        f"are not satisfied for every file. Update the client sidecar to "
-        f"provide values for the listed files."
+        f"{prefix}MISSING REQUIRED METADATA: {len(missing_by_group)} required "
+        f"field(s) are not satisfied for every file. Update the client sidecar "
+        f"to provide values for the listed files."
     )
     click.secho(header, fg="bright_red", bold=True, err=True, color=True)
 
@@ -440,30 +480,50 @@ def _canonicalize_keys(meta: dict, alias_to_canonical: dict[str, str]) -> dict:
     return out
 
 
+def _union_field_groups(
+    field_groups_by_type: dict[str, list[list[str]]],
+) -> list[list[str]]:
+    """Order-stable dedup of every detected type's field groups into one list."""
+    union: list[list[str]] = []
+    seen_ids: set[tuple[str, ...]] = set()
+    for groups in field_groups_by_type.values():
+        for group in groups:
+            gid = tuple(group)
+            if gid not in seen_ids:
+                seen_ids.add(gid)
+                union.append(group)
+    return union
+
+
 def build_sidecar_df(
     file_metadata: list[tuple[str, dict]],
-    required_field_groups: list[list[str]] | None = None,
+    field_groups_by_type: dict[str, list[list[str]]],
+    types_by_label: dict[str, str],
     full: bool = False,
 ):
     """Assemble the sidecar DataFrame.
 
     Layout:
-      - Row 0  : DEFAULT row — Filename="DEFAULT", all other columns empty
+      - Row 0  : DEFAULT row — Filename="DEFAULT", DataType="", other columns empty
       - Row 1+ : one row per file with extracted metadata values, sorted by Filename
-      - Col 0  : "Filename" (basename of the source key/path)
+      - Col 0  : "Filename" (disambiguated basename of the source key/path)
+      - Col 1  : "DataType" (the detected type per file; "" on DEFAULT)
 
-    Required field groups are checked per-file: if any file lacks all alternatives
-    for a group, the canonical (first) field name is prepended as a blank column.
-
-    When `full` is False, only columns belonging to `required_field_groups` are
-    kept; everything else extracted from the source files is dropped.
+    ``field_groups_by_type`` maps each *detected* data type (value string) to its
+    field groups; ``types_by_label`` maps each file's display label to its type.
+    Alias canonicalization and (when ``full`` is False) column selection use the
+    union of all detected types' groups. Blank required columns are prepended
+    **per type**: a group's canonical is prepended iff some row *of that type*
+    lacks every field in the group — so a mixed scan never pollutes image rows
+    with blank point-cloud columns or vice versa.
     """
     import pandas as pd
 
     if not file_metadata:
-        return pd.DataFrame(columns=["Filename"])
+        return pd.DataFrame(columns=["Filename", "DataType"])
 
-    alias_to_canonical = build_global_alias_map(required_field_groups or [])
+    union_groups = _union_field_groups(field_groups_by_type)
+    alias_to_canonical = build_global_alias_map(union_groups)
     file_metadata = [
         (filename, _canonicalize_keys(_split_gps_position(meta), alias_to_canonical))
         for filename, meta in file_metadata
@@ -478,31 +538,44 @@ def build_sidecar_df(
                 seen.add(col)
 
     if not full:
-        allowed = {field for group in (required_field_groups or []) for field in group}
+        allowed = {field for group in union_groups for field in group}
         all_cols = [c for c in all_cols if c in allowed]
 
+    # Per-type blank-column prepending: only prepend a group's canonical when a
+    # row *of that type* is missing every field in the group.
     prepend_cols: list[str] = []
-    if required_field_groups:
-        for group in required_field_groups:
+    for type_value, groups in field_groups_by_type.items():
+        rows_of_type = [
+            meta for label, meta in file_metadata if types_by_label.get(label) == type_value
+        ]
+        if not rows_of_type:
+            continue
+        for group in groups:
             canonical = group[0]
             all_covered = all(
-                any(field in meta for field in group) for _, meta in file_metadata
+                any(field in meta for field in group) for meta in rows_of_type
             )
             if not all_covered and canonical not in prepend_cols:
                 prepend_cols.append(canonical)
 
     all_cols = prepend_cols + [c for c in all_cols if c not in prepend_cols]
-    columns = ["Filename", *all_cols]
+    columns = ["Filename", "DataType", *all_cols]
 
     rows = [
-        {"Filename": filename, **{col: meta.get(col, "") for col in all_cols}}
+        {
+            "Filename": filename,
+            "DataType": types_by_label.get(filename, ""),
+            **{col: meta.get(col, "") for col in all_cols},
+        }
         for filename, meta in file_metadata
     ]
     df = pd.DataFrame(rows, columns=columns)
-    df = df.sort_values(by="Filename", kind="stable", ignore_index=True)
+    # DEFAULT is always first (prepended below); the rest sort by DataType then
+    # Filename so rows of the same type group together, alphabetically within.
+    df = df.sort_values(by=["DataType", "Filename"], kind="stable", ignore_index=True)
 
     default_row = pd.DataFrame(
-        [{"Filename": "DEFAULT", **{col: "" for col in all_cols}}]
+        [{"Filename": "DEFAULT", "DataType": "", **{col: "" for col in all_cols}}]
     )
     return pd.concat([default_row, df], ignore_index=True)
 
@@ -523,12 +596,24 @@ def _add_file_srs_column(df, file_metadata: list[tuple[str, dict]]) -> None:
     df["file_srs"] = df["Filename"].map(lambda name: crs_by_label.get(name, ""))
 
 
-def _reproject_dataframe(df, in_srs: str) -> None:
+def _reproject_dataframe(df, in_srs: str, only_labels: set[str] | None = None) -> None:
     """Reproject GPSLongitude/GPSLatitude (and GPSAltitude as Z) from `in_srs`
     to EPSG:4326 in place, skipping the DEFAULT row and unparseable coordinates.
+
+    When ``only_labels`` is given, only rows whose Filename is in that set are
+    reprojected — used in mixed scans to reproject image/video rows while
+    leaving point-cloud rows (which carry a CRS per-file) untouched.
+
+    No-op when the frame has no GPS columns at all: video field groups carry no
+    coordinates, so a video-only (or point-cloud + video) scan reaches here with
+    neither column present.
     """
+    if "GPSLongitude" not in df.columns or "GPSLatitude" not in df.columns:
+        return
     for idx in df.index:
         if df.at[idx, "Filename"] == "DEFAULT":
+            continue
+        if only_labels is not None and df.at[idx, "Filename"] not in only_labels:
             continue
         lon = to_decimal_degree(df.at[idx, "GPSLongitude"])
         lat = to_decimal_degree(df.at[idx, "GPSLatitude"])
@@ -568,72 +653,275 @@ def _bbox_center_from_meta(meta: dict) -> tuple[float, float, float | None] | No
     return cx, cy, midpoint("bounds.minz", "bounds.maxz")
 
 
-def _validate_point_cloud_crs(
-    file_metadata: list[tuple[str, dict]],
+def _crs_reaches_web_mercator(meta: dict, crs: str) -> bool:
+    """True if ``crs`` transforms to EPSG:3857 for this file.
+
+    Prefers transforming the file's actual bounding-box center into EPSG:3857 (a
+    stricter test than merely building a transformer — it also catches a CRS that
+    maps real coordinates to non-finite values), falling back to a CRS-only check
+    when bounds are unavailable.
+    """
+    center = _bbox_center_from_meta(meta)
+    if center is not None:
+        return transform_center_to_web_mercator(*center, crs) is not None
+    return can_transform_to_web_mercator(crs)
+
+
+def _add_crs_web_mercator_column(
+    df,
+    pc_metadata: list[tuple[str, dict]],
     spatial_reference: str | None,
 ) -> None:
-    """Ensure every point cloud has a CRS reachable from EPSG:3857.
+    """Add a customer-facing ``crs_web_mercator_ok`` status column for point clouds.
 
-    Flow renders point clouds in Web Mercator, so each file must resolve to a
-    CRS pyproj can transform there. The CRS is whatever PDAL read from the file
-    header, falling back to the ``--spatial-reference`` backup when the header
-    has none. The transformability check actually transforms the file's
-    bounding-box center into EPSG:3857 (a stricter test than merely building a
-    transformer — it also catches a CRS that maps real coordinates to non-finite
-    values), falling back to a CRS-only check when bounds are unavailable. Raises
-    ``ValueError`` if any file ends up with no CRS at all, or with a CRS that
-    cannot be transformed to EPSG:3857.
+    Flow renders point clouds in Web Mercator, so each one must resolve to a CRS
+    pyproj can transform to EPSG:3857 — its header CRS (``file_srs``), else the
+    ``--spatial-reference`` fallback (``fallback_srs``). For every point-cloud row
+    this records ``"yes"`` when that effective CRS converts successfully and
+    ``"no"`` when it is missing or cannot be converted (a row the customer needs
+    to fix). Blank on non-point-cloud rows and the DEFAULT row. Rows marked
+    ``"no"`` are also reported as lint errors, so the status is a convenience, not
+    a substitute for the linter's blocking check.
     """
-    missing: list[str] = []
-    untransformable: list[str] = []
-
-    for label, meta in file_metadata:
+    status: dict[str, str] = {}
+    for label, meta in pc_metadata:
         crs = extract_pdal_crs(meta) or spatial_reference
-        if not crs:
-            missing.append(label)
-            continue
-        center = _bbox_center_from_meta(meta)
-        if center is not None:
-            transformable = transform_center_to_web_mercator(*center, crs) is not None
+        status[label] = "yes" if crs and _crs_reaches_web_mercator(meta, crs) else "no"
+    df[_CRS_WEB_MERCATOR_COL] = df["Filename"].map(lambda name: status.get(name, ""))
+
+
+def _crs_failures(df) -> list[str]:
+    """Filenames of point-cloud rows whose CRS could not convert to Web Mercator.
+
+    Reads the ``crs_web_mercator_ok`` column (present only when the scan found
+    point clouds); a row is a failure when that flag is ``"no"``.
+    """
+    if _CRS_WEB_MERCATOR_COL not in df.columns:
+        return []
+    flag = df[_CRS_WEB_MERCATOR_COL].astype(str).str.strip()
+    return df.loc[flag == "no", "Filename"].tolist()
+
+
+class PointCloudCRSError(RuntimeError):
+    """Point clouds whose CRS can't reach Web Mercator, raised before any write.
+
+    Carries the offending filenames (for the loud end-of-run banner) and the path
+    of the local diagnostic CSV written in place of the real sidecar.
+    """
+
+    def __init__(self, filenames: list[str], diagnostic_path: Path) -> None:
+        super().__init__(
+            f"{len(filenames)} point cloud(s) could not be converted to "
+            f"Web Mercator ({WEB_MERCATOR_EPSG})."
+        )
+        self.filenames = filenames
+        self.diagnostic_path = diagnostic_path
+
+
+def _raise_crs_failures_loudly(crs_failures: list[str]) -> None:
+    """Print an unmissable bright-red error for point clouds that fail CRS conversion.
+
+    The linter already records these as errors (so the run exits non-zero); this
+    additionally surfaces them as a loud banner at the very end of the run, where
+    they won't be lost among the rest of the lint report. No-op when nothing failed.
+    """
+    if not crs_failures:
+        return
+    sample = crs_failures if len(crs_failures) <= 10 else crs_failures[:10] + ["…"]
+    click.secho(
+        f"\nERROR: {len(crs_failures)} point cloud(s) could not be converted to "
+        f"Web Mercator ({WEB_MERCATOR_EPSG}) — their CRS is missing or invalid, so "
+        f"Flow cannot ingest them: {sample}",
+        fg="bright_red",
+        bold=True,
+        err=True,
+        color=True,
+    )
+    click.secho(
+        f"  Fix the CRS in the file(s), or re-run with a valid --spatial-reference. "
+        f"See the '{_CRS_WEB_MERCATOR_COL}' column (rows marked 'no').",
+        fg="bright_red",
+        err=True,
+        color=True,
+    )
+
+
+def _union_include_extensions() -> list[str]:
+    """Union (order-stable) of every data type's ``include`` extensions.
+
+    Used for auto-detect listing: we list everything and let ``infer_data_type``
+    (which applies per-type excludes itself) do the classification. Vector is
+    included so vector files can be counted and warned about.
+    """
+    union: list[str] = []
+    for info in DATA_TYPE_INFO.values():
+        for ext in info.get("include") or []:
+            if ext not in union:
+                union.append(ext)
+    return union
+
+
+# Camera/software-generated derivative files (previews, thumbnails, annotation
+# sidecars) that are never source data. In auto-detect these fail classification
+# — they match a data type's ``exclude`` patterns — but they are expected noise,
+# not "unknown types", so they are skipped silently rather than warned about.
+_IGNORED_DERIVATIVE_SUFFIXES = (
+    "previewimage.jpg",
+    "thumbnailimage.jpg",
+    "_thumbnail.jpg",
+    "_thumbnail.jpeg",
+    "_thumbnail.png",
+    "annotation.json",
+)
+
+
+def _is_ignorable_derivative(key: str) -> bool:
+    """True for preview/thumbnail/derivative files that should be skipped quietly.
+
+    Matches the known derivative suffixes above — the exact patterns a data type's
+    ``exclude`` list rejects, which are what make ``infer_data_type`` return None
+    for these files in the first place.
+    """
+    return Path(key).name.lower().endswith(_IGNORED_DERIVATIVE_SUFFIXES)
+
+
+def _classify_keys(
+    keys: list[str],
+) -> tuple[dict[str, DataTypeEnum], list[str], list[str]]:
+    """Filename-only classification of listed keys for auto-detect mode.
+
+    Returns ``(types_by_key, unclassified, vector_keys)``. ``types_by_key`` holds
+    only supported (non-vector, classified) keys. Preview/thumbnail derivatives
+    are dropped silently (see ``_is_ignorable_derivative``) — they never reach
+    ``unclassified``, so they don't trigger the "no known data type" warning.
+    """
+    types_by_key: dict[str, DataTypeEnum] = {}
+    unclassified: list[str] = []
+    vector_keys: list[str] = []
+    ignored: list[str] = []
+    for key in keys:
+        inferred = infer_data_type(key)
+        if inferred is None:
+            (ignored if _is_ignorable_derivative(key) else unclassified).append(key)
+        elif inferred == DataTypeEnum.vector.value:
+            vector_keys.append(key)
         else:
-            transformable = can_transform_to_web_mercator(crs)
-        if not transformable:
-            untransformable.append(label)
+            types_by_key[key] = DataTypeEnum(inferred)
+    if ignored:
+        logger.debug(
+            f"Silently skipped {len(ignored)} preview/thumbnail derivative file(s)."
+        )
+    return types_by_key, unclassified, vector_keys
 
-    if missing:
-        preview = ", ".join(missing[:10]) + (" …" if len(missing) > 10 else "")
-        raise ValueError(
-            f"PDAL could not determine a CRS for {len(missing)} point cloud "
-            f"file(s) and no backup CRS was provided. Re-run with "
-            f"--spatial-reference (e.g. 'EPSG:32612') to supply one. "
-            f"Affected files: {preview}"
-        )
 
-    if untransformable:
-        preview = ", ".join(untransformable[:10]) + (
-            " …" if len(untransformable) > 10 else ""
+def _warn_skipped(keys: list[str], message: str) -> None:
+    sample = keys[:5]
+    suffix = f" (+{len(keys) - 5} more)" if len(keys) > 5 else ""
+    logger.warning(f"{message}: {sample}{suffix}")
+
+
+def _warn_skipped_vectors(vector_keys: list[str]) -> None:
+    """Report vector files skipped during the scan (called once, at the end).
+
+    Vector sidecar generation isn't supported, so vector files are silently
+    passed over while scanning; this surfaces the skip after the run so it isn't
+    lost among the per-file progress output.
+    """
+    if not vector_keys:
+        return
+    sample = vector_keys[:5]
+    suffix = f" (+{len(vector_keys) - 5} more)" if len(vector_keys) > 5 else ""
+    click.secho(
+        f"\nNote: {len(vector_keys)} vector file(s) were skipped — vector sidecar "
+        f"generation is not supported: {sample}{suffix}",
+        fg="yellow",
+        err=True,
+    )
+
+
+def _drop_preview_tifs(keys: list[str]) -> list[str]:
+    """Drop generated preview ``.tif`` files, logging what was skipped.
+
+    The rule itself lives in ``utils.drop_preview_tifs`` so the linter's
+    ``--input-files`` inventory applies the same one and doesn't flag the files
+    generation deliberately left out.
+    """
+    kept, dropped = drop_preview_tifs(keys)
+    if dropped:
+        sample = dropped[:5]
+        suffix = f" (+{len(dropped) - 5} more)" if len(dropped) > 5 else ""
+        logger.info(
+            f"Ignored {len(dropped)} preview .tif file(s) that share a name with "
+            f"an image in the same folder: {sample}{suffix}"
         )
-        raise ValueError(
-            f"The CRS for {len(untransformable)} point cloud file(s) cannot be "
-            f"transformed to {WEB_MERCATOR_EPSG} by pyproj, so it cannot be "
-            f"used. Affected files: {preview}"
+    return kept
+
+
+def _drop_all_empty_columns(df, keep: set[str] | None = None) -> None:
+    """Drop columns whose every value is blank, in place.
+
+    ``Filename`` and ``DataType`` are always kept, as is any column in ``keep``
+    (the required and optional fields for the detected types — a blank one is
+    left in place as a checklist of what still needs filling). A non-protected
+    column survives only if some cell (including the DEFAULT row) holds a value —
+    so ``fallback_srs`` (set only on DEFAULT) stays, while columns no file
+    populated are removed entirely.
+    """
+    protected = {"Filename", "DataType"} | (keep or set())
+    empty_cols = [
+        col
+        for col in df.columns
+        if col not in protected and not df[col].map(has_value).any()
+    ]
+    if empty_cols:
+        logger.info(
+            f"Dropping {len(empty_cols)} unfillable column(s) with no values "
+            f"in any row: {empty_cols}"
         )
+        df.drop(columns=empty_cols, inplace=True)
+
+
+def _move_blank_columns_to_end(df):
+    """Return ``df`` with every all-blank column moved to the right edge.
+
+    After ``_drop_all_empty_columns`` the only all-blank columns left are the
+    protected checklist fields; grouping them at the end keeps the populated
+    columns (``Filename``/``DataType`` first, then real data) together on the
+    left and pushes the empty checklist columns out of the way.
+    """
+    blank = [col for col in df.columns if not df[col].map(has_value).any()]
+    if not blank:
+        return df
+    non_blank = [col for col in df.columns if col not in blank]
+    logger.info(f"Moving {len(blank)} all-blank column(s) to the end: {blank}")
+    return df[non_blank + blank]
 
 
 def _build_sidecar(
     directory: str,
-    data_type: DataTypeEnum,
+    data_type: DataTypeEnum | None,
     client_sidecar: str | None,
     client_schema: str | None,
     full: bool = False,
     spatial_reference: str | None = None,
-):
+) -> tuple["object", StorageBackend, set[DataTypeEnum], list[str]]:
     """Scan a directory, extract metadata, and assemble the sidecar DataFrame.
 
-    This is the shared core of both ``sidecar generate`` and ``validate``: it
+    This is the shared core of both ``sidecar`` and ``validate``: it
     does everything up to (but not including) writing the CSV anywhere. Returns
-    ``(df, backend)`` so callers can either persist the sidecar (``generate``)
-    or lint it from a throwaway temp file without saving (``validate``).
+    ``(df, backend, detected_types, skipped_vector_keys)`` so callers can persist
+    the sidecar (``generate``) or lint it from a throwaway temp file
+    (``validate``), log what was detected, and report skipped vector files at the
+    end of the run rather than mid-scan.
+
+    ``data_type`` is an optional filter/override:
+
+    * ``None`` (auto): every file is classified with ``infer_data_type`` — the
+      same code the backend uses. Ambiguous images are refined oriented↔spherical
+      from EXIF signals. Unclassified and vector files are skipped with a warning.
+    * an explicit type: byte-identical to the pre-auto behaviour — single-type
+      include/exclude listing, no spherical refinement (a client passing
+      ``--datatype spherical_image`` must not have panoramas reclassified).
     """
     if spatial_reference:
         # Fail fast on an unparseable CRS before doing any extraction work.
@@ -648,62 +936,72 @@ def _build_sidecar(
                 "spatial reference (try e.g. 'EPSG:32612' or '32612')."
             ) from None
 
-    if data_type == DataTypeEnum.vector:
-        raise NotImplementedError(
-            "Vector data type is not yet supported for sidecar CSV generation."
-        )
-
-    if data_type not in DATA_TYPE_INFO:
-        raise ValueError(
-            f"Unsupported data_type '{data_type}'. Valid values: {list(DATA_TYPE_INFO.keys())}"
-        )
-
     backend = from_directory(directory)
-    info = DATA_TYPE_INFO[data_type]
-    include = list(info.get("include") or [])
-    exclude = list(info.get("exclude") or [])
 
-    keys = backend.list_keys(include=include, exclude=exclude)
-    if not keys:
-        raise RuntimeError(
-            f"No valid files found for '{data_type}' in {backend.display_root}"
+    if data_type is not None:
+        # --- Explicit override: single-type listing, no refinement. ---
+        if data_type == DataTypeEnum.vector:
+            raise NotImplementedError(
+                "Vector data type is not yet supported for sidecar CSV generation."
+            )
+        if data_type not in DATA_TYPE_INFO:
+            raise ValueError(
+                f"Unsupported data_type '{data_type}'. "
+                f"Valid values: {list(DATA_TYPE_INFO.keys())}"
+            )
+        info = DATA_TYPE_INFO[data_type]
+        keys = backend.list_keys(
+            include=list(info.get("include") or []),
+            exclude=list(info.get("exclude") or []),
         )
+        if not keys:
+            raise RuntimeError(
+                f"No valid files found for '{data_type.value}' in {backend.display_root}"
+            )
+        types_by_key: dict[str, DataTypeEnum] = {key: data_type for key in keys}
+        vector_keys: list[str] = []
+    else:
+        # --- Auto-detect: list everything, classify per file. ---
+        keys = backend.list_keys(include=_union_include_extensions(), exclude=[])
+        keys = _drop_preview_tifs(keys)
+        types_by_key, unclassified, vector_keys = _classify_keys(keys)
+        if unclassified:
+            _warn_skipped(
+                unclassified,
+                f"{len(unclassified)} file(s) matched no known data type and were skipped",
+            )
+        # Vector files are unsupported, but we don't interrupt the scan to say so
+        # — the skip is reported once at the end (see _run_generate / _validate).
+        if not types_by_key:
+            raise RuntimeError(f"No supported files found in {backend.display_root}")
 
-    total = len(keys)
+    supported_keys = list(types_by_key)
+    total = len(supported_keys)
     logger.info(f"Found {total} file(s) to process in {backend.display_root}.")
 
-    is_image_or_video = data_type in (IMAGE_DATA_TYPES | _VIDEO_DATA_TYPES)
-    is_point_cloud = data_type in _POINT_CLOUD_DATA_TYPES
-
-    if not (is_image_or_video or is_point_cloud):
-        raise ValueError(f"Unhandled data type for metadata extraction: {data_type}")
-
-    display_labels = _disambiguate_filenames(keys)
+    display_labels = _disambiguate_filenames(supported_keys)
     display_to_key = {v: k for k, v in display_labels.items()}
-    n_disambiguated = sum(1 for k, v in display_labels.items() if v != Path(k).name)
+    n_disambiguated = sum(
+        1 for k, v in display_labels.items() if v != Path(k).name
+    )
     if n_disambiguated:
         logger.info(
             f"Disambiguated {n_disambiguated} file(s) whose basenames collided "
             f"by prepending parent directories."
         )
 
-    file_metadata: list[tuple[str, dict]] = []
-    empty_count = 0
-    tool = "EXIF" if is_image_or_video else "PDAL"
-
     # For point clouds, confirm pdal is available up front so we fail fast with
     # install instructions instead of logging the same "pdal not found" warning
     # once per file as we walk the directory.
-    if is_point_cloud:
+    if any(t == DataTypeEnum.point_cloud for t in types_by_key.values()):
         find_pdal_bin()
 
-    # Progress bar renders to stderr only when attached to a TTY; on a pipe or
-    # in a log file tqdm suppresses it (``disable=None``), so non-interactive
-    # runs stay clean. The "<looked-at>/<total>" count is shown by default; the
-    # postfix shows the file currently being processed.
+    file_metadata: list[tuple[str, dict]] = []
+    empty_count = 0
+
     with tqdm(
-        keys,
-        desc=f"Extracting {tool} metadata",
+        supported_keys,
+        desc="Extracting metadata",
         unit="file",
         file=sys.stderr,
         disable=None,
@@ -711,12 +1009,24 @@ def _build_sidecar(
         for i, key in enumerate(progress_keys, 1):
             progress_keys.set_postfix_str(Path(key).name if key else "")
             display_label = display_labels[key]
+            key_type = types_by_key[key]
+            is_pc = key_type == DataTypeEnum.point_cloud
+            tool = "PDAL" if is_pc else "EXIF"
             logger.info(f"[{i}/{total}] Extracting {tool}: {key}")
             with backend.open_local(key) as local_path:
-                if is_image_or_video:
-                    meta = extract_exif_metadata(local_path, filename=display_label)
-                else:
+                if is_pc:
                     meta = extract_pdal_metadata(local_path, filename=display_label)
+                else:
+                    meta = extract_exif_metadata(local_path, filename=display_label)
+                    # Auto mode only: refine ambiguous images oriented↔spherical
+                    # from EXIF signals. The filename already chose the (shared)
+                    # EXIF extractor, so this never changes which extractor ran.
+                    if data_type is None and key_type in IMAGE_DATA_TYPES:
+                        refined = infer_data_type(
+                            key, **spherical_signals_from_exif(meta)
+                        )
+                        if refined is not None:
+                            types_by_key[key] = DataTypeEnum(refined)
             if not meta:
                 empty_count += 1
                 logger.warning(f"No {tool} metadata returned for {key}")
@@ -728,10 +1038,22 @@ def _build_sidecar(
             "those rows will have blank fields in the sidecar."
         )
 
-    # Point clouds must carry a CRS that reaches Web Mercator; fail fast here
-    # (before merging/building) rather than emit a sidecar Flow can't ingest.
-    if is_point_cloud:
-        _validate_point_cloud_crs(file_metadata, spatial_reference)
+    detected_types = set(types_by_key.values())
+    counts = Counter(t.value for t in types_by_key.values())
+    detected_summary = ", ".join(f"{n} {name}" for name, n in sorted(counts.items()))
+    logger.info(f"Detected: {detected_summary}")
+
+    # Per-file display-label → type-value string, reflecting any refinement.
+    types_by_label: dict[str, str] = {
+        display_labels[k]: t.value for k, t in types_by_key.items()
+    }
+
+    def _labels_for(*want: DataTypeEnum) -> set[str]:
+        want_set = set(want)
+        return {display_labels[k] for k, t in types_by_key.items() if t in want_set}
+
+    pc_labels = _labels_for(DataTypeEnum.point_cloud)
+    pc_metadata = [(label, meta) for label, meta in file_metadata if label in pc_labels]
 
     if client_sidecar:
         client_url = client_sidecar.strip()
@@ -743,56 +1065,105 @@ def _build_sidecar(
             schema_path=client_schema,
             required_field_groups=_ALL_SIDECAR_FIELD_GROUPS,
         )
+        # A client-supplied DataType column would clobber the detected value on
+        # merge; the detection is authoritative, so drop it with a warning.
+        if "DataType" in client_df.columns:
+            logger.warning(
+                "Client sidecar has a 'DataType' column; dropping it — the "
+                "auto-detected type is authoritative."
+            )
+            client_df = client_df.drop(columns=["DataType"])
         merge_client_metadata(file_metadata, client_df)
 
-    # All groups (required + optional) drive canonicalization, column selection,
-    # the DataFrame build, and date inference; only the loud "missing required
-    # metadata" warning is restricted to truly-required groups.
-    field_groups = _ALL_SIDECAR_FIELD_GROUPS.get(data_type, [])
-    required_field_groups = list(_REQUIRED_SIDECAR_FIELD_GROUPS.get(data_type, []))
-    _fill_missing_dates_from_filepath(file_metadata, field_groups, display_to_key)
+    # Per detected type: canonicalize + date-infer + warn on its own row subset
+    # and field groups. All (required + optional) groups drive canonicalization/
+    # column selection; only the loud warning is restricted to required groups.
+    field_groups_by_type: dict[str, list[list[str]]] = {}
+    multi = len(detected_types) > 1
+    for detected in detected_types:
+        type_value = detected.value
+        field_groups = _ALL_SIDECAR_FIELD_GROUPS.get(detected, [])
+        field_groups_by_type[type_value] = field_groups
+        required_field_groups = list(_REQUIRED_SIDECAR_FIELD_GROUPS.get(detected, []))
+        labels_of_type = _labels_for(detected)
+        subset = [
+            (label, meta) for label, meta in file_metadata if label in labels_of_type
+        ]
+        _fill_missing_dates_from_filepath(subset, field_groups, display_to_key)
+        _warn_missing_required_fields(
+            subset, required_field_groups, type_label=type_value if multi else None
+        )
 
     logger.info(f"Building sidecar DataFrame for {len(file_metadata)} file(s).")
-    _warn_missing_required_fields(file_metadata, required_field_groups)
     df = build_sidecar_df(
         file_metadata,
-        required_field_groups=field_groups,
+        field_groups_by_type=field_groups_by_type,
+        types_by_label=types_by_label,
         full=full,
     )
     logger.info(
-        f"Sidecar DataFrame: {len(df)} row(s) (including DEFAULT), {len(df.columns)} column(s)."
+        f"Sidecar DataFrame: {len(df)} row(s) (including DEFAULT), "
+        f"{len(df.columns)} column(s)."
     )
 
-    if is_point_cloud:
-        # Record each file's header CRS (with or without --spatial-reference) so
-        # the linter can convert every row's bounds into the goal CRS.
-        _add_file_srs_column(df, file_metadata)
+    if pc_metadata:
+        # Record each point cloud's header CRS (with or without
+        # --spatial-reference) so the linter can convert bounds into the goal CRS.
+        _add_file_srs_column(df, pc_metadata)
+        # Customer-facing flag: did each point cloud's effective CRS convert to
+        # Web Mercator? (Uses the same fallback the linter does; rows marked "no"
+        # are also reported as lint errors.)
+        _add_crs_web_mercator_column(df, pc_metadata, spatial_reference)
 
     if spatial_reference:
-        if is_point_cloud:
+        # Mixed content does BOTH: record the point-cloud fallback CRS on DEFAULT
+        # and reproject image/video coordinates.
+        if pc_metadata:
             logger.info(
                 f"Recording fallback_srs={spatial_reference!r} in the DEFAULT row."
             )
             _add_spatial_reference_column(df, spatial_reference)
-        elif is_image_or_video:
+        iv_labels = _labels_for(*IMAGE_DATA_TYPES, *_VIDEO_DATA_TYPES)
+        if iv_labels:
             logger.info(
-                f"Reprojecting coordinates from {spatial_reference!r} to EPSG:4326."
+                f"Reprojecting image/video coordinates from {spatial_reference!r} "
+                "to EPSG:4326."
             )
-            _reproject_dataframe(df, spatial_reference)
+            _reproject_dataframe(df, spatial_reference, only_labels=iv_labels)
 
-    return df, backend
+    # Drop columns no file populated (kept last so file_srs/fallback_srs, added
+    # above, are considered). Both required *and* optional fields for the
+    # detected types are protected even when blank — they stay as a checklist for
+    # the customer to fill in. Optional matters as much as required here:
+    # orientation (Pitch/Heading/Roll) is optional-by-default for oriented images
+    # but the lint that immediately follows promotes it to required unless
+    # --ignore-missing-orientation, so dropping the blank columns would tell the
+    # customer to add back a column this tool just removed.
+    checklist_canonicals = {
+        group[0]
+        for detected in detected_types
+        for groups in (
+            _REQUIRED_SIDECAR_FIELD_GROUPS.get(detected, []),
+            _OPTIONAL_SIDECAR_FIELD_GROUPS.get(detected, []),
+        )
+        for group in groups
+    }
+    _drop_all_empty_columns(df, keep=checklist_canonicals)
+    df = _move_blank_columns_to_end(df)
+
+    return df, backend, detected_types, vector_keys
 
 
 def _generate(
     directory: str,
-    data_type: DataTypeEnum,
+    data_type: DataTypeEnum | None,
     output_filename: str,
     client_sidecar: str | None,
     client_schema: str | None,
     full: bool = False,
     local_copy: bool = False,
     spatial_reference: str | None = None,
-) -> str:
+) -> tuple[str, list[str]]:
     logger.info(
         f"Starting sidecar CSV generation — directory={directory!r} "
         f"data_type={data_type} output={output_filename!r} "
@@ -800,7 +1171,7 @@ def _generate(
         f"full={full} local_copy={local_copy} spatial_reference={spatial_reference!r}"
     )
 
-    df, backend = _build_sidecar(
+    df, backend, _detected, vector_keys = _build_sidecar(
         directory=directory,
         data_type=data_type,
         client_sidecar=client_sidecar,
@@ -808,11 +1179,21 @@ def _generate(
         full=full,
         spatial_reference=spatial_reference,
     )
+    crs_failures = _crs_failures(df)
 
     local_copy_path: Path | None = None
     with tempfile.TemporaryDirectory() as tmp_dir:
         local_csv = Path(tmp_dir) / output_filename
         df.to_csv(local_csv, index=False)
+        if crs_failures:
+            # Flow cannot ingest this sidecar, so it must not land in the input
+            # directory — that is usually the customer's intake bucket, where a
+            # downstream watcher would pick it up. Keep a local diagnostic copy
+            # (its crs_web_mercator_ok column marks the offending rows) and stop
+            # before writing anything remote.
+            diagnostic_path = Path.cwd() / output_filename
+            shutil.copy2(local_csv, diagnostic_path)
+            raise PointCloudCRSError(crs_failures, diagnostic_path)
         logger.info(f"Writing sidecar CSV to {backend.display_root}/{output_filename}")
         sidecar_path = backend.write_output(output_filename, local_csv)
         if local_copy:
@@ -829,13 +1210,13 @@ def _generate(
             f"Local copy at: {local_copy_path}", fg="green", bold=True, err=True
         )
 
-    return sidecar_path
+    return sidecar_path, vector_keys
 
 
 def _format_replay_command(
     subcommand: list[str],
     directory: str,
-    data_type: DataTypeEnum,
+    data_type: DataTypeEnum | None,
     client_sidecar: str | None,
     client_schema: str | None,
     full: bool,
@@ -847,17 +1228,20 @@ def _format_replay_command(
     local_copy: bool = False,
     coco: str | None = None,
 ) -> str:
-    """Build the copy-pasteable replay command for ``sidecar generate`` or
-    ``validate``. ``subcommand`` is the command words (e.g. ``["sidecar",
-    "generate"]`` or ``["validate"]``); the save-only flags are emitted only
-    when relevant (``validate`` passes neither).
+    """Build the copy-pasteable replay command for ``sidecar`` or ``validate``.
+    ``subcommand`` is the command words (e.g. ``["sidecar"]`` or
+    ``["validate"]``); the save-only flags are emitted only when relevant
+    (``validate`` passes neither). ``--datatype`` is emitted only when an
+    explicit filter was chosen (auto-detect is the default).
     """
     parts = ["am-tools"]
     if verbosity == "verbose":
         parts.append("--verbose")
     elif verbosity == "silent":
         parts.append("--silent")
-    parts += [*subcommand, "--directory", shlex.quote(directory), "--datatype", data_type.value]
+    parts += [*subcommand, "--directory", shlex.quote(directory)]
+    if data_type is not None:
+        parts += ["--datatype", data_type.value]
     if output_filename is not None:
         parts += ["--output-filename", shlex.quote(output_filename)]
     if client_sidecar:
@@ -893,7 +1277,7 @@ class WizardResult(NamedTuple):
     """
 
     directory: str
-    data_type: DataTypeEnum
+    data_type: DataTypeEnum | None
     output_filename: str | None
     client_sidecar: str | None
     client_schema: str | None
@@ -937,8 +1321,13 @@ def _run_interactive_wizard(
         if directory is None:
             directory = _ask_directory()
         if data_type is None:
-            data_type = _ask_data_type()
-        if data_type == DataTypeEnum.oriented_image and not ignore_missing_orientation_provided:
+            data_type = _ask_data_type_filter()
+        # Conditional prompts follow "show unless an explicit filter rules them
+        # out": in auto mode (data_type is None) they all apply.
+        if (
+            data_type in (None, DataTypeEnum.oriented_image)
+            and not ignore_missing_orientation_provided
+        ):
             ignore_missing_orientation = _ask_ignore_missing_orientation()
         if save and output_filename is None:
             output_filename = _ask_output_filename()
@@ -947,11 +1336,14 @@ def _run_interactive_wizard(
         if client_schema is None and client_sidecar is not None:
             client_schema = _ask_client_schema()
         # COCO label impact only applies to imagery.
-        if coco is None and data_type in IMAGE_DATA_TYPES:
+        if coco is None and (data_type is None or data_type in IMAGE_DATA_TYPES):
             coco = _ask_coco()
-        # fallback_srs only applies to point clouds; other data types carry
-        # their CRS per-file, so don't bother the user with this prompt.
-        if spatial_reference is None and data_type in _POINT_CLOUD_DATA_TYPES:
+        # fallback_srs applies to point clouds; in auto mode --spatial-reference
+        # also reprojects image/video coordinates, so offer it unless an explicit
+        # non-point-cloud filter rules it out.
+        if spatial_reference is None and (
+            data_type is None or data_type in _POINT_CLOUD_DATA_TYPES
+        ):
             spatial_reference = _ask_spatial_reference()
         if not full_provided:
             full = _ask_full()
@@ -981,7 +1373,7 @@ def _run_interactive_wizard(
 def _run_generate(result: WizardResult, *, wizard_ran: bool) -> None:
     """Generate and lint a sidecar from a fully-resolved set of options.
 
-    Shared by ``sidecar generate`` and the ``build-schema`` follow-on: it
+    Shared by ``sidecar`` and the ``build-schema`` follow-on: it
     normalises the output filename, echoes the replay command (only when a
     wizard ran), writes the sidecar, then lints it. ``result.verbosity`` is
     assumed to have already been applied to the root logger by the caller.
@@ -1000,13 +1392,12 @@ def _run_generate(result: WizardResult, *, wizard_ran: bool) -> None:
 
     if not directory:
         raise typer.BadParameter("Directory is required.")
-    if data_type is None:
-        raise typer.BadParameter("Data type is required.")
+    # data_type is an optional filter now — None means auto-detect.
 
     if wizard_ran:
         _echo_replay_command(
             _format_replay_command(
-                ["sidecar", "generate"],
+                ["sidecar"],
                 directory=directory,
                 data_type=data_type,
                 output_filename=output_filename,
@@ -1022,7 +1413,7 @@ def _run_generate(result: WizardResult, *, wizard_ran: bool) -> None:
         )
 
     try:
-        sidecar_path = _generate(
+        sidecar_path, skipped_vector = _generate(
             directory=directory,
             data_type=data_type,
             output_filename=output_filename,
@@ -1032,6 +1423,17 @@ def _run_generate(result: WizardResult, *, wizard_ran: bool) -> None:
             local_copy=result.local_copy,
             spatial_reference=result.spatial_reference,
         )
+    except PointCloudCRSError as e:
+        # Nothing was written to the input directory; report loudly and stop.
+        _raise_crs_failures_loudly(e.filenames)
+        click.secho(
+            f"  No sidecar was written to {directory}. A diagnostic copy is at: "
+            f"{e.diagnostic_path}",
+            fg="bright_red",
+            err=True,
+            color=True,
+        )
+        raise typer.Exit(code=1) from None
     except Exception as e:
         _fail("Failed to generate sidecar CSV", e)
 
@@ -1050,6 +1452,7 @@ def _run_generate(result: WizardResult, *, wizard_ran: bool) -> None:
         _fail("Failed to lint generated sidecar", e)
 
     typer.echo(report.render())
+    _warn_skipped_vectors(skipped_vector)
     if report.has_errors():
         raise typer.Exit(code=1)
 
@@ -1109,7 +1512,6 @@ def offer_sidecar_after_schema(
     _run_generate(result, wizard_ran=True)
 
 
-@sidecar_app.command()
 def generate(
     ctx: typer.Context,
     directory: Annotated[
@@ -1122,11 +1524,14 @@ def generate(
         ),
     ] = None,
     data_type: Annotated[
-        DataTypeEnum | None,
+        DataTypeFilter | None,
         typer.Option(
             "--datatype",
             "--data-type",
-            help="Data type of the input data (e.g. 'oriented_image', 'point_cloud').",
+            help=(
+                "Optional filter: restrict the scan to this data type. By default "
+                "every file is auto-detected per file (recommended)."
+            ),
             case_sensitive=False,
         ),
     ] = None,
@@ -1238,7 +1643,14 @@ def generate(
     verbosity_choice = verbosity_state.choice
     verbosity_provided = verbosity_state.verbose or verbosity_state.silent
 
-    wizard_ran = directory is None or data_type is None
+    # --datatype is an optional filter; convert it to the full enum immediately.
+    data_type_enum: DataTypeEnum | None = (
+        DataTypeEnum(data_type.value) if data_type is not None else None
+    )
+
+    # The wizard now only runs when the directory is missing; --datatype being
+    # unset just means auto-detect, not "ask me".
+    wizard_ran = directory is None
     if wizard_ran:
         full_provided = (
             ctx.get_parameter_source("full") == click.core.ParameterSource.COMMANDLINE
@@ -1253,7 +1665,7 @@ def generate(
         )
         result = _run_interactive_wizard(
             directory,
-            data_type,
+            data_type_enum,
             output_filename,
             client_sidecar,
             client_schema,
@@ -1278,7 +1690,7 @@ def generate(
     else:
         result = WizardResult(
             directory=directory,
-            data_type=data_type,
+            data_type=data_type_enum,
             output_filename=output_filename,
             client_sidecar=client_sidecar,
             client_schema=client_schema,

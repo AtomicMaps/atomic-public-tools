@@ -367,7 +367,9 @@ def test_lint_coco_ignored_for_non_image_datatype(tmp_path):
     assert any("COCO file ignored" in w.message for w in report.warnings())
 
 
-def test_lint_coco_skipped_without_datatype(tmp_path):
+def test_lint_coco_runs_without_datatype_via_inference(tmp_path):
+    """Without --datatype, a.jpg infers oriented_image (an image row), so COCO
+    label impact runs rather than being skipped."""
     sidecar = _write_sidecar(
         tmp_path,
         [["DEFAULT", "", "", "", "", ""], ["a.jpg", "51", "-114", "100", "2024:01:01", "90"]],
@@ -381,5 +383,5 @@ def test_lint_coco_skipped_without_datatype(tmp_path):
         input_files_path=None,
         coco_path=str(coco),
     )
-    assert report.coco_impact is None
-    assert any("Skipped COCO label-impact" in f.message for f in report.infos())
+    assert report.coco_impact is not None
+    assert report.coco_impact.images_in_coco == 1

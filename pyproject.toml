@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "atomic-public-tools"
-version = "0.1.1"
+version = "0.2.0"
 description = "Client-facing tools to format metadata for Flow intake."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -34,6 +34,7 @@ dependencies = [
     "timezonefinder>=6.5",
     "pyproj>=3.6",
     "tqdm>=4.66",
+    "pye57>=0.4",
 ]
 
 [project.optional-dependencies]
@@ -57,6 +58,9 @@ packages = ["src/atomic_tools"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+# Vendored files are byte-exact copies of the data-engineering source (see
+# vendor_sync.py); reformatting them would trip the drift check.
+extend-exclude = ["src/atomic_tools/vendored"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
