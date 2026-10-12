@@ -4,10 +4,7 @@ from __future__ import annotations
 
 
 class InvalidInputError(ValueError):
-    """Something the caller supplied is wrong: a path, a flag value, an upload.
+    """Bad caller input, reported as ``invalid_input``.
 
-    The library API reports these as ``invalid_input`` (exit 2 in
-    ``validate --api-mode``). Any other ``ValueError`` escaping validation is a
-    bug and is reported as ``internal_error``. Subclassing ValueError keeps
-    existing ``except ValueError`` handlers working.
+    Any other ``ValueError`` is a bug and is reported as ``internal_error``.
     """

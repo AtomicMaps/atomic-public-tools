@@ -96,16 +96,11 @@ _EXIFTOOL_INSTALL_HELP = (
     "EXIFTOOL_BIN to its full path."
 )
 
-# Seconds before a single exiftool call is abandoned; a hung process must not
-# block a server worker forever. Override with AM_TOOLS_EXIFTOOL_TIMEOUT.
+# Seconds per call, so a hung exiftool can't block a server worker.
 DEFAULT_EXIFTOOL_TIMEOUT = 120.0
 
 
 def find_exiftool_bin() -> str:
-    """Locate exiftool: the ``EXIFTOOL_BIN`` override, else ``PATH``.
-
-    Raises :class:`ExiftoolNotFoundError` with install instructions.
-    """
     override = os.environ.get("EXIFTOOL_BIN")
     if override:
         if os.path.isfile(override) and os.access(override, os.X_OK):
@@ -128,8 +123,7 @@ def _exiftool_timeout() -> float:
     except ValueError:
         value = math.nan
     if not math.isfinite(value) or value <= 0:
-        # 0/negative/nan would make every call time out and silently yield
-        # empty metadata for every file.
+        # Would time out every call and silently return empty metadata.
         logger.warning(
             f"Ignoring invalid AM_TOOLS_EXIFTOOL_TIMEOUT={raw!r} (need a positive "
             f"number of seconds); using {DEFAULT_EXIFTOOL_TIMEOUT}."

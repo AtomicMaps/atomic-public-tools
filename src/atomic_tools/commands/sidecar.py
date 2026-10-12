@@ -998,7 +998,6 @@ def _build_sidecar(
     # once per file as we walk the directory.
     if any(t == DataTypeEnum.point_cloud for t in types_by_key.values()):
         find_pdal_bin()
-    # Same for exiftool, which reads every non-point-cloud type.
     if any(t != DataTypeEnum.point_cloud for t in types_by_key.values()):
         find_exiftool_bin()
 

@@ -185,8 +185,7 @@ def parse_bound(value: str) -> ParseResult:
 
 
 def _int_range_parser(label: str, lo: int, hi: int | Callable[[], int]) -> Validator:
-    # `hi` may be a callable so time-relative bounds (e.g. "next year") are
-    # evaluated per call rather than frozen at import in a long-running process.
+    # A callable `hi` keeps "next year" from freezing at import in a server.
     def _parser(value: str) -> ParseResult:
         s = value.strip()
         if not s:
