@@ -6,6 +6,7 @@ the sidecar generator and their transitive helpers — the source module is
 """
 
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -84,6 +85,50 @@ def normalize_object_store_path(path: str) -> str:
     return path.rstrip("/")
 
 
+class ExiftoolNotFoundError(RuntimeError):
+    """Raised when the exiftool executable cannot be located."""
+
+
+_EXIFTOOL_INSTALL_HELP = (
+    "exiftool was not found. Install it (macOS: `brew install exiftool`; "
+    "Debian/Ubuntu: `apt-get install libimage-exiftool-perl`) or set "
+    "EXIFTOOL_BIN to its full path."
+)
+
+# Seconds before a single exiftool call is abandoned; a hung process must not
+# block a server worker forever. Override with AM_TOOLS_EXIFTOOL_TIMEOUT.
+DEFAULT_EXIFTOOL_TIMEOUT = 120.0
+
+
+def find_exiftool_bin() -> str:
+    """Locate exiftool: the ``EXIFTOOL_BIN`` override, else ``PATH``.
+
+    Raises :class:`ExiftoolNotFoundError` with install instructions.
+    """
+    override = os.environ.get("EXIFTOOL_BIN")
+    if override:
+        if os.path.isfile(override) and os.access(override, os.X_OK):
+            return override
+        raise ExiftoolNotFoundError(
+            f"EXIFTOOL_BIN={override!r} is not an executable file. {_EXIFTOOL_INSTALL_HELP}"
+        )
+    found = shutil.which("exiftool")
+    if found is None:
+        raise ExiftoolNotFoundError(_EXIFTOOL_INSTALL_HELP)
+    return found
+
+
+def _exiftool_timeout() -> float:
+    raw = os.environ.get("AM_TOOLS_EXIFTOOL_TIMEOUT")
+    if not raw:
+        return DEFAULT_EXIFTOOL_TIMEOUT
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning(f"Ignoring non-numeric AM_TOOLS_EXIFTOOL_TIMEOUT={raw!r}")
+        return DEFAULT_EXIFTOOL_TIMEOUT
+
+
 def run_exiftool(
     path: str,
     extra_args: list[str],
@@ -99,7 +144,8 @@ def run_exiftool(
     if path.startswith("file://"):
         path = path.replace("file://", "")
 
-    cmd = ["exiftool"]
+    cmd = [find_exiftool_bin()]
+    timeout = _exiftool_timeout()
     if exiftool_config:
         cmd.extend(["-config", exiftool_config])
     cmd.extend(extra_args)
@@ -108,8 +154,10 @@ def run_exiftool(
         cmd.append("-")
         curl_process = subprocess.Popen(["curl", "-s", path], stdout=subprocess.PIPE)
         try:
-            output = subprocess.check_output(cmd, stdin=curl_process.stdout)
-        except subprocess.CalledProcessError:
+            output = subprocess.check_output(
+                cmd, stdin=curl_process.stdout, timeout=timeout
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             curl_process.kill()
             curl_process.wait()
             raise
@@ -119,7 +167,7 @@ def run_exiftool(
             curl_process.wait()
     else:
         cmd.append(path)
-        output = subprocess.check_output(cmd)
+        output = subprocess.check_output(cmd, stdin=subprocess.DEVNULL, timeout=timeout)
 
     return output
 

@@ -8,12 +8,16 @@ import pytest
 from obstore.store import LocalStore
 from typer.testing import CliRunner
 
-from atomic_tools import validate_path
+from atomic_tools import validate_path as _validate_path
 from atomic_tools.cli import app
 from atomic_tools.io.storage import LocalBackend, ObjectStoreBackend, from_path
 from tests.test_auto_detect import patched_extractors  # noqa: F401
 
 runner = CliRunner()
+
+
+def validate_path(*args, **kwargs) -> dict:
+    return _validate_path(*args, **kwargs).to_json_dict()
 
 
 def _dir_with_siblings(tmp_path):

@@ -23,12 +23,17 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-    "typer>=0.12",
+    # typer 0.27 vendors its own click (typer._click) and drops the click
+    # dependency; this code imports click directly and compares against
+    # click.core.ParameterSource, so stay below 0.27 until that's ported.
+    "typer>=0.12,<0.27",
+    "click>=8.1",
     "pydantic>=2",
     "openpyxl>=3.1",
     "boto3>=1.34",
     "obstore>=0.3",
-    "pandas>=2.0",
+    # 2.1+: DataFrame.map is used on the validate path.
+    "pandas>=2.1",
     "questionary>=2.0",
     "pytz>=2024.1",
     "timezonefinder>=6.5",
@@ -42,6 +47,11 @@ dev = [
     "pytest>=8",
     "ruff>=0.6",
     "mypy>=1.10",
+    # Only for the FastAPI end-to-end test (tests/test_validate_upload.py);
+    # the library itself has no web-framework dependency.
+    "fastapi>=0.110",
+    "httpx>=0.27",
+    "python-multipart>=0.0.9",
 ]
 
 [project.scripts]

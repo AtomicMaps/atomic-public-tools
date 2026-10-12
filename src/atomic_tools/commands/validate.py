@@ -40,13 +40,14 @@ from atomic_tools.commands.sidecar import (
     _run_interactive_wizard,
     _warn_skipped_vectors,
 )
+from atomic_tools.models import ValidationResponse
 from atomic_tools.utils.utils import DataTypeEnum, DataTypeFilter
 
 logger = logging.getLogger(__name__)
 
 
-def _emit_json(payload: dict, stream) -> None:
-    stream.write(json.dumps(payload, default=str))
+def _emit_json(payload: ValidationResponse, stream) -> None:
+    stream.write(json.dumps(payload.to_json_dict()))
     stream.write("\n")
     stream.flush()
 
@@ -166,8 +167,9 @@ def validate(
                 "Point it at a single CSV, or at a directory: when it's a "
                 "directory, every CSV in a subdirectory BELOW it is merged into "
                 "one. All merged CSVs must share the same schema (column count); "
-                "a mismatch aborts and names the bad file. Client values win on "
-                "conflict."
+                "a mismatch aborts and names the bad file. Client values fill "
+                "fields the files are missing; where both have a value, the "
+                "file's own metadata is kept (with a warning)."
             ),
         ),
     ] = None,

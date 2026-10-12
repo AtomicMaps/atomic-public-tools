@@ -11,7 +11,7 @@ from typer.testing import CliRunner
 import atomic_tools.api as api_mod
 import atomic_tools.cli as cli_mod
 import atomic_tools.commands.validate as validate_mod
-from atomic_tools import validate_path
+from atomic_tools import validate_path as _validate_path
 from atomic_tools.cli import app
 from atomic_tools.utils.utils import DataTypeEnum
 from atomic_tools.validators.report import LintReport, MissingDataReport
@@ -19,6 +19,10 @@ from atomic_tools.validators.sidecar import lint_sidecar_df, lint_sidecar_file
 from tests.test_auto_detect import _make_mixed_dir, patched_extractors  # noqa: F401
 
 runner = CliRunner()
+
+
+def validate_path(*args, **kwargs) -> dict:
+    return _validate_path(*args, **kwargs).to_json_dict()
 
 
 def _df() -> pd.DataFrame:

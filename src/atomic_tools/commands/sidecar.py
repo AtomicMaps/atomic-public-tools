@@ -57,8 +57,10 @@ from atomic_tools.utils.utils import (
     DATA_TYPE_INFO,
     DataTypeEnum,
     DataTypeFilter,
+    ExiftoolNotFoundError,
     _split_path_components,
     drop_preview_tifs,
+    find_exiftool_bin,
     has_value,
     infer_data_type,
     is_remote_uri,
@@ -92,7 +94,7 @@ def _fail(message: str, exc: Exception) -> NoReturn:
     """Log a failure, surface AWS auth help if applicable, and exit non-zero."""
     # A missing pdal is a setup problem, not a bug — show the install
     # instructions plainly rather than burying them under a traceback.
-    if isinstance(exc, PdalNotFoundError):
+    if isinstance(exc, (PdalNotFoundError, ExiftoolNotFoundError)):
         logger.error(f"{message}: {exc}")
         raise typer.Exit(code=1) from None
     logger.exception(message)
@@ -1023,6 +1025,9 @@ def _build_sidecar(
     # once per file as we walk the directory.
     if any(t == DataTypeEnum.point_cloud for t in types_by_key.values()):
         find_pdal_bin()
+    # Same for exiftool, which reads every non-point-cloud type.
+    if any(t != DataTypeEnum.point_cloud for t in types_by_key.values()):
+        find_exiftool_bin()
 
     file_metadata: list[tuple[str, dict]] = []
     empty_count = 0
@@ -1583,8 +1588,8 @@ def generate(
                 "one (the directory itself is not scanned, since the generated "
                 "sidecar is written there). All merged CSVs must share the same "
                 "schema (column count); a mismatch aborts and names the bad "
-                "file. Values are merged into the generated sidecar; client "
-                "values win on conflict."
+                "file. Client values fill fields the files are missing; where "
+                "both have a value, the file's own metadata is kept (with a warning)."
             ),
         ),
     ] = None,
