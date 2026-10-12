@@ -1,4 +1,4 @@
-"""Pydantic response models for the library API.
+"""Pydantic response models for embedding ``atomic_tools`` in a web service.
 
 Unrequested sections are left unset: serialise with ``exclude_unset=True``
 (FastAPI: ``response_model_exclude_unset=True``).
@@ -102,3 +102,28 @@ class ValidationResponse(BaseModel):
 
     def to_json_dict(self) -> dict[str, Any]:
         return self.model_dump(mode="json", exclude_unset=True)
+
+
+class ToolStatus(BaseModel):
+    found: bool = Field(description="The executable/module was located.")
+    usable: bool = Field(
+        description="It actually ran (catches e.g. a binary with missing shared libraries)."
+    )
+    path: str | None = None
+    version: str | None = None
+    detail: str | None = Field(
+        default=None, description="Why the tool is unavailable, when it isn't."
+    )
+
+
+class DependencyReport(BaseModel):
+    """External tools validation needs; see :func:`atomic_tools.check_dependencies`.
+
+    ``ok`` is true when every tool is usable: exiftool (images/video), pdal
+    (point clouds) and pye57 (.e57 capture dates).
+    """
+
+    ok: bool
+    exiftool: ToolStatus
+    pdal: ToolStatus
+    pye57: ToolStatus
