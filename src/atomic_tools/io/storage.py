@@ -20,7 +20,7 @@ import tempfile
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import parse_qs, urlparse
 
 import obstore
@@ -178,10 +178,14 @@ class ObjectStoreBackend(StorageBackend):
             except RuntimeError as e:
                 self._reraise_if_auth(e, operation="list")
                 raise
-            if keys or not self._prefix:
-                return keys
             # Listing treats the prefix as a folder ("<prefix>/…"), so a URI
-            # naming one object lists nothing. Check for that object directly.
+            # naming one object lists nothing. Check for that object directly —
+            # but only when the last segment looks like a file (has an
+            # extension; types are detected from it, so nothing else could be
+            # validated anyway). This keeps an ordinary empty folder from
+            # costing a HEAD request.
+            if keys or not PurePosixPath(self._prefix).suffix:
+                return keys
             size = self._head_size(self._prefix)
             if size is None:
                 return []
@@ -190,14 +194,19 @@ class ObjectStoreBackend(StorageBackend):
         return filter_keys({self._single_key: self._single_size}, include, exclude)
 
     def _head_size(self, key: str) -> int | None:
-        """Size of object `key`, or None if it doesn't exist."""
+        """Size of object `key`, or None if it doesn't exist or can't be read.
+
+        A denied HEAD is treated as "not a single object", not an auth failure:
+        the listing just succeeded, so the credentials work, and policies scoped
+        to ``prefix/*`` legitimately deny HEAD on the bare prefix key.
+        """
         try:
             meta = obstore.head(self._store, key)
         except (FileNotFoundError, NotFoundError):
             return None
         except (PermissionDeniedError, UnauthenticatedError) as e:
-            self._reraise_if_auth(e, operation="list")
-            raise
+            logger.debug(f"HEAD {key!r} denied ({e}); treating it as a folder prefix.")
+            return None
         return int(meta["size"])
 
     @contextmanager

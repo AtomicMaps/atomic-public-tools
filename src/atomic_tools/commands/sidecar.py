@@ -707,6 +707,10 @@ def _crs_failures(df) -> list[str]:
     return df.loc[flag == "no", "Filename"].tolist()
 
 
+class NoSupportedFilesError(RuntimeError):
+    """The scanned location holds no files of a supported (or requested) type."""
+
+
 class PointCloudCRSError(RuntimeError):
     """Point clouds whose CRS can't reach Web Mercator, raised before any write.
 
@@ -973,7 +977,7 @@ def _build_sidecar(
                     f"{backend.display_root} is not a '{data_type.value}' file "
                     "(or it is empty). Drop --datatype to auto-detect its type."
                 )
-            raise RuntimeError(
+            raise NoSupportedFilesError(
                 f"No valid files found for '{data_type.value}' in {backend.display_root}"
             )
         types_by_key: dict[str, DataTypeEnum] = {key: data_type for key in keys}
@@ -1003,7 +1007,7 @@ def _build_sidecar(
                     f"{backend.display_root} is not a supported file type (or it "
                     "is empty or a preview/thumbnail derivative)."
                 )
-            raise RuntimeError(f"No supported files found in {backend.display_root}")
+            raise NoSupportedFilesError(f"No supported files found in {backend.display_root}")
 
     supported_keys = list(types_by_key)
     total = len(supported_keys)

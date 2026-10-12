@@ -33,7 +33,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any
 
-from atomic_tools.commands.sidecar import _build_sidecar, _crs_failures
+from atomic_tools.client_sidecar import SidecarMergeError
+from atomic_tools.commands.sidecar import (
+    NoSupportedFilesError,
+    PointCloudCRSError,
+    _build_sidecar,
+    _crs_failures,
+)
 from atomic_tools.models import (
     SCHEMA_VERSION,
     DependencyReport,
@@ -77,7 +83,7 @@ def _plain(text: str | None) -> str | None:
 class ValidationResult:
     """Everything a validation run produces, before any rendering."""
 
-    df: Any  # pandas.DataFrame — the assembled (unsaved) sidecar
+    df: Any  # pandas.DataFrame — the assembled (unsaved) sidecar, all-string cells
     report: LintReport
     detected_types: set[DataTypeEnum]
     skipped_vector: list[str]
@@ -154,11 +160,15 @@ def run_validation(
         quiet=quiet,
         unclassified_out=unclassified,
     )
+    # Normalise once to the CSV string form; lint and the metadata section both
+    # use this frame.
+    df = _as_csv_strings(df)
     crs_failures = _crs_failures(df)
 
     logger.info("Linting in-memory sidecar (not saved)…")
     report = lint_sidecar_df(
         df,
+        normalize=False,
         final=True,
         data_type=data_type,
         input_files_path=path,
@@ -216,7 +226,7 @@ def build_payload(result: ValidationResult, include: Iterable[str]) -> Validatio
             report.missing_data.to_dict() if report.missing_data is not None else None
         )
     if "metadata" in include:
-        fields["metadata"] = _as_csv_strings(df).to_dict(orient="records")
+        fields["metadata"] = df.to_dict(orient="records")
     if "details" in include:
         fields["details"] = {
             "crs_failures": result.crs_failures,
@@ -242,12 +252,22 @@ def _classify_exception(exc: BaseException) -> str:
         return "auth_error"
     if isinstance(exc, (PdalNotFoundError, ExiftoolNotFoundError)):
         return "dependency_missing"
-    if isinstance(exc, (ValueError, NotImplementedError, FileNotFoundError)):
-        # FileNotFoundError: from_path() was given a local path that doesn't exist.
-        return "invalid_input"
-    if isinstance(exc, RuntimeError):
-        # _build_sidecar raises RuntimeError when no supported files are found.
+    if isinstance(exc, NoSupportedFilesError):
         return "no_data"
+    if isinstance(
+        exc,
+        (
+            ValueError,
+            NotImplementedError,
+            # from_path() was given a local path (or a client file) that doesn't exist.
+            FileNotFoundError,
+            # Bad client sidecar/schema, or point clouds whose CRS can't be used.
+            SidecarMergeError,
+            PointCloudCRSError,
+        ),
+    ):
+        return "invalid_input"
+    # Anything else (storage/network failures wrapped as RuntimeError, bugs).
     return "internal_error"
 
 
@@ -296,7 +316,11 @@ def validate_path(
         logger.error(f"Validation failed: {e}", exc_info=logger.isEnabledFor(logging.INFO))
         return error_payload(_classify_exception(e), str(e))
 
-    return build_payload(result, sections)
+    try:
+        return build_payload(result, sections)
+    except Exception as e:  # noqa: BLE001 — API contract: never raise
+        logger.exception("Could not build the validation response")
+        return error_payload("internal_error", f"Could not build the response: {e}")
 
 
 # ---- uploads -------------------------------------------------------------------
@@ -317,6 +341,7 @@ class UploadedFile:
 UploadLike = UploadedFile | Any
 
 _COPY_CHUNK = 1024 * 1024
+_EXTRA_ROLES = ("client_sidecar", "client_schema", "coco")
 _MAX_NAME_BYTES = 255
 
 
@@ -339,6 +364,8 @@ def _safe_filename(name: str | None, role: str) -> str:
     if len(base.encode("utf-8")) > _MAX_NAME_BYTES:
         stem, ext = os.path.splitext(base)
         budget = _MAX_NAME_BYTES - len(ext.encode("utf-8"))
+        if budget < 1:
+            raise UploadError(f"The {role} upload's filename is too long: {name[:40]!r}…")
         stem = stem.encode("utf-8")[:budget].decode("utf-8", errors="ignore")
         base = stem + ext
     return base
@@ -349,6 +376,10 @@ def _unpack_upload(obj: UploadLike, filename: str | None, role: str) -> tuple[An
         return obj.content, filename or obj.filename
     if hasattr(obj, "file") and hasattr(obj, "filename"):  # Starlette UploadFile
         return obj.file, filename or obj.filename
+    if isinstance(obj, str):
+        raise UploadError(
+            f"The {role} upload is a str; pass bytes or a binary stream, not text."
+        )
     if isinstance(obj, (bytes, bytearray, memoryview)) or hasattr(obj, "read"):
         if not filename:
             raise UploadError(
@@ -378,6 +409,13 @@ def _save_upload(
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / name
 
+    if isinstance(content, str):
+        raise UploadError(f"The {role} upload {name!r} is text; pass bytes or a binary stream.")
+    if not isinstance(content, (bytes, bytearray, memoryview)) and not hasattr(content, "read"):
+        raise UploadError(
+            f"The {role} upload {name!r} has unsupported content: {type(content).__name__}."
+        )
+
     written = 0
     with open(dest, "wb") as out:
         if isinstance(content, (bytes, bytearray, memoryview)):
@@ -390,6 +428,11 @@ def _save_upload(
             with contextlib.suppress(AttributeError, OSError, ValueError):
                 content.seek(0)
             while chunk := content.read(_COPY_CHUNK):
+                if isinstance(chunk, str):
+                    raise UploadError(
+                        f"The {role} upload {name!r} was opened in text mode; "
+                        "open it in binary mode ('rb')."
+                    )
                 written += len(chunk)
                 if max_bytes is not None and written > max_bytes:
                     break
@@ -411,17 +454,37 @@ def _scrub(value: Any, replacements: list[tuple[str, str]]) -> Any:
     return value
 
 
+_UPLOAD_SUBDIRS = ("data", *(f"extras{os.sep}{role}" for role in _EXTRA_ROLES))
+
+
 def _path_replacements(tmp_root: Path, saved: list[Path]) -> list[tuple[str, str]]:
     """Map server temp paths (as given and as resolved — /var vs /private/var
-    on macOS) to the bare uploaded filename, longest first."""
+    on macOS) to the bare uploaded filename, longest first. Covers files that
+    were never saved too (e.g. an OSError naming the destination path)."""
     pairs: dict[str, str] = {}
     for p in saved:
         for variant in {str(p), str(p.resolve())}:
             pairs[variant] = p.name
-    for variant in {str(tmp_root), str(tmp_root.resolve())}:
-        pairs[variant + os.sep] = ""
-        pairs[variant] = "<upload>"
+    for root in {str(tmp_root), str(tmp_root.resolve())}:
+        for sub in _UPLOAD_SUBDIRS:
+            pairs[f"{root}{os.sep}{sub}{os.sep}"] = ""
+        pairs[root + os.sep] = ""
+        pairs[root] = "<upload>"
     return sorted(pairs.items(), key=lambda kv: len(kv[0]), reverse=True)
+
+
+def _scrubbed(
+    response: ValidationResponse, tmp_root: Path, saved: list[Path]
+) -> ValidationResponse:
+    try:
+        cleaned = _scrub(
+            response.model_dump(mode="json", exclude_unset=True),
+            _path_replacements(tmp_root, saved),
+        )
+        return ValidationResponse.model_validate(cleaned)
+    except Exception:  # noqa: BLE001 — API contract: never raise (or leak paths)
+        logger.exception("Could not scrub the validation response")
+        return error_payload("internal_error", "Could not build the response.")
 
 
 def validate_upload(
@@ -459,54 +522,74 @@ def validate_upload(
     saved: list[Path] = []
     try:
         try:
-            data_path = _save_upload(
+            response = _save_and_validate(
+                tmp_root,
+                saved,
                 file,
-                tmp_root / "data",
-                "data file",
                 filename=filename,
+                extras={"client_sidecar": client_sidecar, "client_schema": client_schema,
+                        "coco": coco},
                 max_bytes=max_bytes,
-                require_extension=True,
+                data_type=data_type,
+                full=full,
+                spatial_reference=spatial_reference,
+                ignore_missing_orientation=ignore_missing_orientation,
+                include=include,
             )
-            saved.append(data_path)
-            extras: dict[str, str | None] = {}
-            for role, obj in (
-                ("client_sidecar", client_sidecar),
-                ("client_schema", client_schema),
-                ("coco", coco),
-            ):
-                if obj is None:
-                    extras[role] = None
-                    continue
-                p = _save_upload(
-                    obj, tmp_root / "extras" / role, role.replace("_", " "),
-                    max_bytes=max_bytes,
-                )
-                saved.append(p)
-                extras[role] = str(p)
         except UploadError as e:
-            return error_payload("invalid_input", str(e))
+            response = error_payload("invalid_input", str(e))
         except OSError as e:
             logger.error(f"Could not save upload: {e}")
-            return error_payload("internal_error", f"Could not save upload: {e}")
-
-        response = validate_path(
-            str(data_path),
-            data_type=data_type,
-            client_sidecar=extras["client_sidecar"],
-            client_schema=extras["client_schema"],
-            full=full,
-            spatial_reference=spatial_reference,
-            ignore_missing_orientation=ignore_missing_orientation,
-            coco=extras["coco"],
-            include=include,
-        )
-        scrubbed = _scrub(
-            response.model_dump(mode="json", exclude_unset=True),
-            _path_replacements(tmp_root, saved),
-        )
-        return ValidationResponse.model_validate(scrubbed)
+            response = error_payload("internal_error", f"Could not save upload: {e}")
+        except Exception as e:  # noqa: BLE001 — API contract: never raise
+            logger.exception("Unexpected error while handling an upload")
+            response = error_payload("internal_error", f"Unexpected error: {e}")
+        # Scrub before the temp dir goes, so paths still resolve the same way.
+        return _scrubbed(response, tmp_root, saved)
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
+
+
+def _save_and_validate(
+    tmp_root: Path,
+    saved: list[Path],
+    file: UploadLike,
+    *,
+    filename: str | None,
+    extras: dict[str, UploadLike | None],
+    max_bytes: int | None,
+    **validate_kwargs: Any,
+) -> ValidationResponse:
+    """Write the uploads into ``tmp_root`` (recording each in ``saved``) and
+    validate the data file. Raises UploadError/OSError on save problems."""
+    data_path = _save_upload(
+        file,
+        tmp_root / "data",
+        "data file",
+        filename=filename,
+        max_bytes=max_bytes,
+        require_extension=True,
+    )
+    saved.append(data_path)
+    extra_paths: dict[str, str | None] = {}
+    for role in _EXTRA_ROLES:
+        obj = extras.get(role)
+        if obj is None:
+            extra_paths[role] = None
+            continue
+        p = _save_upload(
+            obj, tmp_root / "extras" / role, role.replace("_", " "), max_bytes=max_bytes
+        )
+        saved.append(p)
+        extra_paths[role] = str(p)
+
+    return validate_path(
+        str(data_path),
+        client_sidecar=extra_paths["client_sidecar"],
+        client_schema=extra_paths["client_schema"],
+        coco=extra_paths["coco"],
+        **validate_kwargs,
+    )
 
 
 # ---- health ---------------------------------------------------------------------

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -13,6 +14,8 @@ import atomic_tools.cli as cli_mod
 import atomic_tools.commands.validate as validate_mod
 from atomic_tools import validate_path as _validate_path
 from atomic_tools.cli import app
+from atomic_tools.client_sidecar import SidecarMergeError
+from atomic_tools.commands.sidecar import NoSupportedFilesError, PointCloudCRSError
 from atomic_tools.utils.utils import DataTypeEnum
 from atomic_tools.validators.report import LintReport, MissingDataReport
 from atomic_tools.validators.sidecar import lint_sidecar_df, lint_sidecar_file
@@ -167,12 +170,45 @@ def test_api_mode_missing_directory_never_prompts(stubbed, monkeypatch):
 
 
 def test_api_mode_build_failure_is_json_error(stubbed, tmp_path):
-    stubbed["build_exc"] = RuntimeError("No supported files found in /x")
+    stubbed["build_exc"] = NoSupportedFilesError("No supported files found in /x")
     result = _invoke("--path", str(tmp_path), "--api-mode")
     assert result.exit_code == 1
     payload = _json(result)
     assert payload["status"] == "error"
     assert payload["error"] == {"type": "no_data", "message": "No supported files found in /x"}
+
+
+@pytest.mark.parametrize(
+    "exc,error_type,exit_code",
+    [
+        (NoSupportedFilesError("none here"), "no_data", 1),
+        (SidecarMergeError("client CSVs differ in column count"), "invalid_input", 2),
+        (PointCloudCRSError(["a.las"], Path("/x.csv")), "invalid_input", 2),
+        (FileNotFoundError("client.csv"), "invalid_input", 2),
+        # Storage/network failures are wrapped as plain RuntimeError: not "no data".
+        (RuntimeError("Failed to list keys with prefix p: GenericError"), "internal_error", 1),
+        (KeyError("boom"), "internal_error", 1),
+    ],
+)
+def test_error_classification(stubbed, tmp_path, exc, error_type, exit_code):
+    stubbed["build_exc"] = exc
+    result = _invoke("--path", str(tmp_path), "--api-mode")
+    assert result.exit_code == exit_code
+    assert _json(result)["error"]["type"] == error_type
+
+
+def test_response_building_failure_still_returns_json(stubbed, monkeypatch, tmp_path):
+    def broken(result, include):
+        raise TypeError("unserialisable cell")
+
+    monkeypatch.setattr(api_mod, "build_payload", broken)
+    payload = validate_path(str(tmp_path))
+    assert payload["error"]["type"] == "internal_error"
+    assert "unserialisable cell" in payload["error"]["message"]
+
+    result = _invoke("--path", str(tmp_path), "--api-mode")
+    assert result.exit_code == 1
+    assert _json(result)["error"]["type"] == "internal_error"
 
 
 def test_api_mode_stray_prints_go_to_stderr(stubbed, monkeypatch, tmp_path):
@@ -193,15 +229,13 @@ def test_include_without_api_mode_is_rejected(stubbed, tmp_path):
 
 
 def test_api_mode_skips_version_check(stubbed, monkeypatch, tmp_path):
+    """Detected from the args click parses, so it also works when the app is
+    invoked programmatically (sys.argv here is pytest's, not ours)."""
     called = []
     monkeypatch.setattr(cli_mod, "check_for_update", lambda: called.append(1))
-    monkeypatch.setattr(
-        cli_mod.sys, "argv", ["amtools", "validate", "--path", str(tmp_path), "--api-mode"]
-    )
     assert _invoke("--path", str(tmp_path), "--api-mode").exit_code == 0
     assert called == []
 
-    monkeypatch.setattr(cli_mod.sys, "argv", ["amtools", "validate", "--path", str(tmp_path)])
     _invoke("--path", str(tmp_path))
     assert called == [1]
 

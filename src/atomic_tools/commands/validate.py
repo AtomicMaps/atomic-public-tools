@@ -22,16 +22,7 @@ from typing import Annotated
 import click
 import typer
 
-from atomic_tools.api import (
-    ValidationResult,
-    build_payload,
-    error_payload,
-    parse_include,
-    run_validation,
-)
-from atomic_tools.api import (
-    _classify_exception as _classify_api_exception,
-)
+from atomic_tools.api import error_payload, run_validation, validate_path
 from atomic_tools.commands.sidecar import (
     _echo_replay_command,
     _fail,
@@ -76,19 +67,14 @@ def _run_api_mode(
         # aggregator on the API host isn't flooded with per-file warnings.
         logging.getLogger().setLevel(logging.ERROR)
 
-    try:
-        sections = parse_include(include)
-        if not path:
-            raise ValueError("--path is required with --api-mode.")
-    except ValueError as e:
-        _emit_json(error_payload("invalid_input", str(e)), real_stdout)
-        raise typer.Exit(code=2) from None
-
-    # Anything that prints (third-party libraries, stray echoes) goes to stderr
-    # so stdout carries exactly one JSON document.
-    try:
+    if not path:
+        response = error_payload("invalid_input", "--path is required with --api-mode.")
+    else:
+        # Same code path as the library API. Anything that prints (third-party
+        # libraries, stray echoes) goes to stderr so stdout carries exactly
+        # one JSON document.
         with contextlib.redirect_stdout(sys.stderr):
-            result = run_validation(
+            response = validate_path(
                 path,
                 data_type=data_type,
                 client_sidecar=client_sidecar,
@@ -97,38 +83,12 @@ def _run_api_mode(
                 spatial_reference=spatial_reference,
                 ignore_missing_orientation=ignore_missing_orientation,
                 coco=coco,
-                quiet=True,
+                include=include,
             )
-    except Exception as e:  # noqa: BLE001 — always answer with JSON
-        logger.error(f"Validation failed: {e}", exc_info=verbose)
-        error_type = _classify_api_exception(e)
-        _emit_json(error_payload(error_type, str(e)), real_stdout)
-        raise typer.Exit(code=2 if error_type == "invalid_input" else 1) from None
 
-    _emit_json(build_payload(result, sections), real_stdout)
-
-
-def _validate(
-    path: str,
-    data_type: DataTypeEnum | None,
-    client_sidecar: str | None,
-    client_schema: str | None,
-    full: bool = False,
-    spatial_reference: str | None = None,
-    ignore_missing_orientation: bool = False,
-    coco: str | None = None,
-) -> ValidationResult:
-    """Build the sidecar in memory and lint it without persisting anything."""
-    return run_validation(
-        path,
-        data_type=data_type,
-        client_sidecar=client_sidecar,
-        client_schema=client_schema,
-        full=full,
-        spatial_reference=spatial_reference,
-        ignore_missing_orientation=ignore_missing_orientation,
-        coco=coco,
-    )
+    _emit_json(response, real_stdout)
+    if response.error is not None:
+        raise typer.Exit(code=2 if response.error.type == "invalid_input" else 1)
 
 
 def validate(
@@ -363,8 +323,8 @@ def validate(
         )
 
     try:
-        result = _validate(
-            path=path,
+        result = run_validation(
+            path,
             data_type=data_type_enum,
             client_sidecar=client_sidecar,
             client_schema=client_schema,

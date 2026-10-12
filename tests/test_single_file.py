@@ -97,6 +97,36 @@ def test_object_store_missing_key_lists_nothing(monkeypatch, tmp_path):
     assert backend.single_file is None
 
 
+def test_object_store_denied_head_is_not_an_auth_error(monkeypatch, tmp_path):
+    """Policies scoped to ``folder/*`` deny HEAD on the bare key; that must read
+    as "no such single object", not as bad credentials."""
+    from obstore.exceptions import PermissionDeniedError
+
+    import atomic_tools.io.storage as storage_mod
+
+    (tmp_path / "sub").mkdir()
+    backend = _object_backend(monkeypatch, tmp_path, "sub/a.jpg")
+
+    def denied(store, key):
+        raise PermissionDeniedError("AccessDenied")
+
+    monkeypatch.setattr(storage_mod.obstore, "head", denied)
+    assert backend.list_keys(include=[".jpg"], exclude=[]) == []
+    assert backend.single_file is None
+
+
+def test_object_store_folder_prefix_skips_head(monkeypatch, tmp_path):
+    """An empty folder-like prefix (no extension) never triggers a HEAD."""
+    import atomic_tools.io.storage as storage_mod
+
+    (tmp_path / "flight1").mkdir()
+    backend = _object_backend(monkeypatch, tmp_path, "flight1")
+    calls = []
+    monkeypatch.setattr(storage_mod.obstore, "head", lambda store, key: calls.append(key))
+    assert backend.list_keys(include=[".jpg"], exclude=[]) == []
+    assert calls == []
+
+
 def test_object_store_single_key_writes_beside_object(monkeypatch, tmp_path):
     (tmp_path / "sub").mkdir()
     _dir_with_siblings(tmp_path / "sub")

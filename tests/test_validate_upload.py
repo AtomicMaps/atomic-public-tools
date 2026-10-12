@@ -126,6 +126,63 @@ def test_unsupported_upload_message_has_no_server_paths(tmp_path, patched_extrac
     _assert_no_leaks(payload, tmp_path)
 
 
+@pytest.mark.parametrize(
+    "upload",
+    [
+        UploadedFile("Filename,GPSAltitude\n", "a.jpg"),  # str content
+        UploadedFile(io.StringIO("text stream"), "a.jpg"),  # text-mode stream
+        UploadedFile(12345, "a.jpg"),  # not bytes, not a stream
+        SimpleNamespace(file=io.StringIO("text"), filename="a.jpg"),  # text UploadFile-alike
+    ],
+    ids=["str", "text-stream", "int", "text-uploadfile"],
+)
+def test_text_or_odd_content_is_invalid_input_not_a_crash(tmp_path, upload):
+    payload = _upload(tmp_path, upload)
+    assert payload["error"]["type"] == "invalid_input", payload
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_raw_str_file_is_invalid_input(tmp_path):
+    payload = _upload(tmp_path, "some text", filename="a.jpg")
+    assert payload["error"]["type"] == "invalid_input"
+    assert "str" in payload["error"]["message"]
+
+
+def test_overlong_extension_is_invalid_input(tmp_path):
+    payload = _upload(tmp_path, UploadedFile(b"x", "a." + "x" * 300))
+    assert payload["error"]["type"] == "invalid_input"
+    assert "too long" in payload["error"]["message"]
+
+
+def test_overlong_stem_is_truncated_keeping_extension(tmp_path, patched_extractors):  # noqa: F811
+    payload = _upload(tmp_path, UploadedFile(b"x", "y" * 400 + ".jpg"), include="metadata")
+    name = payload["metadata"][1]["Filename"]
+    assert name.endswith(".jpg") and len(name.encode()) <= 255
+
+
+def test_save_failure_does_not_leak_server_paths(tmp_path, monkeypatch):
+    def disk_full(path, mode="r", *a, **k):
+        raise OSError(28, "No space left on device", str(path))
+
+    # _save_upload opens its destination via the module-global name `open`.
+    monkeypatch.setattr(api_mod, "open", disk_full, raising=False)
+    payload = _upload(tmp_path, UploadedFile(b"x", "IMG_0001.jpg"))
+    assert payload["error"]["type"] == "internal_error"
+    assert "No space left on device" in payload["error"]["message"]
+    assert "IMG_0001.jpg" in payload["error"]["message"]
+    _assert_no_leaks(payload, tmp_path)
+
+
+def test_unexpected_save_error_is_contained(tmp_path, monkeypatch):
+    def boom(*a, **k):
+        raise KeyError("surprise")
+
+    monkeypatch.setattr(api_mod, "_save_upload", boom)
+    payload = _upload(tmp_path, UploadedFile(b"x", "a.jpg"))
+    assert payload["error"]["type"] == "internal_error"
+    assert list(tmp_path.iterdir()) == []
+
+
 # ---- companion uploads --------------------------------------------------------
 
 
@@ -250,6 +307,14 @@ def test_exiftool_timeout_returns_empty(monkeypatch, caplog):
         assert extract_exif_metadata("/x/a.jpg", "a.jpg") == {}
     assert seen["timeout"] == 1.5
     assert "timed out" in caplog.text
+
+
+@pytest.mark.parametrize("raw", ["0", "-5", "nan", "inf", "soon"])
+def test_invalid_exiftool_timeout_falls_back(monkeypatch, caplog, raw):
+    monkeypatch.setenv("AM_TOOLS_EXIFTOOL_TIMEOUT", raw)
+    with caplog.at_level("WARNING"):
+        assert utils_mod._exiftool_timeout() == utils_mod.DEFAULT_EXIFTOOL_TIMEOUT
+    assert "AM_TOOLS_EXIFTOOL_TIMEOUT" in caplog.text
 
 
 def test_exiftool_bin_override(monkeypatch, tmp_path):

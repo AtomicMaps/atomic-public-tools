@@ -6,6 +6,7 @@ the sidecar generator and their transitive helpers — the source module is
 """
 
 import logging
+import math
 import os
 import re
 import shutil
@@ -123,10 +124,18 @@ def _exiftool_timeout() -> float:
     if not raw:
         return DEFAULT_EXIFTOOL_TIMEOUT
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
-        logger.warning(f"Ignoring non-numeric AM_TOOLS_EXIFTOOL_TIMEOUT={raw!r}")
+        value = math.nan
+    if not math.isfinite(value) or value <= 0:
+        # 0/negative/nan would make every call time out and silently yield
+        # empty metadata for every file.
+        logger.warning(
+            f"Ignoring invalid AM_TOOLS_EXIFTOOL_TIMEOUT={raw!r} (need a positive "
+            f"number of seconds); using {DEFAULT_EXIFTOOL_TIMEOUT}."
+        )
         return DEFAULT_EXIFTOOL_TIMEOUT
+    return value
 
 
 def run_exiftool(
