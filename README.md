@@ -149,6 +149,54 @@ am-tools validate \
   --ignore-missing-orientation
 ```
 
+#### API mode (`--api-mode`)
+For calling `validate` from a service, pass `--api-mode`. It never prompts (`--directory` is required), skips the daily update check, hides the progress bar and colored banners, and prints **one JSON document to stdout**. Logs go to stderr at ERROR level unless you pass `-v`.
+
+```bash
+am-tools validate --directory s3://bucket/prefix --api-mode
+am-tools validate --directory ./data --api-mode --include findings,metadata
+```
+
+`--include` picks which sections come back: `findings`, `missing_data`, `metadata`, `details` or `all`. The default is `findings,missing_data,details`; `metadata`, which has every extracted field for every file, is opt-in because it can be large. `schema_version`, `status`, `summary` and `error` are always present.
+
+```json
+{
+  "schema_version": 1,
+  "status": "passed | passed_with_warnings | failed | error",
+  "summary": {"errors": 0, "warnings": 1, "infos": 2, "files_scanned": 3,
+              "detected_types": ["oriented_image"], "crs_failures": 0,
+              "skipped_vector": 0, "unclassified": 0},
+  "findings": [{"level": "warning", "message": "...", "fix_hint": "...", "location": null}],
+  "missing_data": {"filename_column": "Filename", "field_columns": ["..."], "columns": ["..."],
+                   "rows": [{"Filename": "b.jpg", "GPSLatitude": "MISSING"}]},
+  "metadata": [{"Filename": "DEFAULT", "DataType": "", "...": "..."}],
+  "details": {"crs_failures": [], "skipped_vector": [], "unclassified": [], "coco": null},
+  "error": null
+}
+```
+
+Exit codes:
+
+| Code | Meaning |
+|---|---|
+| 0 | Validation ran. Check `status`; a failed lint still exits 0. |
+| 2 | Bad input, such as no `--directory` or an unknown `--include` section. `status` is `error`. |
+| 1 | The run itself failed, such as no supported files, an auth error or missing pdal. `status` is `error`, and `error.type` is one of `invalid_input`, `no_data`, `auth_error`, `dependency_missing` or `internal_error`. |
+
+On servers, also set `AM_TOOLS_NO_VERSION_CHECK=1` so no other command makes the outbound update check.
+
+The same thing is available in Python without a subprocess:
+
+```python
+from atomic_tools import validate_directory
+
+payload = validate_directory("s3://bucket/prefix", data_type=None, include="all")
+if payload["status"] == "failed":
+    ...
+```
+
+`validate_directory` never raises; failures come back as `status: "error"`.
+
 ### `am-tools lint`
 There are two subcommands in `am-tools lint`:
 

@@ -110,6 +110,8 @@ def test_validate_help_lists_shared_options(monkeypatch):
         "--full",
         "--spatial-reference",
         "--ignore-missing-orientation",
+        "--api-mode",
+        "--include",
     ):
         assert flag in result.stdout
 

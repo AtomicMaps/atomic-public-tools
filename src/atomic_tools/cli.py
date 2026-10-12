@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 from dataclasses import dataclass
 from typing import Annotated, Literal
 
@@ -113,6 +114,13 @@ def main(
     ctx.obj = verbosity
 
     # First run of the day: nudge the user if the repo has a newer version.
-    # Best-effort and silent-safe — never raises, and skips when --silent.
-    if not silent:
+    # Best-effort and silent-safe — never raises, and skips when --silent or
+    # --api-mode (a server shouldn't make an outbound call per request).
+    if not silent and not _api_mode_requested():
         check_for_update()
+
+
+def _api_mode_requested() -> bool:
+    # The root callback runs before the subcommand's options are parsed, so
+    # --api-mode can only be seen on the raw argv here.
+    return "--api-mode" in sys.argv[1:]

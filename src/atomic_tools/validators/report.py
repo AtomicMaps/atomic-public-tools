@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import csv
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Literal
 
 import click
@@ -59,6 +59,18 @@ class MissingDataReport:
             writer.writeheader()
             writer.writerows(self.rows)
 
+    def to_dict(self) -> dict:
+        """JSON-ready form of the failed-rows table (same columns as the CSV)."""
+        columns = [self.filename_column, *self.field_columns]
+        if self.include_coco:
+            columns += [COCO_STATUS_COLUMN, COCO_LABELS_COLUMN]
+        return {
+            "filename_column": self.filename_column,
+            "field_columns": list(self.field_columns),
+            "columns": columns,
+            "rows": [{col: row.get(col, "") for col in columns} for row in self.rows],
+        }
+
 
 @dataclass
 class LintReport:
@@ -104,6 +116,9 @@ class LintReport:
 
     def exit_code(self) -> int:
         return 1 if self.has_errors() else 0
+
+    def findings_as_dicts(self) -> list[dict]:
+        return [asdict(f) for f in self.findings]
 
     def render(self) -> str:
         lines: list[str] = []

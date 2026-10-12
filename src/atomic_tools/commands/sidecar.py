@@ -904,6 +904,9 @@ def _build_sidecar(
     client_schema: str | None,
     full: bool = False,
     spatial_reference: str | None = None,
+    *,
+    quiet: bool = False,
+    unclassified_out: list[str] | None = None,
 ) -> tuple["object", StorageBackend, set[DataTypeEnum], list[str]]:
     """Scan a directory, extract metadata, and assemble the sidecar DataFrame.
 
@@ -922,6 +925,11 @@ def _build_sidecar(
     * an explicit type: byte-identical to the pre-auto behaviour — single-type
       include/exclude listing, no spherical refinement (a client passing
       ``--datatype spherical_image`` must not have panoramas reclassified).
+
+    ``quiet`` suppresses console-only output (progress bar, the red missing
+    required-fields block) for machine callers such as ``validate --api-mode``;
+    logging is unaffected. ``unclassified_out``, when given, is extended with the
+    auto-detect keys that matched no known data type.
     """
     if spatial_reference:
         # Fail fast on an unparseable CRS before doing any extraction work.
@@ -965,6 +973,8 @@ def _build_sidecar(
         keys = backend.list_keys(include=_union_include_extensions(), exclude=[])
         keys = _drop_preview_tifs(keys)
         types_by_key, unclassified, vector_keys = _classify_keys(keys)
+        if unclassified_out is not None:
+            unclassified_out.extend(unclassified)
         if unclassified:
             _warn_skipped(
                 unclassified,
@@ -1004,7 +1014,7 @@ def _build_sidecar(
         desc="Extracting metadata",
         unit="file",
         file=sys.stderr,
-        disable=None,
+        disable=True if quiet else None,
     ) as progress_keys:
         for i, key in enumerate(progress_keys, 1):
             progress_keys.set_postfix_str(Path(key).name if key else "")
@@ -1090,9 +1100,10 @@ def _build_sidecar(
             (label, meta) for label, meta in file_metadata if label in labels_of_type
         ]
         _fill_missing_dates_from_filepath(subset, field_groups, display_to_key)
-        _warn_missing_required_fields(
-            subset, required_field_groups, type_label=type_value if multi else None
-        )
+        if not quiet:
+            _warn_missing_required_fields(
+                subset, required_field_groups, type_label=type_value if multi else None
+            )
 
     logger.info(f"Building sidecar DataFrame for {len(file_metadata)} file(s).")
     df = build_sidecar_df(

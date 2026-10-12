@@ -105,6 +105,72 @@ def lint_sidecar_file(
         flat_groups = [g for groups in ALL_SIDECAR_FIELD_GROUPS.values() for g in groups]
         df = _apply_global_aliases(df, build_global_alias_map(flat_groups))
 
+    return _lint_loaded_df(
+        df,
+        report,
+        final=final,
+        data_type=data_type,
+        input_files_path=input_files_path,
+        ignore_missing_orientation=ignore_missing_orientation,
+        coco_path=coco_path,
+        coco_not_on_disk_is_error=coco_not_on_disk_is_error,
+    )
+
+
+def lint_sidecar_df(
+    df: pd.DataFrame,
+    *,
+    final: bool,
+    data_type: DataTypeEnum | None,
+    input_files_path: str | None,
+    ignore_missing_orientation: bool = False,
+    coco_path: str | None = None,
+    coco_not_on_disk_is_error: bool = True,
+) -> LintReport:
+    """Lint an already-assembled (canonical) sidecar DataFrame in memory.
+
+    Equivalent to writing ``df`` to CSV and calling :func:`lint_sidecar_file`
+    with no schema, minus the disk round trip. Cells are normalised to strings
+    with blanks for missing values, matching how ``load_sidecar_df`` reads a CSV.
+    """
+    report = LintReport()
+    if data_type is not None and data_type not in ALL_SIDECAR_FIELD_GROUPS:
+        report.add_error(
+            f"Unsupported data type for lint: {data_type}.",
+            fix_hint=f"Allowed values: {sorted(ALL_SIDECAR_FIELD_GROUPS.keys())}.",
+        )
+        return report
+    return _lint_loaded_df(
+        _as_csv_strings(df),
+        report,
+        final=final,
+        data_type=data_type,
+        input_files_path=input_files_path,
+        ignore_missing_orientation=ignore_missing_orientation,
+        coco_path=coco_path,
+        coco_not_on_disk_is_error=coco_not_on_disk_is_error,
+    )
+
+
+def _as_csv_strings(df: pd.DataFrame) -> pd.DataFrame:
+    """Return ``df`` as it would read back from CSV via ``load_sidecar_df``:
+    every cell a ``str``, missing values as ``""``, fresh RangeIndex."""
+    out = df.reset_index(drop=True).astype(object)
+    out = out.where(out.notna(), "")
+    return out.map(lambda v: v if isinstance(v, str) else str(v))
+
+
+def _lint_loaded_df(
+    df: pd.DataFrame,
+    report: LintReport,
+    *,
+    final: bool,
+    data_type: DataTypeEnum | None,
+    input_files_path: str | None,
+    ignore_missing_orientation: bool,
+    coco_path: str | None,
+    coco_not_on_disk_is_error: bool,
+) -> LintReport:
     columns = list(df.columns)
     columns_set = set(columns)
 
@@ -898,7 +964,8 @@ def _apply_coco_impact(
 
     csv_hint = (
         "Per-image detail (including degraded rows) is in the failed-rows "
-        "CSV — use --report to save it."
+        "CSV (`lint sidecar --report`) or under details.coco in "
+        "`validate --api-mode` JSON."
     )
 
     def _format(verdicts: list) -> str:
