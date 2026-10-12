@@ -59,7 +59,6 @@ logger = logging.getLogger(__name__)
 
 
 def sparse_reads_enabled() -> bool:
-    """Sparse metadata reads are on unless AM_TOOLS_SPARSE_READS is 0/false/no/off."""
     return os.environ.get("AM_TOOLS_SPARSE_READS", "1").strip().lower() not in (
         "0", "false", "no", "off",
     )
@@ -67,9 +66,7 @@ def sparse_reads_enabled() -> bool:
 
 @dataclass(frozen=True)
 class MetadataView:
-    """A local file to read metadata from. ``sparse`` means only the byte
-    ranges a metadata reader needs are real (see :mod:`atomic_tools.io.partial_read`);
-    if the reader reports a problem, re-read with :meth:`StorageBackend.open_local`."""
+    """``sparse``: only the ranges exiftool reads are real; on any problem, use ``open_local``."""
 
     path: str
     sparse: bool
@@ -117,11 +114,7 @@ class StorageBackend(ABC):
 
     @contextmanager
     def open_metadata_view(self, key: str) -> Iterator[MetadataView]:
-        """Yield a local file good enough for reading ``key``'s metadata.
-
-        Default: the full file. Remote backends override this to fetch only
-        the byte ranges exiftool reads.
-        """
+        """Yield a local file good enough for reading ``key``'s metadata."""
         with self.open_local(key) as path:
             yield MetadataView(path=path, sparse=False)
 
@@ -285,9 +278,6 @@ class ObjectStoreBackend(StorageBackend):
 
     @contextmanager
     def open_metadata_view(self, key: str) -> Iterator[MetadataView]:
-        """A sparse local copy holding only the bytes exiftool reads, or the
-        full download when the format has no sparse reader, the walk fails, or
-        sparse reads are disabled (AM_TOOLS_SPARSE_READS=0)."""
         if sparse_reads_enabled() and may_support(key):
             with tempfile.TemporaryDirectory() as tmp_dir:
                 local_path = os.path.join(tmp_dir, PurePosixPath(key).name or "object")
@@ -303,7 +293,7 @@ class ObjectStoreBackend(StorageBackend):
             yield MetadataView(path=path, sparse=False)
 
     def _try_sparse_copy(self, key: str, local_path: str) -> SparseStats | None:
-        """Build the sparse copy; None means "download the whole file instead"."""
+        """None means "download the whole file instead"."""
         try:
             head = obstore.get(self._store, key, options={"range": (0, HEAD_BYTES)})
             size = int(head.meta["size"])

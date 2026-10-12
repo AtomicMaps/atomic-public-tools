@@ -1,24 +1,9 @@
 """Sparse local copies of remote files: fetch only the bytes exiftool reads.
 
-exiftool needs a local file, but for most formats it reads only a small part
-of it — the JPEG header, the TIFF directories, the MP4 ``moov`` box. Downloading
-a 1.5 GB ortho to read 400 KB of tags is the dominant cost of validating remote
-data. :func:`build_sparse_copy` creates a local file of the object's full size
-(sparse, so it takes no disk space), fetches just the byte ranges exiftool will
-read for the detected format, and leaves everything else as zeros. exiftool then
-runs on it unchanged — same flags, same output — because every byte it reads is
-real.
-
-Formats whose metadata can't be located cheaply (PNG walks every chunk; unknown
-formats) raise :class:`UnsupportedFormat`; malformed structure raises
-:class:`SparseReadError`; an unexpectedly large fetch raises
-:class:`SparseBudgetExceeded`. Callers fall back to a full download in all three
-cases, and also when exiftool reports a Warning/Error on the sparse copy (see
-``commands.sidecar._extract_exif_with_fallback``).
-
-Validated against 82 real files (TIFF orthos with the IFD 74% into a 1.5 GB
-file, JPEG, MP4, AVI, TTS): exiftool output identical to a full download, ~92x
-less data fetched.
+The copy has the object's full size, but only the ranges exiftool reads for the
+detected format are fetched; the rest are holes. Every byte exiftool does read
+is real, so its output matches a full download. :class:`SparseReadError` and
+its subclasses mean "download the whole file instead".
 """
 
 from __future__ import annotations
@@ -63,7 +48,6 @@ class SparseStats:
     ranges: tuple[tuple[int, int], ...] = ()
 
     def covers(self, offset: int) -> bool:
-        """Whether the byte at ``offset`` was fetched (is real, not a hole)."""
         return any(a <= offset < b for a, b in self.ranges)
 
 
@@ -88,7 +72,7 @@ class SparseCopy:
         self._fh = open(path, "w+b")  # noqa: SIM115 — closed in close()
         self._fh.truncate(size)
         if head:
-            # The caller fetched these; count them so stats/budget are honest.
+            # Fetched by the caller, but still counts toward stats and budget.
             self.requests = 1
             self.fetched = len(head)
             self._store(0, head[:size])
@@ -164,17 +148,15 @@ _INT_FMT = {3: "H", 4: "I", 13: "I", 16: "Q", 18: "Q"}
 
 
 def _ints(bo: str, typ: int, data: bytes, count: int) -> list[int]:
-    """Decode ``count`` unsigned integers of TIFF type ``typ`` from ``data``.
-
-    Inline values are left-justified in the entry's value field, so a 4-byte
-    LONG inside a BigTIFF's 8-byte field is read as 4 bytes, not 8.
-    """
+    """Inline values are left-justified, so a LONG in a BigTIFF's 8-byte field is 4 bytes."""
     fmt = _INT_FMT.get(typ)
     if fmt is None:
         return []
     width = struct.calcsize(fmt)
     count = min(count, len(data) // width)
     return list(struct.unpack(bo + fmt * count, data[: width * count]))
+
+
 _MAKERNOTE = 37500
 # Offsets at which maker notes commonly start an IFD (bare, or after a
 # vendor header such as "Nikon\0\2\x10\0\0" / "OLYMPUS\0II").
@@ -354,8 +336,7 @@ def _detect(head: bytes, name: str) -> str:
     return "unsupported"
 
 
-# Extensions worth trying a sparse read for; anything else (PNG, JP2, …) goes
-# straight to a full download without spending a head request first.
+# Anything else (PNG, JP2, …) skips straight to a full download.
 SPARSE_EXTENSIONS = frozenset(
     {".tif", ".tiff", ".jpg", ".jpeg", ".mp4", ".mov", ".m4v", ".avi",
      ".ts", ".tts", ".m2ts", ".mts"}
@@ -363,8 +344,6 @@ SPARSE_EXTENSIONS = frozenset(
 
 
 def may_support(name: str) -> bool:
-    """Cheap pre-check by extension; :func:`build_sparse_copy` still sniffs
-    the content and raises :class:`UnsupportedFormat` on a mismatch."""
     return os.path.splitext(name)[1].lower() in SPARSE_EXTENSIONS
 
 
@@ -388,10 +367,8 @@ def build_sparse_copy(
 ) -> SparseStats:
     """Write a sparse copy of a ``size``-byte remote object to ``path``.
 
-    ``head`` is the object's first bytes if the caller already has them (saves a
-    request); ``name`` is the object's key (its extension disambiguates some
-    formats). Raises :class:`SparseReadError` (or a subclass) when the caller
-    should download the whole file instead; ``path`` may then be partial.
+    ``name``'s extension disambiguates some formats. On :class:`SparseReadError`
+    ``path`` may be partial.
     """
     sp = SparseCopy(path, size, fetch, head=head, budget=budget)
     try:

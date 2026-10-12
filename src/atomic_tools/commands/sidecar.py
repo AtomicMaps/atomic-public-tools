@@ -920,18 +920,11 @@ _STRUCTURAL_WORDS_RE = re.compile(
 
 
 def _sparse_read_problem(meta: dict, stats: SparseStats | None = None) -> str | None:
-    """Why a metadata read from a sparse copy can't be trusted, or None.
+    """Why exiftool's result on a sparse copy can't be trusted, or None.
 
-    An empty result or an exiftool Error always means "read the whole file". A
-    Warning is trusted (no fallback) only when it can't have come from the
-    unfetched holes in the copy:
-
-    * an exiftool ``[minor]`` hint with no structural wording, such as
-      "[minor] The ExtractEmbedded option may find more tags in the media data";
-    * a warning naming an offset that lies in a range that *was* fetched — the
-      bytes exiftool complains about are real, so the full file says the same.
-
-    Anything else falls back. A wrong guess here only costs a download.
+    A warning is trusted only if it can't come from the unfetched holes: a
+    ``[minor]`` hint with no structural wording, or one citing a fetched offset.
+    A wrong guess only costs a download.
     """
     if not meta:
         return "no metadata returned"
@@ -950,8 +943,6 @@ def _sparse_read_problem(meta: dict, stats: SparseStats | None = None) -> str | 
 
 
 def _extract_exif_with_fallback(backend: StorageBackend, key: str, label: str) -> dict:
-    """exiftool on a sparse copy when the backend offers one, falling back to a
-    full download if exiftool reports any problem reading it."""
     with backend.open_metadata_view(key) as view:
         meta = extract_exif_metadata(view.path, filename=label)
         if not view.sparse:
