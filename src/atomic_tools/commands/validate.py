@@ -56,23 +56,16 @@ def _run_api_mode(
     include: str | None,
     verbose: bool,
 ) -> None:
-    """Non-interactive validate: one JSON document on stdout, nothing else.
-
-    Exit 0 whenever validation completed (pass/fail is in ``status``), 2 for
-    bad input, 1 when the run itself errored.
-    """
+    """Print one JSON document to stdout. Exit 0 if validation ran, else 2/1."""
     real_stdout = sys.stdout
     if not verbose:
-        # Logs already go to stderr; drop them to errors-only so a log
-        # aggregator on the API host isn't flooded with per-file warnings.
+        # Per-file warnings would flood a server's logs.
         logging.getLogger().setLevel(logging.ERROR)
 
     if not path:
         response = error_payload("invalid_input", "--path is required with --api-mode.")
     else:
-        # Same code path as the library API. Anything that prints (third-party
-        # libraries, stray echoes) goes to stderr so stdout carries exactly
-        # one JSON document.
+        # Keep stray prints off stdout, which carries only the JSON.
         with contextlib.redirect_stdout(sys.stderr):
             response = validate_path(
                 path,

@@ -60,7 +60,6 @@ class MissingDataReport:
             writer.writerows(self.rows)
 
     def to_dict(self) -> dict:
-        """JSON-ready form of the failed-rows table (same columns as the CSV)."""
         columns = [self.filename_column, *self.field_columns]
         if self.include_coco:
             columns += [COCO_STATUS_COLUMN, COCO_LABELS_COLUMN]

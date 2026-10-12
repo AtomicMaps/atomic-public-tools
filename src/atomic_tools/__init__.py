@@ -1,9 +1,6 @@
 """atomic_tools — format and validate metadata for Atomic Flow intake.
 
-Library entry points (imported lazily so ``import atomic_tools`` and
-``am-tools --version`` stay cheap)::
-
-    from atomic_tools import validate_path, ValidationResponse
+Library exports load lazily so ``am-tools --version`` stays fast.
 """
 
 import logging

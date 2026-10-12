@@ -1,11 +1,7 @@
 """Pydantic response models for the library API.
 
-:class:`ValidationResponse` is what :func:`atomic_tools.validate_path`
-returns; use it directly as a FastAPI
-``response_model``. Sections the caller didn't ask for (``include``) are left
-*unset*, so serialise with ``exclude_unset=True`` (FastAPI:
-``response_model_exclude_unset=True``) to omit them — that is the same JSON the
-CLI prints with ``validate --api-mode``.
+Unrequested sections are left unset: serialise with ``exclude_unset=True``
+(FastAPI: ``response_model_exclude_unset=True``).
 """
 
 from __future__ import annotations
@@ -91,8 +87,7 @@ class ErrorInfo(BaseModel):
 
 
 class ValidationResponse(BaseModel):
-    """Result of one validation run. ``summary`` is None only when
-    ``status == "error"``; optional sections are unset unless requested."""
+    """``summary`` is None only when ``status == "error"``."""
 
     schema_version: int = SCHEMA_VERSION
     status: Status
@@ -106,5 +101,4 @@ class ValidationResponse(BaseModel):
     error: ErrorInfo | None = None
 
     def to_json_dict(self) -> dict[str, Any]:
-        """Plain-JSON dict with unrequested sections omitted."""
         return self.model_dump(mode="json", exclude_unset=True)

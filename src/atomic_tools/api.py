@@ -1,14 +1,8 @@
-"""Programmatic entry point for validation — the engine behind ``validate --api-mode``.
+"""Library entry point behind ``validate --api-mode``.
 
-:func:`validate_path` validates a directory/prefix or a single file that is
-already on disk or in an object store. It never prompts, never prints, and
-never raises: failures come back as ``status == "error"`` with an ``error``
-object. It returns a :class:`~atomic_tools.models.ValidationResponse`; sections
-not requested via ``include`` are left unset (serialise with
-``exclude_unset=True``).
-
-It is synchronous and blocks on subprocesses (exiftool/pdal). In an async
-framework call it from a worker thread.
+:func:`validate_path` never prompts, prints or raises; failures come back as
+``status == "error"``. It blocks on exiftool/pdal, so call it from a worker
+thread in async code.
 """
 
 from __future__ import annotations
@@ -49,11 +43,10 @@ __all__ = [
 ]
 
 SECTIONS: tuple[str, ...] = ("findings", "missing_data", "metadata", "details")
-# metadata is opt-in: one dict per file can be large for big directories.
+# metadata is opt-in: one dict per file gets large.
 DEFAULT_SECTIONS: frozenset[str] = frozenset({"findings", "missing_data", "details"})
 
-# Some findings embed click-coloured text (e.g. the geography histogram); a JSON
-# consumer wants plain text.
+# Some findings embed click colours (e.g. the geography histogram).
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
@@ -63,9 +56,7 @@ def _plain(text: str | None) -> str | None:
 
 @dataclass
 class ValidationResult:
-    """Everything a validation run produces, before any rendering."""
-
-    df: Any  # pandas.DataFrame — the assembled (unsaved) sidecar, all-string cells
+    df: Any  # pandas.DataFrame with all-string cells
     report: LintReport
     detected_types: set[DataTypeEnum]
     skipped_vector: list[str]
@@ -86,12 +77,7 @@ class ValidationResult:
 
 
 def parse_include(value: str | Iterable[str] | None) -> frozenset[str]:
-    """Normalise an ``include`` spec (comma string or iterable) to section names.
-
-    ``None``/empty → :data:`DEFAULT_SECTIONS`; ``"all"`` → every section.
-    Raises :class:`InvalidInputError` naming any unknown section, or when
-    ``value`` isn't a string or an iterable of strings.
-    """
+    """``None``/empty → :data:`DEFAULT_SECTIONS`; ``"all"`` → every section."""
     if value is None:
         return DEFAULT_SECTIONS
     if isinstance(value, str):
@@ -133,11 +119,7 @@ def run_validation(
     coco: str | None = None,
     quiet: bool = False,
 ) -> ValidationResult:
-    """Build the sidecar in memory and lint it without persisting anything.
-
-    Shared by the interactive CLI and :func:`validate_path`. Raises on
-    extraction/build failures; callers decide how to surface them.
-    """
+    """Build the sidecar in memory and lint it. Unlike :func:`validate_path`, raises."""
     logger.info(
         f"Starting validation — path={path!r} data_type={data_type} "
         f"client_sidecar={client_sidecar!r} client_schema={client_schema!r} "
@@ -154,8 +136,6 @@ def run_validation(
         quiet=quiet,
         unclassified_out=unclassified,
     )
-    # Normalise once to the CSV string form; lint and the metadata section both
-    # use this frame.
     df = _as_csv_strings(df)
     crs_failures = _crs_failures(df)
 
@@ -166,14 +146,10 @@ def run_validation(
         final=True,
         data_type=data_type,
         input_files_path=path,
-        # Reuse the scan's backend: no second session/listing for the
-        # file-inventory check.
         input_backend=backend,
         ignore_missing_orientation=ignore_missing_orientation,
         coco_path=coco,
-        # validate is informational — a COCO referencing images absent from
-        # the scanned directory is reported as a warning here, not a hard
-        # failure (it blocks only when generating a sidecar that ships).
+        # Informational run: only sidecar generation blocks on this.
         coco_not_on_disk_is_error=False,
     )
     return ValidationResult(
@@ -196,8 +172,7 @@ def build_payload(result: ValidationResult, include: Iterable[str]) -> Validatio
         int((filenames != DEFAULT_ROW_NAME).sum()) if filenames is not None else len(df)
     )
 
-    # Only requested sections are passed, so the rest stay *unset* and are
-    # dropped by exclude_unset serialisation.
+    # Unrequested sections stay unset so exclude_unset drops them.
     fields: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "status": result.status,
@@ -235,7 +210,6 @@ def build_payload(result: ValidationResult, include: Iterable[str]) -> Validatio
 
 
 def error_payload(error_type: str, message: str) -> ValidationResponse:
-    """The response returned when validation could not run to completion."""
     return ValidationResponse(
         schema_version=SCHEMA_VERSION,
         status="error",
@@ -254,20 +228,15 @@ def _classify_exception(exc: BaseException) -> str:
     if isinstance(
         exc,
         (
-            # Raised deliberately for bad paths, flag values and uploads. A bare
-            # ValueError (pandas, JSON, …) is a bug, not the caller's fault.
+            # Not bare ValueError: one from pandas, pyproj, … is a bug.
             InvalidInputError,
             NotImplementedError,
-            # from_path() was given a local path (or a client file) that doesn't exist.
             FileNotFoundError,
-            # Bad client sidecar/schema, or point clouds whose CRS can't be used.
             SidecarMergeError,
             PointCloudCRSError,
         ),
     ):
         return "invalid_input"
-    # Anything else: storage/network failures wrapped as RuntimeError, and bugs
-    # (including stray ValueErrors from pandas, pyproj, …).
     return "internal_error"
 
 
@@ -283,14 +252,9 @@ def validate_path(
     coco: str | None = None,
     include: str | Iterable[str] | None = None,
 ) -> ValidationResponse:
-    """Validate ``path`` (a directory/prefix or a single file/object). Never raises.
+    """Validate a directory/prefix or a single file/object. Never raises.
 
-    ``data_type`` accepts a :class:`DataTypeEnum` or its string value; ``None``
-    auto-detects per file. ``include`` selects response sections (see
-    :func:`parse_include`).
-
-    Point ``path`` at the file itself or a folder holding only this request's
-    data — a folder is scanned recursively.
+    A folder is scanned recursively, so never point this at a shared one.
     """
     try:
         sections = parse_include(include)

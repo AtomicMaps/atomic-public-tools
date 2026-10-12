@@ -936,10 +936,8 @@ def _build_sidecar(
       include/exclude listing, no spherical refinement (a client passing
       ``--datatype spherical_image`` must not have panoramas reclassified).
 
-    ``quiet`` suppresses console-only output (progress bar, the red missing
-    required-fields block) for machine callers such as ``validate --api-mode``;
-    logging is unaffected. ``unclassified_out``, when given, is extended with the
-    auto-detect keys that matched no known data type.
+    ``quiet`` hides console-only output (progress bar, missing-fields block) but
+    not logging. ``unclassified_out`` collects keys that matched no data type.
     """
     if spatial_reference:
         # Fail fast on an unparseable CRS before doing any extraction work.

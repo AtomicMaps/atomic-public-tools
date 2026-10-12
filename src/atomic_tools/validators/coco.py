@@ -132,7 +132,6 @@ class CocoImpact:
         ]
 
     def to_dict(self) -> dict:
-        """JSON-ready form: per-tier image/label counts plus every verdict."""
         return {
             "coco_path": self.coco_path,
             "images_in_coco": self.images_in_coco,
