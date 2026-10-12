@@ -14,7 +14,7 @@ from atomic_tools.client_sidecar import (
     build_global_alias_map,
     load_client_schema,
 )
-from atomic_tools.io.storage import from_directory
+from atomic_tools.io.storage import from_path
 from atomic_tools.utils.aws_errors import S3AuthError
 from atomic_tools.utils.utils import (
     DATA_TYPE_INFO,
@@ -701,7 +701,7 @@ def _check_file_inventory(
         return
 
     try:
-        backend = from_directory(input_files_path)
+        backend = from_path(input_files_path)
         keys = backend.list_keys(include=include, exclude=exclude)
         if data_type_filter is None:
             # Mirror generation's auto-detect listing, which drops preview .tif

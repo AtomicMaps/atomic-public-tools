@@ -1,7 +1,7 @@
 """Programmatic entry point for validation — the engine behind ``validate --api-mode``.
 
-:func:`validate_directory` scans a directory, builds the sidecar in memory, lints
-it, and returns a JSON-serialisable dict. It never prompts, never prints to
+:func:`validate_path` scans a directory or single file, builds the sidecar in
+memory, lints it, and returns a JSON-serialisable dict. It never prompts, never prints to
 stdout, never writes a file, and never raises: failures come back as
 ``status == "error"`` with an ``error`` object, so an API handler can return the
 dict as-is.
@@ -94,7 +94,7 @@ def parse_include(value: str | Iterable[str] | None) -> frozenset[str]:
 
 
 def run_validation(
-    directory: str,
+    path: str,
     *,
     data_type: DataTypeEnum | None = None,
     client_sidecar: str | None = None,
@@ -107,18 +107,18 @@ def run_validation(
 ) -> ValidationResult:
     """Build the sidecar in memory and lint it without persisting anything.
 
-    Shared by the interactive CLI and :func:`validate_directory`. Raises on
+    Shared by the interactive CLI and :func:`validate_path`. Raises on
     extraction/build failures; callers decide how to surface them.
     """
     logger.info(
-        f"Starting validation — directory={directory!r} data_type={data_type} "
+        f"Starting validation — path={path!r} data_type={data_type} "
         f"client_sidecar={client_sidecar!r} client_schema={client_schema!r} "
         f"full={full} spatial_reference={spatial_reference!r} coco={coco!r}"
     )
     unclassified: list[str] = []
     # validate never persists, so the backend is unused.
     df, _, detected_types, skipped_vector = _build_sidecar(
-        directory=directory,
+        directory=path,
         data_type=data_type,
         client_sidecar=client_sidecar,
         client_schema=client_schema,
@@ -134,7 +134,7 @@ def run_validation(
         df,
         final=True,
         data_type=data_type,
-        input_files_path=directory,
+        input_files_path=path,
         ignore_missing_orientation=ignore_missing_orientation,
         coco_path=coco,
         # validate is informational — a COCO referencing images absent from
@@ -210,16 +210,17 @@ def _classify_exception(exc: BaseException) -> str:
         return "auth_error"
     if isinstance(exc, PdalNotFoundError):
         return "dependency_missing"
-    if isinstance(exc, (ValueError, NotImplementedError)):
+    if isinstance(exc, (ValueError, NotImplementedError, FileNotFoundError)):
+        # FileNotFoundError: from_path() was given a local path that doesn't exist.
         return "invalid_input"
-    if isinstance(exc, (FileNotFoundError, RuntimeError)):
+    if isinstance(exc, RuntimeError):
         # _build_sidecar raises RuntimeError when no supported files are found.
         return "no_data"
     return "internal_error"
 
 
-def validate_directory(
-    directory: str,
+def validate_path(
+    path: str,
     *,
     data_type: DataTypeEnum | str | None = None,
     client_sidecar: str | None = None,
@@ -230,7 +231,8 @@ def validate_directory(
     coco: str | None = None,
     include: str | Iterable[str] | None = None,
 ) -> dict:
-    """Validate ``directory`` and return the JSON payload (never raises).
+    """Validate ``path`` (a directory/prefix or a single file/object) and
+    return the JSON payload (never raises).
 
     ``data_type`` accepts a :class:`DataTypeEnum` or its string value; ``None``
     auto-detects per file. ``include`` selects payload sections (see
@@ -238,15 +240,15 @@ def validate_directory(
     """
     try:
         sections = parse_include(include)
-        if not directory:
-            raise ValueError("directory is required.")
+        if not path:
+            raise ValueError("path is required.")
         dt = DataTypeEnum(data_type) if isinstance(data_type, str) else data_type
     except ValueError as e:
         return error_payload("invalid_input", str(e))
 
     try:
         result = run_validation(
-            directory,
+            path,
             data_type=dt,
             client_sidecar=client_sidecar,
             client_schema=client_schema,

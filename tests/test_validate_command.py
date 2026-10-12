@@ -48,7 +48,7 @@ def test_validate_runs_lint_in_final_mode(captured_lint, tmp_path):
         app,
         [
             "validate",
-            "--directory",
+            "--path",
             str(tmp_path),
             "--datatype",
             "oriented_image",
@@ -65,7 +65,7 @@ def test_validate_runs_lint_in_final_mode(captured_lint, tmp_path):
 def test_validate_without_datatype_runs_auto(captured_lint, tmp_path):
     """No --datatype: the command runs non-interactively (auto-detect) and lint
     receives data_type=None."""
-    result = runner.invoke(app, ["validate", "--directory", str(tmp_path)])
+    result = runner.invoke(app, ["validate", "--path", str(tmp_path)])
     assert result.exit_code == 0, result.output
     assert captured_lint["lint_kwargs"]["data_type"] is None
     assert captured_lint["build_kwargs"]["data_type"] is None
@@ -76,7 +76,7 @@ def test_validate_passes_coco_to_lint(captured_lint, tmp_path):
         app,
         [
             "validate",
-            "--directory",
+            "--path",
             str(tmp_path),
             "--datatype",
             "oriented_image",
@@ -95,7 +95,7 @@ def test_validate_passes_through_optional_args(captured_lint, tmp_path):
         app,
         [
             "validate",
-            "--directory",
+            "--path",
             str(tmp_path),
             "--datatype",
             "oriented_image",
@@ -115,7 +115,7 @@ def test_validate_writes_no_sidecar(captured_lint, tmp_path):
     """The sidecar is linted in memory; the input directory is never written to."""
     result = runner.invoke(
         app,
-        ["validate", "--directory", str(tmp_path), "--datatype", "point_cloud"],
+        ["validate", "--path", str(tmp_path), "--datatype", "point_cloud"],
     )
     assert result.exit_code == 0, result.output
     # Nothing left behind in the scanned directory.
@@ -136,6 +136,6 @@ def test_validate_exits_nonzero_on_errors(monkeypatch, tmp_path):
 
     result = runner.invoke(
         app,
-        ["validate", "--directory", str(tmp_path), "--datatype", "point_cloud"],
+        ["validate", "--path", str(tmp_path), "--datatype", "point_cloud"],
     )
     assert result.exit_code == 1

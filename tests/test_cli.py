@@ -103,7 +103,7 @@ def test_validate_help_lists_shared_options(monkeypatch):
     result = runner.invoke(app, ["validate", "--help"], env={"COLUMNS": "200"})
     assert result.exit_code == 0
     for flag in (
-        "--directory",
+        "--path",
         "--datatype",
         "--client-sidecar",
         "--client-schema",

@@ -6,7 +6,7 @@ import pytest
 from obstore.exceptions import PermissionDeniedError, UnauthenticatedError
 
 from atomic_tools.io import storage
-from atomic_tools.io.storage import ObjectStoreBackend, from_directory
+from atomic_tools.io.storage import ObjectStoreBackend, from_path
 from atomic_tools.utils import object_store as object_store_module
 from atomic_tools.utils.aws_errors import (
     S3CredentialsMissingError,
@@ -26,14 +26,14 @@ class _FakeSession:
         return object() if self._has_credentials else None
 
 
-def test_from_directory_raises_credentials_missing(monkeypatch):
+def test_from_path_raises_credentials_missing(monkeypatch):
     monkeypatch.setattr(
         object_store_module.boto3,
         "Session",
         lambda *a, **kw: _FakeSession(has_credentials=False),
     )
     with pytest.raises(S3CredentialsMissingError) as ei:
-        from_directory("s3://example-bucket/some/prefix")
+        from_path("s3://example-bucket/some/prefix")
     assert ei.value.profile == "fake-profile"
     assert "fake-profile" in ei.value.help_text()
 
@@ -48,6 +48,8 @@ def _make_backend_without_store(monkeypatch) -> ObjectStoreBackend:
     backend._bucket = "denied-bucket"
     backend._prefix = "deep/path"
     backend._store = object()
+    backend._single_key = None
+    backend._single_size = 0
     return backend
 
 

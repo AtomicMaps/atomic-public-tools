@@ -16,7 +16,7 @@ The main tool of this repo is the the library `am-tools`. It is designed to vali
     - Windows: download from https://exiftool.org/
 - **pdal** — required only if you generate sidecars for point clouds.
     - macOS / Linux: `conda install -c conda-forge pdal` (the tool currently looks for `/opt/conda/envs/pdal/bin/pdal`)
-- **AWS CLI** — required only if you point `--directory` (or a client sidecar/schema) at an `s3://` URI. Install from https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html and see the *Authenticating with AWS* section below.
+- **AWS CLI** — required only if you point `--path`/`--directory` (or a client sidecar/schema) at an `s3://` URI. Install from https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html and see the *Authenticating with AWS* section below.
 
 ### Python package
 
@@ -51,7 +51,7 @@ the vendored copies shipped in the release are used as-is. Run
 
 ## Authenticating with AWS
 
-When `--directory` (or `--client-sidecar`, `--client-schema`) is an `s3://` URI, `am-tools` uses your local AWS credentials via `boto3`. The recommended setup is AWS SSO through the AWS CLI:
+When `--path`/`--directory` (or `--client-sidecar`, `--client-schema`) is an `s3://` URI, `am-tools` uses your local AWS credentials via `boto3`. The recommended setup is AWS SSO through the AWS CLI:
 
 1. Install the AWS CLI: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html
 2. Configure an SSO profile and sign in. For a walkthrough of the one-time `~/.aws/config` setup, see: https://dev.to/slsbytheodo/understand-the-aws-sso-login-configuration-4am7
@@ -99,14 +99,14 @@ After completing the interactive portion, it will show you in blue text a full c
 After the sidecar has been generated, it will tell you where it put the file and it lints the file automatically. Speaking of linting, if you want to lint things manually, there is a command for that.
 
 #### Reformatting a local sidecar
-You can use `sidecar` to reformat a sidecar you already have locally into the Atomic Flow schema. The command scans the directory of data files and merges your CSV into the metadata it extracts, so point `--directory` at the folder that holds the actual files and `--client-sidecar` at your CSV. All flags below also accept `s3://`, `gs://`, and `az://` URIs.
+You can use `sidecar` to reformat a sidecar you already have locally into the Atomic Flow schema. The command scans the directory of data files and merges your CSV into the metadata it extracts, so point `--path` (alias: `--directory`) at the folder that holds the actual files, or at a single file to build a sidecar for just that file (the CSV is written beside it) and `--client-sidecar` at your CSV. All flags below also accept `s3://`, `gs://`, and `az://` URIs.
 
 **Reformat a local sidecar to the AM schema.** Provide a `--client-schema` to rename your columns into their canonical names (see *Sidecar Schemas* below):
 
 ```bash
 # Data type is auto-detected per file; add --datatype <type> only to restrict the scan.
 am-tools sidecar \
-  --directory ./data \
+  --path ./data \
   --client-sidecar ./my_sidecar.csv \
   --client-schema ./schemas/my_schema.json
 ```
@@ -117,7 +117,7 @@ am-tools sidecar \
 
 ```bash
 am-tools sidecar \
-  --directory ./data \
+  --path ./data \
   --client-sidecar ./my_sidecar.csv \
   --spatial-reference EPSG:32612
 ```
@@ -127,22 +127,27 @@ am-tools sidecar \
 ```bash
 # sidecars/flight-a/a.csv  and  sidecars/flight-b/b.csv  are merged
 am-tools sidecar \
-  --directory ./data \
+  --path ./data \
   --client-sidecar ./sidecars
 ```
 
 ### `am-tools validate`
-Sometimes you just want to know whether your data is clean without leaving a sidecar behind. `am-tools validate` does exactly what `am-tools sidecar` does — scans the directory, extracts per-file metadata, merges any client-supplied sidecar, builds the canonical sidecar, and lints it — but **never saves the sidecar** to the remote directory or locally. It's the right command when you only care about the lint report.
+Sometimes you just want to know whether your data is clean without leaving a sidecar behind. `am-tools validate` does exactly what `am-tools sidecar` does — scans the input, extracts per-file metadata, merges any client-supplied sidecar, builds the canonical sidecar, and lints it — but **never saves the sidecar** to the remote directory or locally. It's the right command when you only care about the lint report.
+
+Like `sidecar`, `validate` takes `--path` (`--directory` still works as an alias). It can point at a folder/prefix **or a single file** (`./data/IMG_0001.jpg`, `s3://bucket/flight1/IMG_0001.jpg`). With a single file only that file is extracted and checked; the other files in its folder are ignored. If you also pass `--datatype` and the file isn't that type, it fails with a clear error. Drop `--datatype` to auto-detect the file's type.
 
 It shares all the same options and interactive wizard as `sidecar`, with the two save-related questions removed (it doesn't ask what to name the sidecar or whether to keep a local copy, because nothing is written). Like `generate`, it lints in "final" mode and prints the report; it exits non-zero if any errors are found.
 
 ```bash
 # Auto-detects every file's type; no --datatype needed.
-am-tools validate --directory ./data
+am-tools validate --path ./data
+
+# just one file
+am-tools validate --path ./data/IMG_0001.jpg
 
 # with a client sidecar, reprojection, and orientation ignored — same flags as generate
 am-tools validate \
-  --directory ./data \
+  --path ./data \
   --client-sidecar ./my_sidecar.csv \
   --client-schema ./schemas/my_schema.json \
   --spatial-reference EPSG:32612 \
@@ -150,11 +155,12 @@ am-tools validate \
 ```
 
 #### API mode (`--api-mode`)
-For calling `validate` from a service, pass `--api-mode`. It never prompts (`--directory` is required), skips the daily update check, hides the progress bar and colored banners, and prints **one JSON document to stdout**. Logs go to stderr at ERROR level unless you pass `-v`.
+For calling `validate` from a service, pass `--api-mode`. It never prompts (`--path` is required), skips the daily update check, hides the progress bar and colored banners, and prints **one JSON document to stdout**. Logs go to stderr at ERROR level unless you pass `-v`.
 
 ```bash
-am-tools validate --directory s3://bucket/prefix --api-mode
-am-tools validate --directory ./data --api-mode --include findings,metadata
+am-tools validate --path s3://bucket/prefix --api-mode
+am-tools validate --path s3://bucket/prefix/IMG_0001.jpg --api-mode
+am-tools validate --path ./data --api-mode --include findings,metadata
 ```
 
 `--include` picks which sections come back: `findings`, `missing_data`, `metadata`, `details` or `all`. The default is `findings,missing_data,details`; `metadata`, which has every extracted field for every file, is opt-in because it can be large. `schema_version`, `status`, `summary` and `error` are always present.
@@ -180,22 +186,23 @@ Exit codes:
 | Code | Meaning |
 |---|---|
 | 0 | Validation ran. Check `status`; a failed lint still exits 0. |
-| 2 | Bad input, such as no `--directory` or an unknown `--include` section. `status` is `error`. |
-| 1 | The run itself failed, such as no supported files, an auth error or missing pdal. `status` is `error`, and `error.type` is one of `invalid_input`, `no_data`, `auth_error`, `dependency_missing` or `internal_error`. |
+| 2 | Bad input: no `--path`, a path that doesn't exist, a single file that isn't a supported (or the requested `--datatype`) type, a bad `--spatial-reference`, or an unknown `--include` section. `status` is `error` and `error.type` is `invalid_input`. |
+| 1 | The run itself failed, such as no supported files in a folder, an auth error or missing pdal. `status` is `error`, and `error.type` is one of `no_data`, `auth_error`, `dependency_missing` or `internal_error`. |
 
 On servers, also set `AM_TOOLS_NO_VERSION_CHECK=1` so no other command makes the outbound update check.
 
 The same thing is available in Python without a subprocess:
 
 ```python
-from atomic_tools import validate_directory
+from atomic_tools import validate_path
 
-payload = validate_directory("s3://bucket/prefix", data_type=None, include="all")
+payload = validate_path("s3://bucket/prefix", data_type=None, include="all")
+payload = validate_path("s3://bucket/prefix/IMG_0001.jpg")  # a single file works too
 if payload["status"] == "failed":
     ...
 ```
 
-`validate_directory` never raises; failures come back as `status: "error"`.
+`validate_path` never raises; failures come back as `status: "error"`.
 
 ### `am-tools lint`
 There are two subcommands in `am-tools lint`:
@@ -244,7 +251,7 @@ For oriented-image rows the wizard asks whether you want to ignore missing orien
 
 ```
 am-tools lint sidecar my_sidecar.csv --final --datatype oriented_image --ignore-missing-orientation
-am-tools sidecar --directory ./imgs --datatype oriented_image --ignore-missing-orientation
+am-tools sidecar --path ./imgs --datatype oriented_image --ignore-missing-orientation
 ```
 
 Whenever the sidecar has latitude and longitude columns, the linter also runs a batch-level spatial check to help catch coordinates that parse fine but are wrong relative to the rest of the batch (a dropped decimal, a flipped sign, an altitude in the wrong units):
@@ -275,9 +282,9 @@ Each labelled image is matched to its sidecar row (by filename, using the parent
 The lint output gains a label-impact summary (how many labels are *affected* = degraded + unusable + not_on_disk, and how many are *unusable* = unusable + not_on_disk), and the failed-rows CSV (`--report`) gains `coco_status` and `coco_labels` columns so you can see per-image which labels are at risk — including the degraded and not-on-disk images, which wouldn't otherwise appear in that report.
 
 ```
-am-tools validate --directory ./imgs --datatype oriented_image --coco labels.coco.json
+am-tools validate --path ./imgs --datatype oriented_image --coco labels.coco.json
 am-tools lint sidecar my_sidecar.csv --final --datatype oriented_image --coco labels.coco.json --report impact.csv
-am-tools sidecar --directory ./imgs --datatype oriented_image --coco labels.coco.json
+am-tools sidecar --path ./imgs --datatype oriented_image --coco labels.coco.json
 ```
 
 > Note: the tier respects the same required/optional policy the linter uses. For `oriented_image`, orientation is required by default (so a missing heading makes an image *unusable*); pass `--ignore-missing-orientation` to treat orientation as optional (so it only makes an image *degraded*).

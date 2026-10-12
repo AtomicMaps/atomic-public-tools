@@ -23,7 +23,7 @@ import click
 import questionary
 import typer
 
-from atomic_tools.io.storage import from_directory
+from atomic_tools.io.storage import from_path
 from atomic_tools.utils.utils import (
     DataTypeEnum,
     has_value,
@@ -444,7 +444,7 @@ def _save_schema(schema: dict, csv_path: str, target: str, filename: str) -> lis
         source.write_text(serialized, encoding="utf-8")
 
         if target in (_SAVE_SAME, _SAVE_BOTH):
-            backend = from_directory(_parent_location(csv_path))
+            backend = from_path(_parent_location(csv_path))
             written.append(backend.write_output(filename, source))
 
         if target in (_SAVE_LOCAL, _SAVE_BOTH):

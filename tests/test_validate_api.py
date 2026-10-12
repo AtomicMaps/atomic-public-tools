@@ -1,4 +1,4 @@
-"""Tests for `am-tools validate --api-mode` and `atomic_tools.validate_directory`."""
+"""Tests for `am-tools validate --api-mode` and `atomic_tools.validate_path`."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from typer.testing import CliRunner
 import atomic_tools.api as api_mod
 import atomic_tools.cli as cli_mod
 import atomic_tools.commands.validate as validate_mod
-from atomic_tools import validate_directory
+from atomic_tools import validate_path
 from atomic_tools.cli import app
 from atomic_tools.utils.utils import DataTypeEnum
 from atomic_tools.validators.report import LintReport, MissingDataReport
@@ -65,7 +65,7 @@ def _json(result) -> dict:
 
 
 def test_api_mode_passed_outputs_only_json(stubbed, tmp_path):
-    result = _invoke("--directory", str(tmp_path), "--api-mode")
+    result = _invoke("--path", str(tmp_path), "--api-mode")
     assert result.exit_code == 0, result.output
     payload = _json(result)
     assert payload["schema_version"] == 1
@@ -93,7 +93,7 @@ def test_api_mode_failed_lint_still_exits_zero(stubbed, tmp_path):
     )
     stubbed["report"] = report
 
-    result = _invoke("--directory", str(tmp_path), "--api-mode")
+    result = _invoke("--path", str(tmp_path), "--api-mode")
     assert result.exit_code == 0, result.output
     payload = _json(result)
     assert payload["status"] == "failed"
@@ -110,13 +110,13 @@ def test_api_mode_failed_lint_still_exits_zero(stubbed, tmp_path):
 
 def test_api_mode_warnings_only_status(stubbed, tmp_path):
     stubbed["report"].add_warning("meh")
-    payload = _json(_invoke("--directory", str(tmp_path), "--api-mode"))
+    payload = _json(_invoke("--path", str(tmp_path), "--api-mode"))
     assert payload["status"] == "passed_with_warnings"
 
 
 def test_api_mode_crs_failure_is_failed(stubbed, monkeypatch, tmp_path):
     monkeypatch.setattr(api_mod, "_crs_failures", lambda df: ["a.las"])
-    result = _invoke("--directory", str(tmp_path), "--api-mode")
+    result = _invoke("--path", str(tmp_path), "--api-mode")
     assert result.exit_code == 0
     payload = _json(result)
     assert payload["status"] == "failed"
@@ -125,7 +125,7 @@ def test_api_mode_crs_failure_is_failed(stubbed, monkeypatch, tmp_path):
 
 def test_api_mode_include_filters_sections(stubbed, tmp_path):
     payload = _json(
-        _invoke("--directory", str(tmp_path), "--api-mode", "--include", "metadata")
+        _invoke("--path", str(tmp_path), "--api-mode", "--include", "metadata")
     )
     assert "metadata" in payload
     assert not {"findings", "missing_data", "details"} & set(payload)
@@ -137,12 +137,12 @@ def test_api_mode_include_filters_sections(stubbed, tmp_path):
 
 
 def test_api_mode_include_all(stubbed, tmp_path):
-    payload = _json(_invoke("--directory", str(tmp_path), "--api-mode", "--include", "all"))
+    payload = _json(_invoke("--path", str(tmp_path), "--api-mode", "--include", "all"))
     assert {"findings", "missing_data", "metadata", "details"} <= set(payload)
 
 
 def test_api_mode_unknown_include_is_json_error(stubbed, tmp_path):
-    result = _invoke("--directory", str(tmp_path), "--api-mode", "--include", "bogus")
+    result = _invoke("--path", str(tmp_path), "--api-mode", "--include", "bogus")
     assert result.exit_code == 2
     payload = _json(result)
     assert payload["status"] == "error"
@@ -159,12 +159,12 @@ def test_api_mode_missing_directory_never_prompts(stubbed, monkeypatch):
     assert result.exit_code == 2
     payload = _json(result)
     assert payload["status"] == "error"
-    assert "--directory" in payload["error"]["message"]
+    assert "--path" in payload["error"]["message"]
 
 
 def test_api_mode_build_failure_is_json_error(stubbed, tmp_path):
     stubbed["build_exc"] = RuntimeError("No supported files found in /x")
-    result = _invoke("--directory", str(tmp_path), "--api-mode")
+    result = _invoke("--path", str(tmp_path), "--api-mode")
     assert result.exit_code == 1
     payload = _json(result)
     assert payload["status"] == "error"
@@ -177,14 +177,14 @@ def test_api_mode_stray_prints_go_to_stderr(stubbed, monkeypatch, tmp_path):
         return LintReport()
 
     monkeypatch.setattr(api_mod, "lint_sidecar_df", noisy_lint)
-    result = _invoke("--directory", str(tmp_path), "--api-mode")
+    result = _invoke("--path", str(tmp_path), "--api-mode")
     assert result.exit_code == 0
     assert _json(result)["status"] == "passed"
     assert "chatty" in result.stderr
 
 
 def test_include_without_api_mode_is_rejected(stubbed, tmp_path):
-    result = _invoke("--directory", str(tmp_path), "--include", "all")
+    result = _invoke("--path", str(tmp_path), "--include", "all")
     assert result.exit_code == 2
 
 
@@ -192,44 +192,44 @@ def test_api_mode_skips_version_check(stubbed, monkeypatch, tmp_path):
     called = []
     monkeypatch.setattr(cli_mod, "check_for_update", lambda: called.append(1))
     monkeypatch.setattr(
-        cli_mod.sys, "argv", ["amtools", "validate", "--directory", str(tmp_path), "--api-mode"]
+        cli_mod.sys, "argv", ["amtools", "validate", "--path", str(tmp_path), "--api-mode"]
     )
-    assert _invoke("--directory", str(tmp_path), "--api-mode").exit_code == 0
+    assert _invoke("--path", str(tmp_path), "--api-mode").exit_code == 0
     assert called == []
 
-    monkeypatch.setattr(cli_mod.sys, "argv", ["amtools", "validate", "--directory", str(tmp_path)])
-    _invoke("--directory", str(tmp_path))
+    monkeypatch.setattr(cli_mod.sys, "argv", ["amtools", "validate", "--path", str(tmp_path)])
+    _invoke("--path", str(tmp_path))
     assert called == [1]
 
 
 # ---- Python API --------------------------------------------------------------
 
 
-def test_validate_directory_matches_cli(stubbed, tmp_path):
-    from_cli = _json(_invoke("--directory", str(tmp_path), "--api-mode", "--include", "all"))
-    from_py = validate_directory(str(tmp_path), include="all")
+def test_validate_path_matches_cli(stubbed, tmp_path):
+    from_cli = _json(_invoke("--path", str(tmp_path), "--api-mode", "--include", "all"))
+    from_py = validate_path(str(tmp_path), include="all")
     assert from_py == from_cli
 
 
-def test_validate_directory_accepts_string_datatype(stubbed, tmp_path):
-    payload = validate_directory(str(tmp_path), data_type="oriented_image")
+def test_validate_path_accepts_string_datatype(stubbed, tmp_path):
+    payload = validate_path(str(tmp_path), data_type="oriented_image")
     assert payload["status"] == "passed"
     assert stubbed["build_kwargs"]["data_type"] == DataTypeEnum.oriented_image
 
 
-def test_validate_directory_never_raises(stubbed, tmp_path):
+def test_validate_path_never_raises(stubbed, tmp_path):
     stubbed["build_exc"] = ValueError("bad CRS")
-    payload = validate_directory(str(tmp_path))
+    payload = validate_path(str(tmp_path))
     assert payload["status"] == "error"
     assert payload["error"]["type"] == "invalid_input"
 
-    assert validate_directory("")["error"]["type"] == "invalid_input"
-    assert validate_directory(str(tmp_path), data_type="nope")["status"] == "error"
+    assert validate_path("")["error"]["type"] == "invalid_input"
+    assert validate_path(str(tmp_path), data_type="nope")["status"] == "error"
 
 
-def test_validate_directory_end_to_end(tmp_path, patched_extractors):  # noqa: F811
+def test_validate_path_end_to_end(tmp_path, patched_extractors):  # noqa: F811
     _make_mixed_dir(tmp_path)
-    payload = validate_directory(str(tmp_path), include="all")
+    payload = validate_path(str(tmp_path), include="all")
     assert payload["status"] in {"passed", "passed_with_warnings", "failed"}
     json.dumps(payload)  # fully serialisable
     names = {row["Filename"] for row in payload["metadata"]}

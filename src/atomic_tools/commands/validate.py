@@ -1,6 +1,6 @@
 """``am-tools validate`` — lint data without saving a sidecar.
 
-Does exactly what ``am-tools sidecar`` does — scan a directory,
+Does exactly what ``am-tools sidecar`` does — scan a directory (or one file),
 extract per-file metadata, assemble a sidecar, and lint it — but never writes
 the sidecar to the remote/local directory. It exists for the common case of
 "I just want to know whether my data is clean" without leaving a file behind.
@@ -53,7 +53,7 @@ def _emit_json(payload: dict, stream) -> None:
 
 def _run_api_mode(
     *,
-    directory: str | None,
+    path: str | None,
     data_type: DataTypeEnum | None,
     client_sidecar: str | None,
     client_schema: str | None,
@@ -77,8 +77,8 @@ def _run_api_mode(
 
     try:
         sections = parse_include(include)
-        if not directory:
-            raise ValueError("--directory is required with --api-mode.")
+        if not path:
+            raise ValueError("--path is required with --api-mode.")
     except ValueError as e:
         _emit_json(error_payload("invalid_input", str(e)), real_stdout)
         raise typer.Exit(code=2) from None
@@ -88,7 +88,7 @@ def _run_api_mode(
     try:
         with contextlib.redirect_stdout(sys.stderr):
             result = run_validation(
-                directory,
+                path,
                 data_type=data_type,
                 client_sidecar=client_sidecar,
                 client_schema=client_schema,
@@ -100,14 +100,15 @@ def _run_api_mode(
             )
     except Exception as e:  # noqa: BLE001 — always answer with JSON
         logger.error(f"Validation failed: {e}", exc_info=verbose)
-        _emit_json(error_payload(_classify_api_exception(e), str(e)), real_stdout)
-        raise typer.Exit(code=1) from None
+        error_type = _classify_api_exception(e)
+        _emit_json(error_payload(error_type, str(e)), real_stdout)
+        raise typer.Exit(code=2 if error_type == "invalid_input" else 1) from None
 
     _emit_json(build_payload(result, sections), real_stdout)
 
 
 def _validate(
-    directory: str,
+    path: str,
     data_type: DataTypeEnum | None,
     client_sidecar: str | None,
     client_schema: str | None,
@@ -118,7 +119,7 @@ def _validate(
 ) -> ValidationResult:
     """Build the sidecar in memory and lint it without persisting anything."""
     return run_validation(
-        directory,
+        path,
         data_type=data_type,
         client_sidecar=client_sidecar,
         client_schema=client_schema,
@@ -131,12 +132,16 @@ def _validate(
 
 def validate(
     ctx: typer.Context,
-    directory: Annotated[
+    path: Annotated[
         str | None,
         typer.Option(
+            "--path",
+            "--directory",
             help=(
-                "Directory to scan. Either an object-store URI "
-                "(s3://bucket/prefix, gs://..., az://...) or a local filesystem path."
+                "Directory or single file to validate (--directory is an "
+                "alias). Either an object-store "
+                "URI (s3://bucket/prefix, s3://bucket/key.jpg, gs://..., az://...) "
+                "or a local filesystem path."
             ),
         ),
     ] = None,
@@ -237,7 +242,7 @@ def validate(
                 "Machine mode for API use: never prompts, skips the update "
                 "check, and prints a single JSON document to stdout instead of "
                 "the text report. Exit 0 when validation ran (see 'status'), "
-                "2 for bad input, 1 if the run errored. Requires --directory."
+                "2 for bad input, 1 if the run errored. Requires --path."
             ),
         ),
     ] = False,
@@ -253,7 +258,7 @@ def validate(
         ),
     ] = None,
 ) -> None:
-    """Scan a directory, extract metadata, and lint it — without saving a sidecar.
+    """Scan a directory or file, extract metadata, and lint it — without saving a sidecar.
 
     Identical to ``sidecar`` except nothing is written: no sidecar is
     saved to the input directory or locally. With no flags, prompts
@@ -273,7 +278,7 @@ def validate(
 
     if api_mode:
         _run_api_mode(
-            directory=directory,
+            path=path,
             data_type=data_type_enum,
             client_sidecar=client_sidecar,
             client_schema=client_schema,
@@ -288,9 +293,9 @@ def validate(
     if include is not None:
         raise typer.BadParameter("--include only applies with --api-mode.")
 
-    # The wizard now only runs when the directory is missing; --datatype being
+    # The wizard now only runs when the path is missing; --datatype being
     # unset just means auto-detect, not "ask me".
-    wizard_ran = directory is None
+    wizard_ran = path is None
     if wizard_ran:
         full_provided = (
             ctx.get_parameter_source("full") == click.core.ParameterSource.COMMANDLINE
@@ -302,7 +307,7 @@ def validate(
         # output_filename / local_copy are irrelevant when nothing is saved, so
         # they're left at their defaults and ignored (hence save=False).
         result = _run_interactive_wizard(
-            directory,
+            path,
             data_type_enum,
             None,
             client_sidecar,
@@ -319,7 +324,7 @@ def validate(
             coco=coco,
             save=False,
         )
-        directory = result.directory
+        path = result.directory
         data_type_enum = result.data_type
         client_sidecar = result.client_sidecar
         client_schema = result.client_schema
@@ -335,15 +340,15 @@ def validate(
             )
         )
 
-    if not directory:
-        raise typer.BadParameter("Directory is required.")
+    if not path:
+        raise typer.BadParameter("--path is required.")
     # data_type is an optional filter now — None means auto-detect.
 
     if wizard_ran:
         _echo_replay_command(
             _format_replay_command(
                 ["validate"],
-                directory=directory,
+                directory=path,
                 data_type=data_type_enum,
                 client_sidecar=client_sidecar,
                 client_schema=client_schema,
@@ -357,7 +362,7 @@ def validate(
 
     try:
         result = _validate(
-            directory=directory,
+            path=path,
             data_type=data_type_enum,
             client_sidecar=client_sidecar,
             client_schema=client_schema,
