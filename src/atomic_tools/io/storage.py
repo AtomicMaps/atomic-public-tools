@@ -15,17 +15,25 @@ backend lists just that file and writes output beside it.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import tempfile
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from urllib.parse import parse_qs, urlparse
 
 import obstore
 from obstore.exceptions import NotFoundError, PermissionDeniedError, UnauthenticatedError
 
+from atomic_tools.io.partial_read import (
+    HEAD_BYTES,
+    SparseReadError,
+    SparseStats,
+    build_sparse_copy,
+)
 from atomic_tools.utils.aws_errors import (
     S3PermissionDeniedError,
     current_profile,
@@ -42,6 +50,24 @@ from atomic_tools.utils.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def sparse_reads_enabled() -> bool:
+    """Sparse metadata reads are on unless AM_TOOLS_SPARSE_READS is 0/false/no/off."""
+    return os.environ.get("AM_TOOLS_SPARSE_READS", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+@dataclass(frozen=True)
+class MetadataView:
+    """A local file to read metadata from. ``sparse`` means only the byte
+    ranges a metadata reader needs are real (see :mod:`atomic_tools.io.partial_read`);
+    if the reader reports a problem, re-read with :meth:`StorageBackend.open_local`."""
+
+    path: str
+    sparse: bool
+    stats: SparseStats | None = None
 
 
 class StorageBackend(ABC):
@@ -65,6 +91,16 @@ class StorageBackend(ABC):
     @abstractmethod
     def write_output(self, filename: str, source: Path) -> str:
         """Write `source` to the root as `filename`. Returns a display path."""
+
+    @contextmanager
+    def open_metadata_view(self, key: str) -> Iterator[MetadataView]:
+        """Yield a local file good enough for reading ``key``'s metadata.
+
+        Default: the full file. Remote backends override this to fetch only
+        the byte ranges exiftool reads.
+        """
+        with self.open_local(key) as path:
+            yield MetadataView(path=path, sparse=False)
 
     @property
     def single_file(self) -> str | None:
@@ -194,7 +230,11 @@ class ObjectStoreBackend(StorageBackend):
         return filter_keys({self._single_key: self._single_size}, include, exclude)
 
     def _head_size(self, key: str) -> int | None:
-        """Size of object `key`, or None if it doesn't exist or can't be read.
+        """Size of object `key`; None if the HEAD is denied.
+
+        Raises ``FileNotFoundError`` when the store says the object doesn't
+        exist: the URI names a file (it has an extension) and nothing is under
+        it as a folder either, so it's a bad path, like a missing local file.
 
         A denied HEAD is treated as "not a single object", not an auth failure:
         the listing just succeeded, so the credentials work, and policies scoped
@@ -203,11 +243,52 @@ class ObjectStoreBackend(StorageBackend):
         try:
             meta = obstore.head(self._store, key)
         except (FileNotFoundError, NotFoundError):
-            return None
+            raise FileNotFoundError(f"Object does not exist: {self.display_root}") from None
         except (PermissionDeniedError, UnauthenticatedError) as e:
             logger.debug(f"HEAD {key!r} denied ({e}); treating it as a folder prefix.")
             return None
         return int(meta["size"])
+
+    @contextmanager
+    def open_metadata_view(self, key: str) -> Iterator[MetadataView]:
+        """A sparse local copy holding only the bytes exiftool reads, or the
+        full download when the format has no sparse reader, the walk fails, or
+        sparse reads are disabled (AM_TOOLS_SPARSE_READS=0)."""
+        if sparse_reads_enabled():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                local_path = os.path.join(tmp_dir, PurePosixPath(key).name or "object")
+                stats = self._try_sparse_copy(key, local_path)
+                if stats is not None:
+                    logger.debug(
+                        f"Sparse read of {key}: {stats.fetched} of {stats.size} bytes "
+                        f"in {stats.requests} request(s) ({stats.fmt})."
+                    )
+                    yield MetadataView(path=local_path, sparse=True, stats=stats)
+                    return
+        with self.open_local(key) as path:
+            yield MetadataView(path=path, sparse=False)
+
+    def _try_sparse_copy(self, key: str, local_path: str) -> SparseStats | None:
+        """Build the sparse copy; None means "download the whole file instead"."""
+        try:
+            head = obstore.get(self._store, key, options={"range": (0, HEAD_BYTES)})
+            size = int(head.meta["size"])
+
+            def fetch(start: int, end: int) -> bytes:
+                return bytes(obstore.get_range(self._store, key, start=start, end=end))
+
+            return build_sparse_copy(
+                local_path, size, fetch, name=key, head=bytes(head.bytes())
+            )
+        except (PermissionDeniedError, UnauthenticatedError) as e:
+            self._reraise_if_auth(e, operation="download")
+            raise
+        except SparseReadError as e:
+            logger.debug(f"No sparse read for {key} ({e}); downloading it in full.")
+        except Exception as e:  # noqa: BLE001 — transient store errors: the full
+            # download below retries with backoff, so prefer it over failing.
+            logger.debug(f"Sparse read of {key} failed ({e}); downloading it in full.")
+        return None
 
     @contextmanager
     def open_local(self, key: str) -> Iterator[str]:

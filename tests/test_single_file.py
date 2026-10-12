@@ -90,11 +90,28 @@ def test_object_store_prefix_still_lists_folder(monkeypatch, tmp_path):
     assert backend.single_file is None
 
 
-def test_object_store_missing_key_lists_nothing(monkeypatch, tmp_path):
+def test_object_store_missing_key_is_file_not_found(monkeypatch, tmp_path):
+    """A URI naming an object that doesn't exist is a bad path (invalid_input),
+    like a missing local file, not "no supported files" (no_data)."""
     (tmp_path / "sub").mkdir()
     backend = _object_backend(monkeypatch, tmp_path, "sub/nope.jpg")
-    assert backend.list_keys(include=[".jpg"], exclude=[]) == []
+    with pytest.raises(FileNotFoundError, match="Object does not exist: s3://bucket/sub/nope.jpg"):
+        backend.list_keys(include=[".jpg"], exclude=[])
     assert backend.single_file is None
+
+
+def test_missing_object_maps_to_invalid_input(monkeypatch):
+    import atomic_tools.api as api_mod
+
+    def missing(**kwargs):
+        raise FileNotFoundError("Object does not exist: s3://bucket/sub/nope.jpg")
+
+    monkeypatch.setattr(api_mod, "_build_sidecar", missing)
+    payload = validate_path("s3://bucket/sub/nope.jpg")
+    assert payload["error"] == {
+        "type": "invalid_input",
+        "message": "Object does not exist: s3://bucket/sub/nope.jpg",
+    }
 
 
 def test_object_store_denied_head_is_not_an_auth_error(monkeypatch, tmp_path):

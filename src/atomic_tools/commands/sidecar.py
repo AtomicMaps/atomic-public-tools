@@ -906,6 +906,36 @@ def _move_blank_columns_to_end(df):
     return df[non_blank + blank]
 
 
+def _sparse_read_problem(meta: dict) -> str | None:
+    """Why a metadata read from a sparse copy can't be trusted, or None.
+
+    exiftool flags structure it couldn't read (e.g. "Truncated PNG image") with
+    a Warning/Error tag; an empty result means extraction failed outright. A
+    file that also warns when read in full just costs one extra download.
+    """
+    if not meta:
+        return "no metadata returned"
+    for tag in ("Error", "Warning"):
+        if tag in meta:
+            return f"exiftool {tag.lower()}: {meta[tag]}"
+    return None
+
+
+def _extract_exif_with_fallback(backend: StorageBackend, key: str, label: str) -> dict:
+    """exiftool on a sparse copy when the backend offers one, falling back to a
+    full download if exiftool reports any problem reading it."""
+    with backend.open_metadata_view(key) as view:
+        meta = extract_exif_metadata(view.path, filename=label)
+        if not view.sparse:
+            return meta
+        problem = _sparse_read_problem(meta)
+        if problem is None:
+            return meta
+    logger.info(f"Partial read of {label} wasn't enough ({problem}); downloading it in full.")
+    with backend.open_local(key) as local_path:
+        return extract_exif_metadata(local_path, filename=label)
+
+
 def _build_sidecar(
     directory: str,
     data_type: DataTypeEnum | None,
@@ -1050,20 +1080,18 @@ def _build_sidecar(
             is_pc = key_type == DataTypeEnum.point_cloud
             tool = "PDAL" if is_pc else "EXIF"
             logger.info(f"[{i}/{total}] Extracting {tool}: {key}")
-            with backend.open_local(key) as local_path:
-                if is_pc:
+            if is_pc:
+                with backend.open_local(key) as local_path:
                     meta = extract_pdal_metadata(local_path, filename=display_label)
-                else:
-                    meta = extract_exif_metadata(local_path, filename=display_label)
-                    # Auto mode only: refine ambiguous images oriented↔spherical
-                    # from EXIF signals. The filename already chose the (shared)
-                    # EXIF extractor, so this never changes which extractor ran.
-                    if data_type is None and key_type in IMAGE_DATA_TYPES:
-                        refined = infer_data_type(
-                            key, **spherical_signals_from_exif(meta)
-                        )
-                        if refined is not None:
-                            types_by_key[key] = DataTypeEnum(refined)
+            else:
+                meta = _extract_exif_with_fallback(backend, key, display_label)
+                # Auto mode only: refine ambiguous images oriented↔spherical
+                # from EXIF signals. The filename already chose the (shared)
+                # EXIF extractor, so this never changes which extractor ran.
+                if data_type is None and key_type in IMAGE_DATA_TYPES:
+                    refined = infer_data_type(key, **spherical_signals_from_exif(meta))
+                    if refined is not None:
+                        types_by_key[key] = DataTypeEnum(refined)
             if not meta:
                 empty_count += 1
                 logger.warning(f"No {tool} metadata returned for {key}")
