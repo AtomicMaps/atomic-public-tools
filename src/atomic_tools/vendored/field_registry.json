@@ -1,5 +1,5 @@
 {
-  "$comment": "Vendorizable registry of every metadata source field the data-engineering pipeline checks, per data type. Chains are ordered fallback lists (first present wins); tuple entries are tried as a unit. 'stac_properties' names the STAC item properties a chain feeds; whether those are required is derived from the STAC schemas mirrored in 'stac_properties_by_data_type' (kept in lockstep by tests/atomicmapspy/test_field_registry.py). External repos: copy this file verbatim.",
+  "$comment": "Vendorizable registry of every metadata source field the data-engineering pipeline checks, per data type. Chains are ordered fallback lists (first present wins) unless marked 'read_as': 'set', meaning the fields are read together and are not alternatives for one another; tuple entries are tried as a unit. 'stac_properties' names the STAC item properties a chain feeds; whether those are required is derived from the STAC schemas mirrored in 'stac_properties_by_data_type' (kept in lockstep by tests/atomicmapspy/test_field_registry.py). External repos: copy this file verbatim. IMPORTANT: because this file is vendorized into other libraries, EVERY external metadata source the pipeline reads must be listed here even when it feeds no STAC property (use 'stac_properties': []) — downstream consumers rely on it to know where our data comes from, and a source read in code but absent here is invisible to them. 'namespace' names the reader the fields come from (exiftool, PDAL, GDAL, ...) and, where a reader has addressable sub-locations, an extra key records it: 'gdal_domain' for GDAL metadata domains, 'from_reader'/'key_path' for PDAL stage dicts.",
   "registry_version": 1,
   "chains": {
     "DATETIME_FIELDS": {
@@ -29,8 +29,64 @@
       "applies_to": ["oriented_image", "spherical_image", "ortho_image"],
       "kind": "scalar",
       "stac_properties": ["datetime"],
-      "description": "Last-resort datetime fallback before filename inference.",
+      "description": "Last-resort datetime fallback before filename inference. NOT consulted for ECW-derived ortho images: their file is a TIFF this pipeline authored during ingestion, so its mtime is ingest time, not capture time (see ORTHO_ECW_ACQUISITION_DATE_FIELD and OrthoImage.get_datetime).",
       "field": "FileModifyDate"
+    },
+    "ORTHO_ECW_ACQUISITION_DATE_FIELD": {
+      "namespace": "ortho_ecw_gdal",
+      "gdal_domain": "",
+      "applies_to": ["ortho_image"],
+      "kind": "scalar",
+      "stac_properties": ["datetime"],
+      "description": "ECW header acquisition date, read from the source .ecw via GDAL's ECW driver (exiftool has no ECW reader at all). Present only in ECW v3 files — v2 headers carry little beyond VERSION/PROJ/DATUM, so this is frequently absent. Normalized and merged into the EXIF dict as 'DateTimeOriginal' (the first DATETIME_FIELDS entry) so the standard chain resolves it, and it takes precedence over path/sidecar dates because it is genuine capture metadata. See OrthoImage._ecw_acquisition_tags.",
+      "field": "FILE_METADATA_ACQUISITION_DATE"
+    },
+    "ORTHO_ECW_FILE_METADATA_FIELDS": {
+      "namespace": "ortho_ecw_gdal",
+      "gdal_domain": "",
+      "applies_to": ["ortho_image"],
+      "kind": "list",
+      "read_as": "set",
+      "stac_properties": [],
+      "description": "ECW v3 provenance/authorship header items, read as a set (not a fallback chain) from the source .ecw via GDAL's ECW driver and merged into the EXIF dict. Feed no STAC property today; listed because this registry is vendorized and consumers must be able to see every external metadata source we read. FILE_METADATA_ACQUISITION_DATE is deliberately not repeated here — it has its own entry because it feeds datetime.",
+      "fields": [
+        "FILE_METADATA_ACQUISITION_SENSOR_NAME",
+        "FILE_METADATA_AUTHOR",
+        "FILE_METADATA_COMPANY",
+        "FILE_METADATA_COPYRIGHT",
+        "FILE_METADATA_CLASSIFICATION",
+        "FILE_METADATA_COMPRESSION_SOFTWARE",
+        "FILE_METADATA_ADDRESS",
+        "FILE_METADATA_EMAIL",
+        "FILE_METADATA_TELEPHONE"
+      ]
+    },
+    "ORTHO_ECW_RASTER_PROPERTY_FIELDS": {
+      "namespace": "ortho_ecw_gdal",
+      "gdal_domain": "",
+      "applies_to": ["ortho_image"],
+      "kind": "list",
+      "read_as": "set",
+      "stac_properties": [],
+      "description": "ECW file/compression properties, read as a set from the source .ecw via GDAL's ECW driver and merged into the EXIF dict. Feed no STAC property; listed for vendorized-consumer provenance. VERSION is the one to check when diagnosing missing metadata: it reports 2 or 3, and the FILE_METADATA_* items only exist in v3 files.",
+      "fields": [
+        "VERSION",
+        "COLORSPACE",
+        "CLOCKWISE_ROTATION_DEG",
+        "COMPRESSION_DATE",
+        "COMPRESSION_RATE_TARGET",
+        "COMPRESSION_RATE_ACTUAL"
+      ]
+    },
+    "ORTHO_ECW_SRS_FIELDS": {
+      "namespace": "ortho_ecw_gdal",
+      "gdal_domain": "ECW",
+      "applies_to": ["ortho_image"],
+      "kind": "list",
+      "read_as": "set",
+      "stac_properties": [],
+      "description": "Projection/datum/units as recorded in the ECW header, read as a set from GDAL's 'ECW' metadata domain and merged into the EXIF dict. Feed no STAC property — the item's crs comes from the raster CRS rasterio reads off the converted TIFF (with fallback_srs substituted when that CRS is missing or local) — but they are the diagnostic for why an ECW needed a fallback SRS, and are listed for vendorized-consumer provenance.",
+      "fields": ["PROJ", "DATUM", "UNITS"]
     },
     "IMAGE_SIZE_FIELDS": {
       "namespace": "image_exif",
@@ -625,6 +681,7 @@
         "exif_orientation",
         "exposure_point",
         "name",
+        "srs_overwritten",
         "title",
         "updated"
       ],
@@ -645,6 +702,7 @@
         "image_shape",
         "key",
         "name",
+        "srs_overwritten",
         "sub_type",
         "title",
         "updated"

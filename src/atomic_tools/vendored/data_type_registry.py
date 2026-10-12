@@ -1,4 +1,4 @@
-# VENDORED from data-engineering@unified_date_fields
+# VENDORED from data-engineering@main
 #   atomicmapspy/atomicmapspy/utils/utils.py (selected definitions)
 # Do not edit by hand. Re-vendor with `am-tools update` (dev machines) —
 # drift is detected by tests/test_vendored_drift.py.
@@ -109,6 +109,13 @@ DATA_TYPE_INFO: Dict = {
         "sidecars": [],
         "sub_types": [],
     },
+    "gaussian_splat": {
+        "include": [".ply", ".splat"],
+        "exclude": ["_mesh.ply"],
+        "sidecars": [],
+        "sub_types": [],
+        "footprint_feature_class": "footprints_gaussian_splat",
+    },
 }
 
 
@@ -121,6 +128,7 @@ class DataTypeEnum(str, Enum):
     video = "full_motion_video"
     cad = "cad"
     vector = "vector"
+    gaussian_splat = "gaussian_splat"
 
 
 class ImageDataTypeEnum(str, Enum):
@@ -143,6 +151,7 @@ _INFER_DATA_TYPE_ORDER = [
     "point_cloud",
     "full_motion_video",
     "vector",
+    "gaussian_splat",
 ]
 
 
@@ -158,16 +167,26 @@ _SPHERICAL_ASPECT_RATIO_MAX = 2.05
 def _xmp_indicates_spherical(xmp_packet: bytes) -> bool:
     """Return True if an XMP packet indicates an equirectangular spherical image.
 
-    Looks for either the Google Photo Sphere `GPano:` namespace or an explicit
-    `ProjectionType="equirectangular"` attribute. Match is case-insensitive and
-    does not require well-formed XML parsing — XMP is conventionally bounded by
+    Looks for actual usage of a Google Photo Sphere `GPano:` property or an
+    explicit `ProjectionType="equirectangular"` attribute. A bare
+    `xmlns:GPano` namespace *declaration* is not a signal: DJI cameras (e.g.
+    Zenmuse P1) declare it in the XMP boilerplate of every flat photo without
+    writing a single GPano property. Match is case-insensitive and does not
+    require well-formed XML parsing — XMP is conventionally bounded by
     `<x:xmpmeta>` markers but we scan the raw bytes for robustness against
     minor format variation across cameras/stitchers.
+
+    A bare `xmlns:GPano="..."` namespace *declaration* is deliberately NOT a
+    signal: DJI writes the GPano namespace into the boilerplate header of every
+    image it produces without ever populating a GPano field, so treating the
+    declaration as evidence misclassified every DJI frame as spherical — and
+    because this check runs before the aspect-ratio test, a 4:3 photo could
+    never be rescued by its own geometry.
     """
     if not xmp_packet:
         return False
     lower = xmp_packet.lower()
-    if b"gpano:" in lower or b"xmlns:gpano" in lower:
+    if re.search(rb"gpano:[a-z]", lower):
         return True
     # Match `ProjectionType="equirectangular"` (with or without quotes,
     # tolerant of whitespace) as a real attribute pairing rather than two
