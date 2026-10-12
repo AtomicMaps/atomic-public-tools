@@ -230,8 +230,7 @@ def test_include_without_api_mode_is_rejected(stubbed, tmp_path):
 
 
 def test_api_mode_skips_version_check(stubbed, monkeypatch, tmp_path):
-    """Detected from the args click parses, so it also works when the app is
-    invoked programmatically (sys.argv here is pytest's, not ours)."""
+    """sys.argv here is pytest's, so this checks the args click parsed."""
     called = []
     monkeypatch.setattr(cli_mod, "check_for_update", lambda: called.append(1))
     assert _invoke("--path", str(tmp_path), "--api-mode").exit_code == 0

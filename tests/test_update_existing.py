@@ -172,9 +172,9 @@ def test_new_default_values_go_on_the_new_row():
     ])
     merged, _, _ = _merge_into_existing(existing, new)
     by_name = merged.set_index("Filename")["fallback_srs"]
-    assert by_name["DEFAULT"] == ""  # shared DEFAULT unchanged
-    assert by_name["old.las"] == ""  # other files unaffected
-    assert by_name["new.las"] == "EPSG:32612"  # applies to this file only
+    assert by_name["DEFAULT"] == ""
+    assert by_name["old.las"] == ""
+    assert by_name["new.las"] == "EPSG:32612"
 
 
 def test_default_value_already_shared_is_not_copied():

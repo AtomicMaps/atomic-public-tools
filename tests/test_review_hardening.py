@@ -1,5 +1,4 @@
-"""Regression tests for the second code-review pass (single-file safety, upload
-edge cases, sparse-read fallback rules, backend reuse)."""
+"""Edge cases: single-file safety, uploads, sparse-read fallback, backend reuse."""
 
 import io
 import json
@@ -25,7 +24,7 @@ from tests.test_auto_detect import patched_extractors  # noqa: F401
 runner = CliRunner()
 
 
-# ---- 1: single-file sidecar never overwrites ----------------------------------------
+# ---- single-file sidecar never overwrites ----------------------------------------
 
 
 def _folder(tmp_path):
@@ -67,7 +66,7 @@ def test_object_store_output_exists(monkeypatch, tmp_path):
     backend.list_keys(include=[".jpg"], exclude=[])
     assert backend.output_exists("sidecar.csv") is True
     assert backend.output_exists("other.csv") is False
-    assert backend.output_location == "s3://bucket/sub"  # 10: the folder, not the file
+    assert backend.output_location == "s3://bucket/sub"  # the folder, not the file
 
 
 def test_local_output_location_is_the_folder(tmp_path):
@@ -77,7 +76,7 @@ def test_local_output_location_is_the_folder(tmp_path):
     assert backend.output_location == str(tmp_path.resolve())
 
 
-# ---- 2: empty optional form fields ------------------------------------------------
+# ---- empty optional form fields ------------------------------------------------
 
 
 def test_empty_optional_uploads_are_ignored(tmp_path, patched_extractors):  # noqa: F811
@@ -118,7 +117,7 @@ def test_fastapi_form_with_empty_file_inputs(patched_extractors):  # noqa: F811
     assert resp.json()["status"] != "error", resp.json()
 
 
-# ---- 5: COCO scoped to a single-file run --------------------------------------------
+# ---- COCO scoped to a single-file run --------------------------------------------
 
 
 def test_single_file_coco_ignores_other_images(tmp_path, patched_extractors):  # noqa: F811
@@ -145,7 +144,7 @@ def test_single_file_coco_ignores_other_images(tmp_path, patched_extractors):  #
                    for f in payload["findings"])
 
 
-# ---- 8: include must be strings ---------------------------------------------------
+# ---- include must be strings ---------------------------------------------------
 
 
 @pytest.mark.parametrize("include", [["findings", 1], 5, [None]])
@@ -154,7 +153,7 @@ def test_bad_include_types_are_invalid_input(tmp_path, include):
     assert response.error.type == "invalid_input"
 
 
-# ---- 9: temp dir errors don't leak paths --------------------------------------------
+# ---- temp dir errors don't leak paths --------------------------------------------
 
 
 def test_temp_dir_failure_hides_server_path(tmp_path):
@@ -165,7 +164,7 @@ def test_temp_dir_failure_hides_server_path(tmp_path):
     assert "temp dir" in response.error.message
 
 
-# ---- 11: which sparse-read warnings force a full download ----------------------------
+# ---- which sparse-read warnings force a full download ----------------------------
 
 _STATS = SparseStats(fmt="bmff", requests=3, fetched=3000, size=10**9,
                      ranges=((0, 1024), (0x337C0000, 0x337D0000)))
@@ -198,7 +197,7 @@ def test_offset_rule_needs_stats():
     assert _sparse_read_problem({"Warning": "Truncated data at offset 0x10"}, None) is not None
 
 
-# ---- 12: unsupported extensions skip the head request ---------------------------------
+# ---- unsupported extensions skip the head request ---------------------------------
 
 
 def test_png_metadata_view_skips_sparse_attempt(monkeypatch, tmp_path):
@@ -220,7 +219,7 @@ def test_png_metadata_view_skips_sparse_attempt(monkeypatch, tmp_path):
         assert view.sparse is False
 
 
-# ---- 13: buffer uploads without an extra copy -----------------------------------------
+# ---- buffer uploads without an extra copy -----------------------------------------
 
 
 @pytest.mark.parametrize("wrap", [bytes, bytearray, memoryview])
@@ -232,7 +231,7 @@ def test_buffer_uploads(tmp_path, patched_extractors, wrap):  # noqa: F811
     assert too_big.error.type == "invalid_input"
 
 
-# ---- 14: the scan's backend is reused for the inventory check -------------------------
+# ---- the scan's backend is reused for the inventory check -------------------------
 
 
 def test_run_validation_passes_its_backend_to_lint(monkeypatch, tmp_path):

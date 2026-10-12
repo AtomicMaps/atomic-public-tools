@@ -92,8 +92,7 @@ def test_object_store_prefix_still_lists_folder(monkeypatch, tmp_path):
 
 
 def test_object_store_missing_key_is_file_not_found(monkeypatch, tmp_path):
-    """A URI naming an object that doesn't exist is a bad path (invalid_input),
-    like a missing local file, not "no supported files" (no_data)."""
+    """invalid_input like a missing local file, not no_data."""
     (tmp_path / "sub").mkdir()
     backend = _object_backend(monkeypatch, tmp_path, "sub/nope.jpg")
     with pytest.raises(FileNotFoundError, match="No file or folder exists at s3://bucket/sub/nope.jpg"):
@@ -116,8 +115,7 @@ def test_missing_object_maps_to_invalid_input(monkeypatch):
 
 
 def test_object_store_denied_head_on_file_uri_is_an_auth_error(monkeypatch, tmp_path):
-    """Nothing is listed under the URI, so it can only be a single object; a
-    denied HEAD there is a real permission problem, not "no files"."""
+    """With nothing listed under the URI, a denied HEAD is a permission error."""
     from obstore.exceptions import PermissionDeniedError
 
     import atomic_tools.io.storage as storage_mod
@@ -136,8 +134,7 @@ def test_object_store_denied_head_on_file_uri_is_an_auth_error(monkeypatch, tmp_
 
 @pytest.mark.parametrize("folder", ["flight1", "survey_v1.2"])
 def test_object_store_folder_with_no_matches_never_heads(monkeypatch, tmp_path, folder):
-    """A folder with content but no matching files (dotted name or not) lists
-    nothing and costs no HEAD; the caller reports "no supported files"."""
+    """A folder without matching files lists nothing and costs no HEAD."""
     import atomic_tools.io.storage as storage_mod
 
     (tmp_path / folder).mkdir()
