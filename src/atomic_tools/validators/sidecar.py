@@ -128,13 +128,9 @@ def lint_sidecar_df(
     coco_not_on_disk_is_error: bool = True,
     normalize: bool = True,
 ) -> LintReport:
-    """Lint an already-assembled (canonical) sidecar DataFrame in memory.
+    """Same as :func:`lint_sidecar_file` with no schema, without the CSV round trip.
 
-    Equivalent to writing ``df`` to CSV and calling :func:`lint_sidecar_file`
-    with no schema, minus the disk round trip. Cells are normalised to strings
-    with blanks for missing values, matching how ``load_sidecar_df`` reads a CSV;
-    pass ``normalize=False`` if ``df`` is already in that form (see
-    :func:`_as_csv_strings`).
+    Pass ``normalize=False`` if ``df`` already looks like a CSV read back.
     """
     report = LintReport()
     if data_type is not None and data_type not in ALL_SIDECAR_FIELD_GROUPS:
@@ -156,8 +152,7 @@ def lint_sidecar_df(
 
 
 def _as_csv_strings(df: pd.DataFrame) -> pd.DataFrame:
-    """Return ``df`` as it would read back from CSV via ``load_sidecar_df``:
-    every cell a ``str``, missing values as ``""``, fresh RangeIndex."""
+    """Return ``df`` as ``load_sidecar_df`` would read it back from CSV."""
     out = df.reset_index(drop=True).astype(object)
     out = out.where(out.notna(), "")
     return out.map(lambda v: v if isinstance(v, str) else str(v))
