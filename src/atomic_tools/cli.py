@@ -4,7 +4,9 @@ import logging
 from dataclasses import dataclass
 from typing import Annotated, Literal
 
+import click
 import typer
+from typer.core import TyperGroup
 
 from atomic_tools import __version__
 from atomic_tools.commands.lint import lint_app
@@ -45,7 +47,26 @@ def level_for(*, verbose: bool, silent: bool) -> int:
     return logging.WARNING
 
 
+_API_MODE_META = "atomic_tools.api_mode"
+
+
+class _RootGroup(TyperGroup):
+    """Notes whether ``--api-mode`` was passed before the root callback runs.
+
+    The root callback (which runs the update check) executes before the
+    subcommand parses its own options, and click no longer exposes the
+    remaining args to it. ``parse_args`` sees exactly the args click was given,
+    which — unlike ``sys.argv`` — is also right when the app is invoked
+    programmatically (``app([...])``, ``CliRunner``).
+    """
+
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        ctx.meta[_API_MODE_META] = "--api-mode" in args
+        return super().parse_args(ctx, args)
+
+
 app = typer.Typer(
+    cls=_RootGroup,
     name="am-tools",
     help="Atomic public tools — format metadata for Flow intake.",
     no_args_is_help=True,
@@ -113,6 +134,7 @@ def main(
     ctx.obj = verbosity
 
     # First run of the day: nudge the user if the repo has a newer version.
-    # Best-effort and silent-safe — never raises, and skips when --silent.
-    if not silent:
+    # Best-effort and silent-safe — never raises, and skips when --silent or
+    # --api-mode (a server shouldn't make an outbound call per request).
+    if not silent and not ctx.meta.get(_API_MODE_META, False):
         check_for_update()

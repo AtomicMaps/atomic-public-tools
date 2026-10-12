@@ -982,7 +982,8 @@ def _apply_coco_impact(
 
     csv_hint = (
         "Per-image detail (including degraded rows) is in the failed-rows "
-        "CSV — use --report to save it."
+        "CSV (`lint sidecar --report`) or under details.coco in "
+        "`validate --api-mode` JSON."
     )
 
     def _format(verdicts: list) -> str:
