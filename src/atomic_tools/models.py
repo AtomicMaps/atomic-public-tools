@@ -117,11 +117,7 @@ class ToolStatus(BaseModel):
 
 
 class DependencyReport(BaseModel):
-    """External tools validation needs; see :func:`atomic_tools.check_dependencies`.
-
-    ``ok`` is true when every tool is usable: exiftool (images/video), pdal
-    (point clouds) and pye57 (.e57 capture dates).
-    """
+    """``ok`` is true when every tool is usable."""
 
     ok: bool
     exiftool: ToolStatus

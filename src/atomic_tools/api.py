@@ -303,16 +303,16 @@ def validate_path(
 
 @dataclass
 class UploadedFile:
-    """A file received over the wire: its bytes (or a binary stream) and the
-    name the user's file had. The name matters — type detection, filename
-    dates, and client-sidecar/COCO matching all use it."""
+    """Uploaded bytes or binary stream, with the user's original filename.
+
+    Type detection, filename dates and sidecar/COCO matching use the name.
+    """
 
     content: bytes | IO[bytes]
     filename: str
 
 
-# Accepted for every upload argument: an UploadedFile, or anything shaped like
-# FastAPI/Starlette's UploadFile (``.file`` stream + ``.filename``).
+# Or anything shaped like Starlette's UploadFile (``.file`` + ``.filename``).
 UploadLike = UploadedFile | Any
 
 _COPY_CHUNK = 1024 * 1024
@@ -325,11 +325,6 @@ class UploadError(InvalidInputError):
 
 
 def _safe_filename(name: str | None, role: str) -> str:
-    """Basename of a client-supplied filename, safe to create in our temp dir.
-
-    Keeps the original name (detection depends on it) but drops any directory
-    part, so ``../../etc/x.jpg`` becomes ``x.jpg``.
-    """
     if not name or not name.strip():
         raise UploadError(f"The {role} upload has no filename; send its original name.")
     base = re.split(r"[\\/]", name)[-1]
@@ -366,11 +361,7 @@ def _unpack_upload(obj: UploadLike, filename: str | None, role: str) -> tuple[An
 
 
 def _is_empty_form_field(obj: UploadLike) -> bool:
-    """An optional file input the user left empty.
-
-    HTML forms still send an empty file part, which FastAPI/Starlette turn into
-    an ``UploadFile`` with ``filename=""`` and no bytes rather than ``None``.
-    """
+    """HTML forms send an empty file input as an ``UploadFile`` with ``filename=""``, not None."""
     if isinstance(obj, UploadedFile) or not (hasattr(obj, "file") and hasattr(obj, "filename")):
         return False
     if obj.filename:
@@ -452,9 +443,7 @@ _UPLOAD_SUBDIRS = ("data", *(f"extras{os.sep}{role}" for role in _EXTRA_ROLES))
 
 
 def _path_replacements(tmp_root: Path, saved: list[Path]) -> list[tuple[str, str]]:
-    """Map server temp paths (as given and as resolved — /var vs /private/var
-    on macOS) to the bare uploaded filename, longest first. Covers files that
-    were never saved too (e.g. an OSError naming the destination path)."""
+    """Temp paths, raw and resolved (/var vs /private/var on macOS), longest first."""
     pairs: dict[str, str] = {}
     for p in saved:
         for variant in {str(p), str(p.resolve())}:
@@ -496,17 +485,10 @@ def validate_upload(
     work_dir: str | os.PathLike[str] | None = None,
     max_bytes: int | None = None,
 ) -> ValidationResponse:
-    """Validate one uploaded data file (plus optional companion uploads). Never raises.
+    """Validate one uploaded data file plus optional companion uploads. Never raises.
 
-    ``file`` (and each of ``client_sidecar``/``client_schema``/``coco``) may be a
-    FastAPI/Starlette ``UploadFile``, an :class:`UploadedFile`, or — for ``file``
-    only — raw bytes / a binary stream together with ``filename``. ``filename``
-    overrides the upload's own name for ``file``.
-
-    Each upload is written under its original basename to a fresh private temp
-    dir (inside ``work_dir`` if given), validated with :func:`validate_path`,
-    and deleted afterwards. Temp paths in messages are replaced by the original
-    filename. ``max_bytes`` caps each upload's size.
+    ``file`` may also be raw bytes or a binary stream, given with ``filename``.
+    Temp paths in messages are replaced by the original filenames.
     """
     try:
         tmp_root = Path(tempfile.mkdtemp(prefix="amtools-", dir=work_dir))
@@ -557,8 +539,6 @@ def _save_and_validate(
     max_bytes: int | None,
     **validate_kwargs: Any,
 ) -> ValidationResponse:
-    """Write the uploads into ``tmp_root`` (recording each in ``saved``) and
-    validate the data file. Raises UploadError/OSError on save problems."""
     data_path = _save_upload(
         file,
         tmp_root / "data",
@@ -593,7 +573,6 @@ def _save_and_validate(
 
 
 def _probe_tool(path: str, args: list[str], pattern: str | None = None) -> ToolStatus:
-    """Run ``path args`` and report whether it works, with its version."""
     try:
         proc = subprocess.run(
             [path, *args],
@@ -624,9 +603,8 @@ def _probe_tool(path: str, args: list[str], pattern: str | None = None) -> ToolS
 def check_dependencies() -> DependencyReport:
     """Report whether exiftool, pdal and pye57 are usable. Never raises.
 
-    Each binary is located *and run*, so a container where a tool is present
-    but broken (e.g. missing shared libraries) is caught at deploy time by a
-    ``/health`` endpoint rather than on the first upload.
+    Binaries are run, not just located, so a broken install (e.g. missing
+    shared libraries) fails ``/health`` instead of the first upload.
     """
     try:
         exiftool = _probe_tool(find_exiftool_bin(), ["-ver"])
