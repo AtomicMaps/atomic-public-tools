@@ -21,10 +21,14 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlparse
 
 import obstore
 from obstore.exceptions import NotFoundError, PermissionDeniedError, UnauthenticatedError
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 from atomic_tools.errors import InvalidInputError
 from atomic_tools.utils.aws_errors import (
@@ -66,6 +70,16 @@ class StorageBackend(ABC):
     @abstractmethod
     def write_output(self, filename: str, source: Path) -> str:
         """Write `source` to the root as `filename`. Returns a display path."""
+
+    @abstractmethod
+    def read_output(self, filename: str) -> tuple[pd.DataFrame, str | None]:
+        """Read an existing output CSV (all cells as strings) plus its
+        :meth:`output_version`, for read-modify-write updates."""
+
+    @abstractmethod
+    def output_version(self, filename: str) -> str | None:
+        """An opaque token that changes whenever the output file changes
+        (None if it doesn't exist). Compare before writing a merged file."""
 
     @abstractmethod
     def output_exists(self, filename: str) -> bool:
@@ -136,6 +150,19 @@ class LocalBackend(StorageBackend):
 
     def output_exists(self, filename: str) -> bool:
         return (self._root / filename).exists()
+
+    def output_version(self, filename: str) -> str | None:
+        try:
+            st = (self._root / filename).stat()
+        except FileNotFoundError:
+            return None
+        return f"{st.st_mtime_ns}:{st.st_size}"
+
+    def read_output(self, filename: str) -> tuple[pd.DataFrame, str | None]:
+        from atomic_tools.utils.utils import load_sidecar_df
+
+        version = self.output_version(filename)
+        return load_sidecar_df(str(self._root / filename)), version
 
     @property
     def output_location(self) -> str:
@@ -261,6 +288,34 @@ class ObjectStoreBackend(StorageBackend):
             self._reraise_if_auth(e, operation="download")
             raise
         return True
+
+    @staticmethod
+    def _version_of(meta: dict) -> str:
+        return str(meta.get("e_tag") or f"{meta.get('last_modified')}:{meta.get('size')}")
+
+    def output_version(self, filename: str) -> str | None:
+        try:
+            meta = obstore.head(self._store, self._output_key(filename))
+        except (FileNotFoundError, NotFoundError):
+            return None
+        except (PermissionDeniedError, UnauthenticatedError) as e:
+            self._reraise_if_auth(e, operation="download")
+            raise
+        return self._version_of(meta)
+
+    def read_output(self, filename: str) -> tuple[pd.DataFrame, str | None]:
+        import io
+
+        import pandas
+
+        try:
+            result = obstore.get(self._store, self._output_key(filename))
+            data = bytes(result.bytes())
+        except (PermissionDeniedError, UnauthenticatedError) as e:
+            self._reraise_if_auth(e, operation="download")
+            raise
+        df = pandas.read_csv(io.BytesIO(data), dtype=str, keep_default_na=False, encoding="utf-8")
+        return df, self._version_of(result.meta)
 
     def write_output(self, filename: str, source: Path) -> str:
         output_key = self._output_key(filename)
