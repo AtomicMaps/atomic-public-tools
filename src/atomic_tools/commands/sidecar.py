@@ -11,12 +11,13 @@ Requires the following external binaries at runtime (NOT pip-installable):
 """
 
 import logging
+import re
 import shlex
 import shutil
 import sys
 import tempfile
 from collections import Counter, defaultdict
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Annotated, NamedTuple, NoReturn
 
 import click
@@ -32,6 +33,8 @@ from atomic_tools.client_sidecar import (
     load_and_clean_client_sidecar,
     merge_client_metadata,
 )
+from atomic_tools.errors import InvalidInputError
+from atomic_tools.io.partial_read import SparseStats
 from atomic_tools.io.storage import (
     StorageBackend,
     from_path,
@@ -906,19 +909,44 @@ def _move_blank_columns_to_end(df):
     return df[non_blank + blank]
 
 
-def _sparse_read_problem(meta: dict) -> str | None:
+# exiftool cites absolute file offsets in many structural warnings, e.g.
+# "Truncated 'RDT6' data at offset 0x337c2ff0".
+_WARNING_OFFSET_RE = re.compile(r"\bat offset 0x([0-9a-fA-F]+)")
+# Wording that suggests a read problem; a [minor] warning containing any of it
+# is not trusted to be a mere hint.
+_STRUCTURAL_WORDS_RE = re.compile(
+    r"offset|truncat|corrupt|\bbad\b|missing|invalid|error|maker ?notes?", re.IGNORECASE
+)
+
+
+def _sparse_read_problem(meta: dict, stats: SparseStats | None = None) -> str | None:
     """Why a metadata read from a sparse copy can't be trusted, or None.
 
-    exiftool flags structure it couldn't read (e.g. "Truncated PNG image") with
-    a Warning/Error tag; an empty result means extraction failed outright. A
-    file that also warns when read in full just costs one extra download.
+    An empty result or an exiftool Error always means "read the whole file". A
+    Warning is trusted (no fallback) only when it can't have come from the
+    unfetched holes in the copy:
+
+    * an exiftool ``[minor]`` hint with no structural wording, such as
+      "[minor] The ExtractEmbedded option may find more tags in the media data";
+    * a warning naming an offset that lies in a range that *was* fetched — the
+      bytes exiftool complains about are real, so the full file says the same.
+
+    Anything else falls back. A wrong guess here only costs a download.
     """
     if not meta:
         return "no metadata returned"
-    for tag in ("Error", "Warning"):
-        if tag in meta:
-            return f"exiftool {tag.lower()}: {meta[tag]}"
-    return None
+    if "Error" in meta:
+        return f"exiftool error: {meta['Error']}"
+    warning = meta.get("Warning")
+    if warning is None:
+        return None
+    text = str(warning)
+    if text.startswith("[minor]") and not _STRUCTURAL_WORDS_RE.search(text):
+        return None
+    match = _WARNING_OFFSET_RE.search(text)
+    if match and stats is not None and stats.covers(int(match.group(1), 16)):
+        return None
+    return f"exiftool warning: {text}"
 
 
 def _extract_exif_with_fallback(backend: StorageBackend, key: str, label: str) -> dict:
@@ -928,7 +956,7 @@ def _extract_exif_with_fallback(backend: StorageBackend, key: str, label: str) -
         meta = extract_exif_metadata(view.path, filename=label)
         if not view.sparse:
             return meta
-        problem = _sparse_read_problem(meta)
+        problem = _sparse_read_problem(meta, view.stats)
         if problem is None:
             return meta
     logger.info(f"Partial read of {label} wasn't enough ({problem}); downloading it in full.")
@@ -978,7 +1006,7 @@ def _build_sidecar(
         try:
             CRS(spatial_reference)
         except CRSError:
-            raise ValueError(
+            raise InvalidInputError(
                 f"--spatial-reference value {spatial_reference!r} is not a valid "
                 "spatial reference (try e.g. 'EPSG:32612' or '32612')."
             ) from None
@@ -992,7 +1020,7 @@ def _build_sidecar(
                 "Vector data type is not yet supported for sidecar CSV generation."
             )
         if data_type not in DATA_TYPE_INFO:
-            raise ValueError(
+            raise InvalidInputError(
                 f"Unsupported data_type '{data_type}'. "
                 f"Valid values: {list(DATA_TYPE_INFO.keys())}"
             )
@@ -1003,7 +1031,7 @@ def _build_sidecar(
         )
         if not keys:
             if backend.single_file is not None:
-                raise ValueError(
+                raise InvalidInputError(
                     f"{backend.display_root} is not a '{data_type.value}' file "
                     "(or it is empty). Drop --datatype to auto-detect its type."
                 )
@@ -1033,7 +1061,7 @@ def _build_sidecar(
                         f"{backend.display_root} is vector data, which is not yet "
                         "supported for sidecar generation or validation."
                     )
-                raise ValueError(
+                raise InvalidInputError(
                     f"{backend.display_root} is not a supported file type (or it "
                     "is empty or a preview/thumbnail derivative)."
                 )
@@ -1123,7 +1151,7 @@ def _build_sidecar(
     if client_sidecar:
         client_url = client_sidecar.strip()
         if not client_url:
-            raise ValueError("--client-sidecar value cannot be empty.")
+            raise InvalidInputError("--client-sidecar value cannot be empty.")
         logger.info(f"Merging client sidecar from {client_url}")
         client_df = load_and_clean_client_sidecar(
             url=client_url,
@@ -1229,7 +1257,7 @@ def _generate(
     full: bool = False,
     local_copy: bool = False,
     spatial_reference: str | None = None,
-) -> tuple[str, list[str]]:
+) -> tuple[str, list[str], StorageBackend]:
     logger.info(
         f"Starting sidecar CSV generation — directory={directory!r} "
         f"data_type={data_type} output={output_filename!r} "
@@ -1245,6 +1273,15 @@ def _generate(
         full=full,
         spatial_reference=spatial_reference,
     )
+    if backend.single_file is not None and backend.output_exists(output_filename):
+        # A single-file run yields a one-row sidecar; silently replacing the
+        # folder's real sidecar (which an intake watcher may pick up) loses data.
+        raise InvalidInputError(
+            f"Refusing to overwrite {backend.output_location}/{output_filename}: "
+            f"this run covers only {PurePosixPath(backend.single_file).name}, so its "
+            "sidecar would replace the existing one with a single row. Pass "
+            "--output-filename with a name that isn't taken."
+        )
     crs_failures = _crs_failures(df)
 
     local_copy_path: Path | None = None
@@ -1260,7 +1297,7 @@ def _generate(
             diagnostic_path = Path.cwd() / output_filename
             shutil.copy2(local_csv, diagnostic_path)
             raise PointCloudCRSError(crs_failures, diagnostic_path)
-        logger.info(f"Writing sidecar CSV to {backend.display_root}/{output_filename}")
+        logger.info(f"Writing sidecar CSV to {backend.output_location}/{output_filename}")
         sidecar_path = backend.write_output(output_filename, local_csv)
         if local_copy:
             local_copy_path = Path.cwd() / output_filename
@@ -1276,7 +1313,7 @@ def _generate(
             f"Local copy at: {local_copy_path}", fg="green", bold=True, err=True
         )
 
-    return sidecar_path, vector_keys
+    return sidecar_path, vector_keys, backend
 
 
 def _format_replay_command(
@@ -1479,7 +1516,7 @@ def _run_generate(result: WizardResult, *, wizard_ran: bool) -> None:
         )
 
     try:
-        sidecar_path, skipped_vector = _generate(
+        sidecar_path, skipped_vector, backend = _generate(
             directory=directory,
             data_type=data_type,
             output_filename=output_filename,
@@ -1511,6 +1548,7 @@ def _run_generate(result: WizardResult, *, wizard_ran: bool) -> None:
             data_type=data_type,
             schema_path=None,
             input_files_path=directory,
+            input_backend=backend,
             ignore_missing_orientation=result.ignore_missing_orientation,
             coco_path=result.coco,
         )

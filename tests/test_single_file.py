@@ -71,6 +71,7 @@ def _object_backend(monkeypatch, root, prefix):
     backend._store = LocalStore(prefix=str(root))
     backend._single_key = None
     backend._single_size = 0
+    backend._listing = None
     return backend
 
 
@@ -95,7 +96,7 @@ def test_object_store_missing_key_is_file_not_found(monkeypatch, tmp_path):
     like a missing local file, not "no supported files" (no_data)."""
     (tmp_path / "sub").mkdir()
     backend = _object_backend(monkeypatch, tmp_path, "sub/nope.jpg")
-    with pytest.raises(FileNotFoundError, match="Object does not exist: s3://bucket/sub/nope.jpg"):
+    with pytest.raises(FileNotFoundError, match="No file or folder exists at s3://bucket/sub/nope.jpg"):
         backend.list_keys(include=[".jpg"], exclude=[])
     assert backend.single_file is None
 
@@ -114,12 +115,13 @@ def test_missing_object_maps_to_invalid_input(monkeypatch):
     }
 
 
-def test_object_store_denied_head_is_not_an_auth_error(monkeypatch, tmp_path):
-    """Policies scoped to ``folder/*`` deny HEAD on the bare key; that must read
-    as "no such single object", not as bad credentials."""
+def test_object_store_denied_head_on_file_uri_is_an_auth_error(monkeypatch, tmp_path):
+    """Nothing is listed under the URI, so it can only be a single object; a
+    denied HEAD there is a real permission problem, not "no files"."""
     from obstore.exceptions import PermissionDeniedError
 
     import atomic_tools.io.storage as storage_mod
+    from atomic_tools.utils.aws_errors import S3PermissionDeniedError
 
     (tmp_path / "sub").mkdir()
     backend = _object_backend(monkeypatch, tmp_path, "sub/a.jpg")
@@ -128,20 +130,50 @@ def test_object_store_denied_head_is_not_an_auth_error(monkeypatch, tmp_path):
         raise PermissionDeniedError("AccessDenied")
 
     monkeypatch.setattr(storage_mod.obstore, "head", denied)
-    assert backend.list_keys(include=[".jpg"], exclude=[]) == []
+    with pytest.raises(S3PermissionDeniedError):
+        backend.list_keys(include=[".jpg"], exclude=[])
+
+
+@pytest.mark.parametrize("folder", ["flight1", "survey_v1.2"])
+def test_object_store_folder_with_no_matches_never_heads(monkeypatch, tmp_path, folder):
+    """A folder with content but no matching files (dotted name or not) lists
+    nothing and costs no HEAD; the caller reports "no supported files"."""
+    import atomic_tools.io.storage as storage_mod
+
+    (tmp_path / folder).mkdir()
+    (tmp_path / folder / "notes.txt").write_text("x")
+    backend = _object_backend(monkeypatch, tmp_path, folder)
+    calls = []
+    monkeypatch.setattr(storage_mod.obstore, "head", lambda store, key: calls.append(key))
+    assert backend.list_keys(include=[".las"], exclude=[]) == []
+    assert calls == []
     assert backend.single_file is None
 
 
-def test_object_store_folder_prefix_skips_head(monkeypatch, tmp_path):
-    """An empty folder-like prefix (no extension) never triggers a HEAD."""
+def test_object_store_listing_is_cached(monkeypatch, tmp_path):
     import atomic_tools.io.storage as storage_mod
 
-    (tmp_path / "flight1").mkdir()
-    backend = _object_backend(monkeypatch, tmp_path, "flight1")
+    (tmp_path / "sub").mkdir()
+    _dir_with_siblings(tmp_path / "sub")
+    backend = _object_backend(monkeypatch, tmp_path, "sub")
+    real = storage_mod.get_keys_and_metadata
     calls = []
-    monkeypatch.setattr(storage_mod.obstore, "head", lambda store, key: calls.append(key))
-    assert backend.list_keys(include=[".jpg"], exclude=[]) == []
-    assert calls == []
+
+    def counting(store, prefix):
+        calls.append(prefix)
+        return real(store, prefix)
+
+    monkeypatch.setattr(storage_mod, "get_keys_and_metadata", counting)
+    assert sorted(backend.list_keys(include=[".jpg"], exclude=[])) == ["sub/a.jpg", "sub/b.jpg"]
+    assert backend.list_keys(include=[".las"], exclude=[]) == ["sub/c.las"]
+    assert calls == ["sub"]
+
+
+def test_object_store_empty_prefix_does_not_exist(monkeypatch, tmp_path):
+    (tmp_path / "gone").mkdir()
+    backend = _object_backend(monkeypatch, tmp_path, "gone")
+    with pytest.raises(FileNotFoundError, match="No file or folder exists"):
+        backend.list_keys(include=[".jpg"], exclude=[])
 
 
 def test_object_store_single_key_writes_beside_object(monkeypatch, tmp_path):

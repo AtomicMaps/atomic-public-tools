@@ -59,6 +59,12 @@ class SparseStats:
     requests: int
     fetched: int
     size: int
+    # Merged [start, end) byte ranges that hold real data in the sparse copy.
+    ranges: tuple[tuple[int, int], ...] = ()
+
+    def covers(self, offset: int) -> bool:
+        """Whether the byte at ``offset`` was fetched (is real, not a hole)."""
+        return any(a <= offset < b for a, b in self.ranges)
 
 
 class SparseCopy:
@@ -82,6 +88,9 @@ class SparseCopy:
         self._fh = open(path, "w+b")  # noqa: SIM115 — closed in close()
         self._fh.truncate(size)
         if head:
+            # The caller fetched these; count them so stats/budget are honest.
+            self.requests = 1
+            self.fetched = len(head)
             self._store(0, head[:size])
 
     def close(self) -> None:
@@ -140,12 +149,32 @@ class SparseCopy:
     def flush(self) -> None:
         self._fh.flush()
 
+    @property
+    def ranges(self) -> tuple[tuple[int, int], ...]:
+        return tuple(self._have)
+
 
 # ---- TIFF / BigTIFF (also the Exif block inside JPEG APP1) -----------------------
 
 _TYPE_SIZE = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4,
               12: 8, 13: 4, 16: 8, 17: 8, 18: 8}
 _SUB_IFD_TAGS = {34665, 34853, 40965, 330}  # Exif, GPS, Interop, SubIFDs
+# Integer formats by TIFF type: SHORT, LONG, IFD (4 bytes); LONG8, IFD8 (8 bytes).
+_INT_FMT = {3: "H", 4: "I", 13: "I", 16: "Q", 18: "Q"}
+
+
+def _ints(bo: str, typ: int, data: bytes, count: int) -> list[int]:
+    """Decode ``count`` unsigned integers of TIFF type ``typ`` from ``data``.
+
+    Inline values are left-justified in the entry's value field, so a 4-byte
+    LONG inside a BigTIFF's 8-byte field is read as 4 bytes, not 8.
+    """
+    fmt = _INT_FMT.get(typ)
+    if fmt is None:
+        return []
+    width = struct.calcsize(fmt)
+    count = min(count, len(data) // width)
+    return list(struct.unpack(bo + fmt * count, data[: width * count]))
 _MAKERNOTE = 37500
 # Offsets at which maker notes commonly start an IFD (bare, or after a
 # vendor header such as "Nikon\0\2\x10\0\0" / "OLYMPUS\0II").
@@ -194,22 +223,17 @@ def _walk_tiff(sp: SparseCopy, base: int = 0) -> None:
             voff = struct.unpack(bo + off_fmt, value)[0] if out_of_line else None
             if out_of_line:
                 sp.ensure(base + voff, min(nbytes, _MAX_VALUE_BYTES))
-            if tag in _SUB_IFD_TAGS:
-                if out_of_line:
-                    data = sp.read(base + voff, nbytes)
-                    width = 8 if (big or typ in (16, 18)) else 4
-                    fmt = "Q" if width == 8 else "I"
-                    ptrs = [struct.unpack(bo + fmt, data[j:j + width])[0]
-                            for j in range(0, len(data) - width + 1, width)]
-                else:
-                    ptrs = [struct.unpack(bo + off_fmt, value)[0]] if count == 1 else []
-                queue += [(p, False) for p in ptrs]
+            if tag in _SUB_IFD_TAGS or tag in (_THUMB_OFFSET, _THUMB_LENGTH):
+                raw_vals = sp.read(base + voff, nbytes) if out_of_line else value
+                ints = _ints(bo, typ, raw_vals, count)
+                if tag in _SUB_IFD_TAGS:
+                    queue += [(p, False) for p in ints]
+                elif ints and tag == _THUMB_OFFSET:
+                    thumb_off = ints[0]
+                elif ints:
+                    thumb_len = ints[0]
             elif tag == _MAKERNOTE and out_of_line:
                 queue += [(voff + skip, False) for skip in _MAKERNOTE_IFD_SKIPS]
-            elif tag == _THUMB_OFFSET and not out_of_line:
-                thumb_off = struct.unpack(bo + off_fmt, value)[0]
-            elif tag == _THUMB_LENGTH and not out_of_line:
-                thumb_len = struct.unpack(bo + off_fmt, value)[0]
         if thumb_off and thumb_len and thumb_len <= _MAX_VALUE_BYTES:
             sp.ensure(base + thumb_off, thumb_len)  # exiftool -b extracts it
         nxt = raw[n * ent_sz:n * ent_sz + off_sz]
@@ -330,6 +354,20 @@ def _detect(head: bytes, name: str) -> str:
     return "unsupported"
 
 
+# Extensions worth trying a sparse read for; anything else (PNG, JP2, …) goes
+# straight to a full download without spending a head request first.
+SPARSE_EXTENSIONS = frozenset(
+    {".tif", ".tiff", ".jpg", ".jpeg", ".mp4", ".mov", ".m4v", ".avi",
+     ".ts", ".tts", ".m2ts", ".mts"}
+)
+
+
+def may_support(name: str) -> bool:
+    """Cheap pre-check by extension; :func:`build_sparse_copy` still sniffs
+    the content and raises :class:`UnsupportedFormat` on a mismatch."""
+    return os.path.splitext(name)[1].lower() in SPARSE_EXTENSIONS
+
+
 _WALKERS = {
     "tiff": _walk_tiff,
     "jpeg": _walk_jpeg,
@@ -366,6 +404,12 @@ def build_sparse_copy(
         except (struct.error, IndexError, ValueError) as e:
             raise SparseReadError(f"could not walk {fmt} structure: {e}") from e
         sp.flush()
-        return SparseStats(fmt=fmt, requests=sp.requests, fetched=sp.fetched, size=size)
+        return SparseStats(
+            fmt=fmt,
+            requests=sp.requests,
+            fetched=sp.fetched,
+            size=size,
+            ranges=sp.ranges,
+        )
     finally:
         sp.close()

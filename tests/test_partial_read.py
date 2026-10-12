@@ -22,6 +22,9 @@ from atomic_tools.io.partial_read import (
 from atomic_tools.io.storage import MetadataView, ObjectStoreBackend
 
 PIXELS = 4 * 1024 * 1024  # stand-in image/media payload that must never be fetched
+# Space between IFD0 and the Exif/GPS IFDs, wider than any read-ahead, so those
+# IFDs are only fetched if their pointers are followed correctly.
+SUB_IFD_GAP = 1024 * 1024
 HAVE_EXIFTOOL = shutil.which("exiftool") is not None
 FS_TAGS = {
     "SourceFile", "FileName", "Directory", "FileModifyDate", "FileAccessDate",
@@ -36,12 +39,19 @@ def _ascii(s: str) -> tuple[int, bytes]:
     return 2, s.encode() + b"\0"
 
 
-def _tiff(bo: str = "<", big: bool = False, ifd_at_end: bool = True) -> bytes:
+def _tiff(
+    bo: str = "<",
+    big: bool = False,
+    ifd_at_end: bool = True,
+    long_pointers: bool = False,
+    gap: int = SUB_IFD_GAP,
+) -> bytes:
     """A TIFF/BigTIFF with Exif + GPS sub-IFDs, out-of-line values, and the
     directories either before or after a large pixel block."""
     off_fmt, off_sz = ("Q", 8) if big else ("I", 4)
     cnt_fmt, cnt_sz, ent_sz = ("Q", 8, 20) if big else ("H", 2, 12)
-    long_t = 16 if big else 4
+    # BigTIFF writers may use LONG8 or plain 4-byte LONG for offsets/sub-IFDs.
+    long_t = 16 if big and not long_pointers else 4
     header_sz = 16 if big else 8
 
     def rational(*vals: float) -> tuple[int, bytes]:
@@ -51,7 +61,7 @@ def _tiff(bo: str = "<", big: bool = False, ifd_at_end: bool = True) -> bytes:
         return 3, struct.pack(bo + "H", v)
 
     def ptr(v: int) -> tuple[int, bytes]:
-        return long_t, struct.pack(bo + off_fmt, v)
+        return long_t, struct.pack(bo + ("I" if long_t == 4 else "Q"), v)
 
     meta_base = header_sz + (PIXELS if ifd_at_end else 0)
     pixel_off = header_sz if ifd_at_end else None  # filled below for front layout
@@ -69,7 +79,7 @@ def _tiff(bo: str = "<", big: bool = False, ifd_at_end: bool = True) -> bytes:
         return cnt_sz + len(entries) * ent_sz + off_sz + out_of_line
 
     ifd0_off = meta_base
-    exif_off = ifd0_off + ifd_size(ifd0)
+    exif_off = ifd0_off + ifd_size(ifd0) + gap
     gps_off = exif_off + ifd_size(exif)
     meta_end = gps_off + ifd_size(gps)
     if pixel_off is None:
@@ -92,7 +102,7 @@ def _tiff(bo: str = "<", big: bool = False, ifd_at_end: bool = True) -> bytes:
             body += struct.pack(bo + "HH", tag, typ) + struct.pack(bo + off_fmt, count) + field
         return body + struct.pack(bo + off_fmt, 0) + extra
 
-    meta = ser(ifd0, ifd0_off) + ser(exif, exif_off) + ser(gps, gps_off)
+    meta = ser(ifd0, ifd0_off) + b"\0" * gap + ser(exif, exif_off) + ser(gps, gps_off)
     if big:
         header = (b"II" if bo == "<" else b"MM") + struct.pack(bo + "HHHQ", 43, 8, 0, ifd0_off)
     else:
@@ -102,7 +112,8 @@ def _tiff(bo: str = "<", big: bool = False, ifd_at_end: bool = True) -> bytes:
 
 
 def _jpeg() -> bytes:
-    exif = b"Exif\0\0" + _tiff(ifd_at_end=False)[: -PIXELS]  # metadata only
+    # metadata only; APP1 segments are capped at 64 KiB, so no gap
+    exif = b"Exif\0\0" + _tiff(ifd_at_end=False, gap=0)[: -PIXELS]
     app1 = b"\xff\xe1" + struct.pack(">H", len(exif) + 2) + exif
     sos = b"\xff\xda" + struct.pack(">H", 8) + b"\x01\x01\x00\x00\x3f\x00"
     return b"\xff\xd8" + app1 + sos + b"\x55" * PIXELS + b"\xff\xd9"
@@ -185,15 +196,20 @@ def _assert_same_as_full(tmp_path: Path, data: bytes, sparse_path: Path, name: s
 
 
 @pytest.mark.parametrize(
-    "bo,big,ifd_at_end",
+    "bo,big,ifd_at_end,long_pointers",
     [
-        ("<", False, True), ("<", False, False), (">", False, True),
-        ("<", True, True), (">", True, True),
+        ("<", False, True, False), ("<", False, False, False), (">", False, True, False),
+        ("<", True, True, False), (">", True, True, False),
+        # 4-byte LONG pointers left-justified in BigTIFF's 8-byte value field.
+        (">", True, True, True), ("<", True, True, True),
     ],
-    ids=["le-ifd-at-end", "le-ifd-first", "be-ifd-at-end", "bigtiff-le", "bigtiff-be"],
+    ids=[
+        "le-ifd-at-end", "le-ifd-first", "be-ifd-at-end", "bigtiff-le", "bigtiff-be",
+        "bigtiff-be-long-pointers", "bigtiff-le-long-pointers",
+    ],
 )
-def test_tiff_sparse_matches_full(tmp_path, bo, big, ifd_at_end):
-    data = _tiff(bo, big, ifd_at_end)
+def test_tiff_sparse_matches_full(tmp_path, bo, big, ifd_at_end, long_pointers):
+    data = _tiff(bo, big, ifd_at_end, long_pointers)
     path, stats, rec = _sparse(tmp_path, data, "ortho.tif")
     assert stats.fmt == "tiff"
     assert stats.fetched < len(data) // 10
@@ -282,6 +298,7 @@ def _backend(monkeypatch, root: Path) -> ObjectStoreBackend:
     backend._scheme, backend._bucket, backend._prefix = "s3", "bucket", "data"
     backend._store = LocalStore(prefix=str(root))
     backend._single_key, backend._single_size = None, 0
+    backend._listing = None
     return backend
 
 

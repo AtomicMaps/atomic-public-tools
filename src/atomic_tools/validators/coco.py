@@ -98,6 +98,8 @@ class CocoImpact:
     affected_labels: int = 0
     unusable_labels: int = 0
     verdicts: list[CocoVerdict] = field(default_factory=list)
+    # Single-file runs: COCO images outside the run, not classified at all.
+    out_of_scope: int = 0
     # Whether not-on-disk blocks (sidecar generation) or merely warns
     # (informational `validate` runs). Drives both the finding severity and the
     # colour of the not_on_disk row in the matching breakdown so they agree.
@@ -138,6 +140,7 @@ class CocoImpact:
             "affected_labels": self.affected_labels,
             "unusable_labels": self.unusable_labels,
             "not_on_disk_is_error": self.not_on_disk_is_error,
+            "out_of_scope": self.out_of_scope,
             "tiers": [
                 {"tier": tier, "images": images, "labels": labels, "severity": severity}
                 for tier, images, labels, severity in self.tier_counts()
@@ -150,7 +153,12 @@ class CocoImpact:
             f"Label impact ({self.display_name}): "
             f"{self.images_in_coco} image(s) in COCO — "
             f"complete={self.complete} degraded={self.degraded} "
-            f"unusable={self.unusable} not_on_disk={self.not_on_disk}.",
+            f"unusable={self.unusable} not_on_disk={self.not_on_disk}"
+            + (
+                f"; {self.out_of_scope} outside this single-file run, not checked."
+                if self.out_of_scope
+                else "."
+            ),
             f"Labels: {self.total_labels} total, {self.affected_labels} affected "
             f"(degraded+unusable+not_on_disk), {self.unusable_labels} unusable "
             f"(unusable+not_on_disk).",
@@ -290,8 +298,14 @@ def analyze_coco_impact(
     optional_groups: list[list[str]],
     columns_set: set[str],
     default_row_idx: int | None,
+    scope_to_sidecar: bool = False,
 ) -> CocoImpact:
-    """Classify each COCO image against the sidecar and tally label impact."""
+    """Classify each COCO image against the sidecar and tally label impact.
+
+    ``scope_to_sidecar`` (single-file runs): COCO images with no sidecar row are
+    outside this run, not missing from disk — count them in ``out_of_scope``
+    instead of classifying them ``not_on_disk``.
+    """
     impact = CocoImpact(coco_path=coco_path)
     if df.shape[1] == 0:
         return impact
@@ -317,6 +331,9 @@ def analyze_coco_impact(
         match_idx = _match_row(image, rows_by_basename)
         reasons: list[str] = []
 
+        if match_idx is None and scope_to_sidecar:
+            impact.out_of_scope += 1
+            continue
         if match_idx is None:
             tier = TIER_NOT_ON_DISK
             reasons.append("no_sidecar_row")

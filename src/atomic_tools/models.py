@@ -71,6 +71,9 @@ class CocoDetails(BaseModel):
     affected_labels: int
     unusable_labels: int
     not_on_disk_is_error: bool
+    out_of_scope: int = Field(
+        default=0, description="Single-file runs: COCO images outside the run, not checked."
+    )
     tiers: list[CocoTier]
     verdicts: list[CocoVerdict]
 

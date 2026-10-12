@@ -16,6 +16,7 @@ from atomic_tools import validate_path as _validate_path
 from atomic_tools.cli import app
 from atomic_tools.client_sidecar import SidecarMergeError
 from atomic_tools.commands.sidecar import NoSupportedFilesError, PointCloudCRSError
+from atomic_tools.errors import InvalidInputError
 from atomic_tools.utils.utils import DataTypeEnum
 from atomic_tools.validators.report import LintReport, MissingDataReport
 from atomic_tools.validators.sidecar import lint_sidecar_df, lint_sidecar_file
@@ -256,10 +257,14 @@ def test_validate_path_accepts_string_datatype(stubbed, tmp_path):
 
 
 def test_validate_path_never_raises(stubbed, tmp_path):
-    stubbed["build_exc"] = ValueError("bad CRS")
+    stubbed["build_exc"] = InvalidInputError("bad CRS")
     payload = validate_path(str(tmp_path))
     assert payload["status"] == "error"
     assert payload["error"]["type"] == "invalid_input"
+
+    # A stray ValueError (pandas, pyproj, …) is a bug, not the caller's fault.
+    stubbed["build_exc"] = ValueError("cannot reindex on an axis with duplicate labels")
+    assert validate_path(str(tmp_path))["error"]["type"] == "internal_error"
 
     assert validate_path("")["error"]["type"] == "invalid_input"
     assert validate_path(str(tmp_path), data_type="nope")["status"] == "error"

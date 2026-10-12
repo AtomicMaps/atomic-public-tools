@@ -28,11 +28,13 @@ from urllib.parse import parse_qs, urlparse
 import obstore
 from obstore.exceptions import NotFoundError, PermissionDeniedError, UnauthenticatedError
 
+from atomic_tools.errors import InvalidInputError
 from atomic_tools.io.partial_read import (
     HEAD_BYTES,
     SparseReadError,
     SparseStats,
     build_sparse_copy,
+    may_support,
 )
 from atomic_tools.utils.aws_errors import (
     S3PermissionDeniedError,
@@ -45,7 +47,7 @@ from atomic_tools.utils.object_store import (
 from atomic_tools.utils.utils import (
     download,
     filter_keys,
-    get_object_keys,
+    get_keys_and_metadata,
     upload,
 )
 
@@ -91,6 +93,16 @@ class StorageBackend(ABC):
     @abstractmethod
     def write_output(self, filename: str, source: Path) -> str:
         """Write `source` to the root as `filename`. Returns a display path."""
+
+    @abstractmethod
+    def output_exists(self, filename: str) -> bool:
+        """Whether :meth:`write_output` would replace an existing file."""
+
+    @property
+    @abstractmethod
+    def output_location(self) -> str:
+        """Display form of the folder :meth:`write_output` writes into (for a
+        single-file target, the file's folder rather than the file)."""
 
     @contextmanager
     def open_metadata_view(self, key: str) -> Iterator[MetadataView]:
@@ -159,6 +171,13 @@ class LocalBackend(StorageBackend):
         shutil.copy2(source, target)
         return str(target)
 
+    def output_exists(self, filename: str) -> bool:
+        return (self._root / filename).exists()
+
+    @property
+    def output_location(self) -> str:
+        return str(self._root)
+
 
 class ObjectStoreBackend(StorageBackend):
     def __init__(self, scheme: str, bucket: str, prefix: str) -> None:
@@ -169,6 +188,8 @@ class ObjectStoreBackend(StorageBackend):
         # Set by list_keys when the prefix turns out to name a single object.
         self._single_key: str | None = None
         self._single_size = 0
+        # {key: size} of everything under "<prefix>/", listed once per backend.
+        self._listing: dict[str, int] | None = None
         factory = ObjectStore(store_type)
         self._store = (
             factory.init_session(bucket=bucket)
@@ -202,51 +223,48 @@ class ObjectStoreBackend(StorageBackend):
     def single_file(self) -> str | None:
         return self._single_key
 
-    def list_keys(self, include: Sequence[str], exclude: Sequence[str]) -> list[str]:
-        if self._single_key is None:
+    def _raw_listing(self) -> dict[str, int]:
+        """``{key: size}`` for everything under ``<prefix>/``, listed once."""
+        if self._listing is None:
+            if not self._prefix.strip():
+                raise InvalidInputError("Directory path cannot be empty")
             try:
-                keys = get_object_keys(
-                    store=self._store,
-                    directory=self._prefix,
-                    include=list(include),
-                    exclude=list(exclude),
-                )
+                info = get_keys_and_metadata(self._store, self._prefix)
             except RuntimeError as e:
                 self._reraise_if_auth(e, operation="list")
                 raise
-            # Listing treats the prefix as a folder ("<prefix>/…"), so a URI
-            # naming one object lists nothing. Check for that object directly —
-            # but only when the last segment looks like a file (has an
-            # extension; types are detected from it, so nothing else could be
-            # validated anyway). This keeps an ordinary empty folder from
-            # costing a HEAD request.
-            if keys or not PurePosixPath(self._prefix).suffix:
-                return keys
-            size = self._head_size(self._prefix)
-            if size is None:
-                return []
+            self._listing = {k: int(v["size"]) for k, v in info.items()}
+        return self._listing
+
+    def list_keys(self, include: Sequence[str], exclude: Sequence[str]) -> list[str]:
+        if self._single_key is None:
+            listing = self._raw_listing()
+            if listing:
+                # Something lives under "<prefix>/", so the URI names a folder —
+                # even one with a dot in its name — matching files or not.
+                return filter_keys(listing, include, exclude)
+            # Nothing under it as a folder (listing treats the prefix as
+            # "<prefix>/"): either one object at exactly this key, or nothing.
+            self._single_size = self._head_size(self._prefix)
             self._single_key = self._prefix
-            self._single_size = size
         return filter_keys({self._single_key: self._single_size}, include, exclude)
 
-    def _head_size(self, key: str) -> int | None:
-        """Size of object `key`; None if the HEAD is denied.
+    def _head_size(self, key: str) -> int:
+        """Size of the object at ``key``.
 
-        Raises ``FileNotFoundError`` when the store says the object doesn't
-        exist: the URI names a file (it has an extension) and nothing is under
-        it as a folder either, so it's a bad path, like a missing local file.
-
-        A denied HEAD is treated as "not a single object", not an auth failure:
-        the listing just succeeded, so the credentials work, and policies scoped
-        to ``prefix/*`` legitimately deny HEAD on the bare prefix key.
+        Only called when nothing is listed under ``key/``, so a 404 means the
+        path doesn't exist at all (a bad path, like a missing local file), and
+        a denied HEAD is a real permission problem on that object.
         """
         try:
             meta = obstore.head(self._store, key)
         except (FileNotFoundError, NotFoundError):
-            raise FileNotFoundError(f"Object does not exist: {self.display_root}") from None
+            raise FileNotFoundError(
+                f"No file or folder exists at {self.display_root}"
+            ) from None
         except (PermissionDeniedError, UnauthenticatedError) as e:
-            logger.debug(f"HEAD {key!r} denied ({e}); treating it as a folder prefix.")
-            return None
+            self._reraise_if_auth(e, operation="download")
+            raise
         return int(meta["size"])
 
     @contextmanager
@@ -254,7 +272,7 @@ class ObjectStoreBackend(StorageBackend):
         """A sparse local copy holding only the bytes exiftool reads, or the
         full download when the format has no sparse reader, the walk fails, or
         sparse reads are disabled (AM_TOOLS_SPARSE_READS=0)."""
-        if sparse_reads_enabled():
+        if sparse_reads_enabled() and may_support(key):
             with tempfile.TemporaryDirectory() as tmp_dir:
                 local_path = os.path.join(tmp_dir, PurePosixPath(key).name or "object")
                 stats = self._try_sparse_copy(key, local_path)
@@ -300,10 +318,30 @@ class ObjectStoreBackend(StorageBackend):
                 raise
             yield local_path
 
+    def _output_folder(self) -> str:
+        # For a single-object target, outputs go beside the object, not under it.
+        return self._prefix.rpartition("/")[0] if self._single_key else self._prefix
+
+    def _output_key(self, filename: str) -> str:
+        folder = self._output_folder()
+        return f"{folder}/{filename}" if folder else filename
+
+    @property
+    def output_location(self) -> str:
+        return f"{self._scheme}://{self._bucket}/{self._output_folder()}"
+
+    def output_exists(self, filename: str) -> bool:
+        try:
+            obstore.head(self._store, self._output_key(filename))
+        except (FileNotFoundError, NotFoundError):
+            return False
+        except (PermissionDeniedError, UnauthenticatedError) as e:
+            self._reraise_if_auth(e, operation="download")
+            raise
+        return True
+
     def write_output(self, filename: str, source: Path) -> str:
-        # For a single-object target, write beside the object, not under it.
-        folder = self._prefix.rpartition("/")[0] if self._single_key else self._prefix
-        output_key = f"{folder}/{filename}" if folder else filename
+        output_key = self._output_key(filename)
         try:
             upload(self._store, key=output_key, source=str(source))
         except RuntimeError as e:
@@ -382,7 +420,7 @@ def from_path(path: str) -> StorageBackend:
     path to a directory or a single file. Local paths must already exist.
     """
     if not path or not path.strip():
-        raise ValueError("--path cannot be empty.")
+        raise InvalidInputError("--path cannot be empty.")
 
     directory = normalize_directory(path)
     raw = directory.strip().rstrip("/")
@@ -391,7 +429,7 @@ def from_path(path: str) -> StorageBackend:
     store_type = REMOTE_SCHEME_TO_STORE_TYPE.get(scheme) if scheme else None
     if store_type:
         if not parsed.netloc:
-            raise ValueError(f"Object-store URI missing bucket: {directory!r}")
+            raise InvalidInputError(f"Object-store URI missing bucket: {directory!r}")
         prefix = parsed.path.lstrip("/")
         return ObjectStoreBackend(scheme=scheme, bucket=parsed.netloc, prefix=prefix)
 

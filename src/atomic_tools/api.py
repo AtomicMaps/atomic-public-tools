@@ -40,6 +40,7 @@ from atomic_tools.commands.sidecar import (
     _build_sidecar,
     _crs_failures,
 )
+from atomic_tools.errors import InvalidInputError
 from atomic_tools.models import (
     SCHEMA_VERSION,
     DependencyReport,
@@ -107,11 +108,24 @@ def parse_include(value: str | Iterable[str] | None) -> frozenset[str]:
     """Normalise an ``include`` spec (comma string or iterable) to section names.
 
     ``None``/empty → :data:`DEFAULT_SECTIONS`; ``"all"`` → every section.
-    Raises ``ValueError`` naming any unknown section.
+    Raises :class:`InvalidInputError` naming any unknown section, or when
+    ``value`` isn't a string or an iterable of strings.
     """
     if value is None:
         return DEFAULT_SECTIONS
-    parts = value.split(",") if isinstance(value, str) else list(value)
+    if isinstance(value, str):
+        parts = value.split(",")
+    else:
+        try:
+            parts = list(value)
+        except TypeError:
+            raise InvalidInputError(
+                f"include must be a comma-separated string or a list of section "
+                f"names, not {type(value).__name__}."
+            ) from None
+        bad = [p for p in parts if not isinstance(p, str)]
+        if bad:
+            raise InvalidInputError(f"include entries must be strings, got {bad!r}.")
     names = {p.strip().lower() for p in parts if p and p.strip()}
     if not names:
         return DEFAULT_SECTIONS
@@ -119,7 +133,7 @@ def parse_include(value: str | Iterable[str] | None) -> frozenset[str]:
         return frozenset(SECTIONS)
     unknown = sorted(names - set(SECTIONS))
     if unknown:
-        raise ValueError(
+        raise InvalidInputError(
             f"Unknown include section(s): {unknown}. "
             f"Choose from {list(SECTIONS)} or 'all'."
         )
@@ -149,8 +163,7 @@ def run_validation(
         f"full={full} spatial_reference={spatial_reference!r} coco={coco!r}"
     )
     unclassified: list[str] = []
-    # validate never persists, so the backend is unused.
-    df, _, detected_types, skipped_vector = _build_sidecar(
+    df, backend, detected_types, skipped_vector = _build_sidecar(
         directory=path,
         data_type=data_type,
         client_sidecar=client_sidecar,
@@ -172,6 +185,9 @@ def run_validation(
         final=True,
         data_type=data_type,
         input_files_path=path,
+        # Reuse the scan's backend: no second session/listing for the
+        # file-inventory check.
+        input_backend=backend,
         ignore_missing_orientation=ignore_missing_orientation,
         coco_path=coco,
         # validate is informational — a COCO referencing images absent from
@@ -257,7 +273,9 @@ def _classify_exception(exc: BaseException) -> str:
     if isinstance(
         exc,
         (
-            ValueError,
+            # Raised deliberately for bad paths, flag values and uploads. A bare
+            # ValueError (pandas, JSON, …) is a bug, not the caller's fault.
+            InvalidInputError,
             NotImplementedError,
             # from_path() was given a local path (or a client file) that doesn't exist.
             FileNotFoundError,
@@ -267,7 +285,8 @@ def _classify_exception(exc: BaseException) -> str:
         ),
     ):
         return "invalid_input"
-    # Anything else (storage/network failures wrapped as RuntimeError, bugs).
+    # Anything else: storage/network failures wrapped as RuntimeError, and bugs
+    # (including stray ValueErrors from pandas, pyproj, …).
     return "internal_error"
 
 
@@ -295,7 +314,7 @@ def validate_path(
     try:
         sections = parse_include(include)
         if not path:
-            raise ValueError("path is required.")
+            raise InvalidInputError("path is required.")
         dt = DataTypeEnum(data_type) if isinstance(data_type, str) else data_type
     except ValueError as e:
         return error_payload("invalid_input", str(e))
@@ -345,7 +364,7 @@ _EXTRA_ROLES = ("client_sidecar", "client_schema", "coco")
 _MAX_NAME_BYTES = 255
 
 
-class UploadError(ValueError):
+class UploadError(InvalidInputError):
     """An upload that can't be validated as given (bad name, too large…)."""
 
 
@@ -390,6 +409,26 @@ def _unpack_upload(obj: UploadLike, filename: str | None, role: str) -> tuple[An
     raise UploadError(f"Unsupported {role} upload type: {type(obj).__name__}.")
 
 
+def _is_empty_form_field(obj: UploadLike) -> bool:
+    """An optional file input the user left empty.
+
+    HTML forms still send an empty file part, which FastAPI/Starlette turn into
+    an ``UploadFile`` with ``filename=""`` and no bytes rather than ``None``.
+    """
+    if isinstance(obj, UploadedFile) or not (hasattr(obj, "file") and hasattr(obj, "filename")):
+        return False
+    if obj.filename:
+        return False
+    stream = obj.file
+    try:
+        pos = stream.tell()
+        empty = stream.read(1) in (b"", "")
+        stream.seek(pos)
+    except (AttributeError, OSError, ValueError):
+        return False  # can't tell; let _save_upload report it
+    return empty
+
+
 def _save_upload(
     obj: UploadLike,
     dest_dir: Path,
@@ -419,10 +458,9 @@ def _save_upload(
     written = 0
     with open(dest, "wb") as out:
         if isinstance(content, (bytes, bytearray, memoryview)):
-            data = bytes(content)
-            written = len(data)
+            written = memoryview(content).nbytes
             if max_bytes is None or written <= max_bytes:
-                out.write(data)
+                out.write(content)  # no intermediate copy of a large buffer
         else:
             # Rewind if possible; an unseekable stream is read from where it is.
             with contextlib.suppress(AttributeError, OSError, ValueError):
@@ -517,7 +555,10 @@ def validate_upload(
     try:
         tmp_root = Path(tempfile.mkdtemp(prefix="amtools-", dir=work_dir))
     except OSError as e:
-        return error_payload("internal_error", f"Could not create a temp dir: {e}")
+        # Log the path for operators; don't send it to the HTTP client.
+        logger.error(f"Could not create a temp dir in {work_dir!r}: {e}")
+        reason = e.strerror or type(e).__name__
+        return error_payload("internal_error", f"Could not create a temp dir ({reason}).")
 
     saved: list[Path] = []
     try:
@@ -574,7 +615,7 @@ def _save_and_validate(
     extra_paths: dict[str, str | None] = {}
     for role in _EXTRA_ROLES:
         obj = extras.get(role)
-        if obj is None:
+        if obj is None or _is_empty_form_field(obj):
             extra_paths[role] = None
             continue
         p = _save_upload(
