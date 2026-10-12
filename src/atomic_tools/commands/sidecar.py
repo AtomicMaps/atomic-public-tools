@@ -1182,21 +1182,11 @@ class SidecarConflictError(RuntimeError):
 
 
 def _merge_into_existing(existing, new):
-    """Add a single-file run's rows (``new``) to an existing generated sidecar.
+    """Add a single-file run's rows to an existing generated sidecar.
 
-    Returns ``(merged, added, kept)``: the merged frame, the filenames added as
-    new rows, and the filenames that already had a row (left untouched).
-
-    * Only sidecars this tool generated are updated: they need ``Filename`` and
-      ``DataType`` columns and a ``DEFAULT`` row. Anything else is refused
-      rather than reshaped.
-    * Columns are unioned; existing rows get blanks for new columns.
-    * The existing ``DEFAULT`` row is kept as-is because it applies to every
-      file. A value the run put on its own ``DEFAULT`` row (e.g. ``fallback_srs``
-      from ``--spatial-reference``) is written onto the new file's row instead,
-      unless the existing ``DEFAULT`` already says the same.
-    * Rows are ordered like a full run: ``DEFAULT`` first, then by DataType and
-      Filename.
+    Returns ``(merged, added, kept)``; ``kept`` are files that already had a row.
+    The existing ``DEFAULT`` row applies to every file, so it's left alone and
+    this run's ``DEFAULT`` values (e.g. ``fallback_srs``) go on the new row.
     """
     import pandas as pd
 
@@ -1224,7 +1214,7 @@ def _merge_into_existing(existing, new):
             if col in ("Filename", "DataType") or value == "":
                 continue
             if existing_default.get(col, "") == value:
-                continue  # the existing DEFAULT already provides it
+                continue
             to_add.loc[to_add[col] == "", col] = value
 
     columns = list(existing.columns) + [c for c in to_add.columns if c not in existing.columns]
@@ -1246,10 +1236,11 @@ def _generate(
     spatial_reference: str | None = None,
     update_existing: bool = False,
 ) -> tuple[str, list[str], StorageBackend, "object | None"]:
-    """Build and write the sidecar. Returns ``(sidecar_path, vector_keys,
-    backend, lint_df)``; ``lint_df`` is the subset to lint (DEFAULT plus this
-    file's row) when a single-file run updated an existing sidecar, else None
-    (lint the written file)."""
+    """Build and write the sidecar.
+
+    ``lint_df`` is set when an existing sidecar was updated: lint only those
+    rows, not the whole file.
+    """
     logger.info(
         f"Starting sidecar CSV generation — directory={directory!r} "
         f"data_type={data_type} output={output_filename!r} "
@@ -1276,8 +1267,6 @@ def _generate(
     if backend.single_file is not None and backend.output_exists(output_filename):
         target = f"{backend.output_location}/{output_filename}"
         if not update_existing:
-            # A single-file run yields a one-row sidecar; silently replacing the
-            # folder's real sidecar (which an intake watcher may pick up) loses data.
             raise InvalidInputError(
                 f"Refusing to overwrite {target}: this run covers only "
                 f"{PurePosixPath(backend.single_file).name}, so its sidecar would "
@@ -1577,8 +1566,6 @@ def _run_generate(
     logger.info("Linting generated sidecar…")
     try:
         if lint_df is not None:
-            # Updated an existing sidecar: lint only this file's row (with the
-            # sidecar's DEFAULT), not rows other runs already produced.
             report = lint_sidecar_df(
                 lint_df,
                 final=True,

@@ -68,8 +68,6 @@ def _validate(
         final=True,
         data_type=data_type,
         input_files_path=directory,
-        # Reuse the scan's backend: no second session/listing for the
-        # file-inventory check.
         input_backend=backend,
         ignore_missing_orientation=ignore_missing_orientation,
         coco_path=coco,

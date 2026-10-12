@@ -73,13 +73,11 @@ class StorageBackend(ABC):
 
     @abstractmethod
     def read_output(self, filename: str) -> tuple[pd.DataFrame, str | None]:
-        """Read an existing output CSV (all cells as strings) plus its
-        :meth:`output_version`, for read-modify-write updates."""
+        """Read an existing output CSV as strings, with its :meth:`output_version`."""
 
     @abstractmethod
     def output_version(self, filename: str) -> str | None:
-        """An opaque token that changes whenever the output file changes
-        (None if it doesn't exist). Compare before writing a merged file."""
+        """Opaque token that changes when the output file does; None if missing."""
 
     @abstractmethod
     def output_exists(self, filename: str) -> bool:
@@ -88,23 +86,19 @@ class StorageBackend(ABC):
     @property
     @abstractmethod
     def output_location(self) -> str:
-        """Display form of the folder :meth:`write_output` writes into (for a
-        single-file target, the file's folder rather than the file)."""
+        """The folder :meth:`write_output` writes into (a single file's parent)."""
 
     @property
     def single_file(self) -> str | None:
-        """The one key this backend targets when it was given a file, else None.
+        """The targeted key when given a single file, else None.
 
-        For object stores this is only known after ``list_keys`` (a URI can't
-        be told apart from a prefix without asking the store).
+        Object stores only know this after ``list_keys``.
         """
         return None
 
 
 class LocalBackend(StorageBackend):
     def __init__(self, root: Path, only: str | None = None) -> None:
-        # `only` restricts the backend to one file (a name relative to `root`);
-        # `root` is then the file's parent, so outputs land beside it.
         self._root = root
         self._only = only
 
@@ -178,7 +172,6 @@ class ObjectStoreBackend(StorageBackend):
         # Set by list_keys when the prefix turns out to name a single object.
         self._single_key: str | None = None
         self._single_size = 0
-        # {key: size} of everything under "<prefix>/", listed once per backend.
         self._listing: dict[str, int] | None = None
         factory = ObjectStore(store_type)
         self._store = (
@@ -230,11 +223,8 @@ class ObjectStoreBackend(StorageBackend):
         if self._single_key is None:
             listing = self._raw_listing()
             if listing:
-                # Something lives under "<prefix>/", so the URI names a folder —
-                # even one with a dot in its name — matching files or not.
+                # A folder, even if its name has a dot in it.
                 return filter_keys(listing, include, exclude)
-            # Nothing under it as a folder (listing treats the prefix as
-            # "<prefix>/"): either one object at exactly this key, or nothing.
             self._single_size = self._head_size(self._prefix)
             self._single_key = self._prefix
         return filter_keys({self._single_key: self._single_size}, include, exclude)
@@ -243,8 +233,7 @@ class ObjectStoreBackend(StorageBackend):
         """Size of the object at ``key``.
 
         Only called when nothing is listed under ``key/``, so a 404 means the
-        path doesn't exist at all (a bad path, like a missing local file), and
-        a denied HEAD is a real permission problem on that object.
+        path doesn't exist at all.
         """
         try:
             meta = obstore.head(self._store, key)
@@ -268,7 +257,6 @@ class ObjectStoreBackend(StorageBackend):
             yield local_path
 
     def _output_folder(self) -> str:
-        # For a single-object target, outputs go beside the object, not under it.
         return self._prefix.rpartition("/")[0] if self._single_key else self._prefix
 
     def _output_key(self, filename: str) -> str:

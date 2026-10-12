@@ -272,8 +272,6 @@ def _lint_loaded_df(
             default_row_idx=default_row_idx,
             report=report,
             not_on_disk_is_error=coco_not_on_disk_is_error,
-            # A single-file run can't have the COCO's other images on disk;
-            # judge only the image(s) this run covers.
             scope_to_sidecar=(
                 inventory_backend is not None and inventory_backend.single_file is not None
             ),
@@ -693,8 +691,7 @@ def _check_file_inventory(
 ) -> StorageBackend | None:
     """Compare sidecar rows with the files actually at ``input_files_path``.
 
-    Returns the backend used (``backend`` if given, else a new one), or None if
-    the location couldn't be opened, so later checks can reuse it.
+    Returns the backend for later checks to reuse, or None if it couldn't be opened.
     """
     detected_types = list(dict.fromkeys(t for t in row_types.values() if t is not None))
 

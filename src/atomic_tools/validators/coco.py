@@ -285,9 +285,8 @@ def analyze_coco_impact(
 ) -> CocoImpact:
     """Classify each COCO image against the sidecar and tally label impact.
 
-    ``scope_to_sidecar`` (single-file runs): COCO images with no sidecar row are
-    outside this run, not missing from disk — count them in ``out_of_scope``
-    instead of classifying them ``not_on_disk``.
+    ``scope_to_sidecar`` counts images with no sidecar row as ``out_of_scope``
+    instead of ``not_on_disk`` (for single-file runs).
     """
     impact = CocoImpact(coco_path=coco_path)
     if df.shape[1] == 0:
