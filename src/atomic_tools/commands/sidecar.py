@@ -11,6 +11,7 @@ Requires the following external binaries at runtime (NOT pip-installable):
 """
 
 import logging
+import re
 import shlex
 import shutil
 import sys
@@ -33,6 +34,7 @@ from atomic_tools.client_sidecar import (
     merge_client_metadata,
 )
 from atomic_tools.errors import InvalidInputError
+from atomic_tools.io.partial_read import SparseStats
 from atomic_tools.io.storage import (
     StorageBackend,
     from_path,
@@ -907,6 +909,61 @@ def _move_blank_columns_to_end(df):
     return df[non_blank + blank]
 
 
+# exiftool cites absolute file offsets in many structural warnings, e.g.
+# "Truncated 'RDT6' data at offset 0x337c2ff0".
+_WARNING_OFFSET_RE = re.compile(r"\bat offset 0x([0-9a-fA-F]+)")
+# Wording that suggests a read problem; a [minor] warning containing any of it
+# is not trusted to be a mere hint.
+_STRUCTURAL_WORDS_RE = re.compile(
+    r"offset|truncat|corrupt|\bbad\b|missing|invalid|error|maker ?notes?", re.IGNORECASE
+)
+
+
+def _sparse_read_problem(meta: dict, stats: SparseStats | None = None) -> str | None:
+    """Why a metadata read from a sparse copy can't be trusted, or None.
+
+    An empty result or an exiftool Error always means "read the whole file". A
+    Warning is trusted (no fallback) only when it can't have come from the
+    unfetched holes in the copy:
+
+    * an exiftool ``[minor]`` hint with no structural wording, such as
+      "[minor] The ExtractEmbedded option may find more tags in the media data";
+    * a warning naming an offset that lies in a range that *was* fetched — the
+      bytes exiftool complains about are real, so the full file says the same.
+
+    Anything else falls back. A wrong guess here only costs a download.
+    """
+    if not meta:
+        return "no metadata returned"
+    if "Error" in meta:
+        return f"exiftool error: {meta['Error']}"
+    warning = meta.get("Warning")
+    if warning is None:
+        return None
+    text = str(warning)
+    if text.startswith("[minor]") and not _STRUCTURAL_WORDS_RE.search(text):
+        return None
+    match = _WARNING_OFFSET_RE.search(text)
+    if match and stats is not None and stats.covers(int(match.group(1), 16)):
+        return None
+    return f"exiftool warning: {text}"
+
+
+def _extract_exif_with_fallback(backend: StorageBackend, key: str, label: str) -> dict:
+    """exiftool on a sparse copy when the backend offers one, falling back to a
+    full download if exiftool reports any problem reading it."""
+    with backend.open_metadata_view(key) as view:
+        meta = extract_exif_metadata(view.path, filename=label)
+        if not view.sparse:
+            return meta
+        problem = _sparse_read_problem(meta, view.stats)
+        if problem is None:
+            return meta
+    logger.info(f"Partial read of {label} wasn't enough ({problem}); downloading it in full.")
+    with backend.open_local(key) as local_path:
+        return extract_exif_metadata(local_path, filename=label)
+
+
 def _build_sidecar(
     directory: str,
     data_type: DataTypeEnum | None,
@@ -1048,20 +1105,18 @@ def _build_sidecar(
             is_pc = key_type == DataTypeEnum.point_cloud
             tool = "PDAL" if is_pc else "EXIF"
             logger.info(f"[{i}/{total}] Extracting {tool}: {key}")
-            with backend.open_local(key) as local_path:
-                if is_pc:
+            if is_pc:
+                with backend.open_local(key) as local_path:
                     meta = extract_pdal_metadata(local_path, filename=display_label)
-                else:
-                    meta = extract_exif_metadata(local_path, filename=display_label)
-                    # Auto mode only: refine ambiguous images oriented↔spherical
-                    # from EXIF signals. The filename already chose the (shared)
-                    # EXIF extractor, so this never changes which extractor ran.
-                    if data_type is None and key_type in IMAGE_DATA_TYPES:
-                        refined = infer_data_type(
-                            key, **spherical_signals_from_exif(meta)
-                        )
-                        if refined is not None:
-                            types_by_key[key] = DataTypeEnum(refined)
+            else:
+                meta = _extract_exif_with_fallback(backend, key, display_label)
+                # Auto mode only: refine ambiguous images oriented↔spherical
+                # from EXIF signals. The filename already chose the (shared)
+                # EXIF extractor, so this never changes which extractor ran.
+                if data_type is None and key_type in IMAGE_DATA_TYPES:
+                    refined = infer_data_type(key, **spherical_signals_from_exif(meta))
+                    if refined is not None:
+                        types_by_key[key] = DataTypeEnum(refined)
             if not meta:
                 empty_count += 1
                 logger.warning(f"No {tool} metadata returned for {key}")

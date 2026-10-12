@@ -154,6 +154,12 @@ am-tools validate \
   --ignore-missing-orientation
 ```
 
+#### Faster validation of remote files
+
+For `s3://`, `gs://` and `az://` paths, `sidecar` and `validate` don't download each image or video in full. They fetch only the byte ranges exiftool reads, such as the JPEG header, the TIFF directories (even when a GeoTIFF stores them at the end of a 1.5 GB file), or an MP4's `moov` box. The ranges are written into a sparse local file the size of the original, and exiftool runs on that file with the same flags as before, so the extracted values are identical. If exiftool reports any warning or error on the partial copy, or the format has no partial reader (for example PNG), the file is downloaded in full and read again. Point clouds are always downloaded in full, because pdal reads them.
+
+On a sample of 82 real files (orthos, drone JPEGs, MP4/AVI/TTS video), this fetched about 86 MB instead of 7.7 GB, with identical metadata. Set `AM_TOOLS_SPARSE_READS=0` to turn it off.
+
 #### API mode (`--api-mode`)
 For calling `validate` from a service, pass `--api-mode`. It never prompts (`--path` is required), skips the daily update check, hides the progress bar and colored banners, and prints **one JSON document to stdout**. Logs go to stderr at ERROR level unless you pass `-v`.
 
@@ -361,6 +367,7 @@ Tuning and operations:
 | Setting | Effect |
 |---|---|
 | `AM_TOOLS_EXIFTOOL_TIMEOUT` | Seconds per exiftool call; the default is 120. A timeout logs a warning and treats the file as having no EXIF. |
+| `AM_TOOLS_SPARSE_READS` | Set to `0` to always download remote (S3/GCS/Azure) files in full instead of reading only their metadata. On by default. |
 | `EXIFTOOL_BIN`, `PDAL_BIN` | Explicit tool paths. |
 | Logging | The library logs to the `atomic_tools` logger and adds a `NullHandler`, so configure logging in your app to see its warnings. |
 | Concurrency | pdal can take up to about 3 × 120 s on a large point cloud. Limit concurrent point-cloud requests, for example with a semaphore or a dedicated worker. |
