@@ -16,7 +16,7 @@ import shutil
 import sys
 import tempfile
 from collections import Counter, defaultdict
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Annotated, NamedTuple, NoReturn
 
 import click
@@ -35,7 +35,7 @@ from atomic_tools.client_sidecar import (
 from atomic_tools.errors import InvalidInputError
 from atomic_tools.io.storage import (
     StorageBackend,
-    from_directory,
+    from_path,
     normalize_directory,
 )
 from atomic_tools.utils.aws_errors import find_auth_error, print_help_block
@@ -116,8 +116,11 @@ def _list_local_schemas() -> list[Path]:
 def _ask_directory() -> str:
     answer = (
         questionary.text(
-            "Directory to scan:",
-            instruction="(Local folder or object-store URI like s3://bucket/prefix)",
+            "Directory or file to scan:",
+            instruction=(
+                "(Local folder/file or object-store URI like s3://bucket/prefix "
+                "or s3://bucket/key.jpg)"
+            ),
             validate=lambda v: bool(v.strip()) or "Required.",
         )
         .unsafe_ask()
@@ -939,7 +942,7 @@ def _build_sidecar(
                 "spatial reference (try e.g. 'EPSG:32612' or '32612')."
             ) from None
 
-    backend = from_directory(directory)
+    backend = from_path(directory)
 
     if data_type is not None:
         # --- Explicit override: single-type listing, no refinement. ---
@@ -958,6 +961,11 @@ def _build_sidecar(
             exclude=list(info.get("exclude") or []),
         )
         if not keys:
+            if backend.single_file is not None:
+                raise InvalidInputError(
+                    f"{backend.display_root} is not a '{data_type.value}' file "
+                    "(or it is empty). Drop --datatype to auto-detect its type."
+                )
             raise RuntimeError(
                 f"No valid files found for '{data_type.value}' in {backend.display_root}"
             )
@@ -976,6 +984,16 @@ def _build_sidecar(
         # Vector files are unsupported, but we don't interrupt the scan to say so
         # — the skip is reported once at the end (see _run_generate / _validate).
         if not types_by_key:
+            if backend.single_file is not None:
+                if vector_keys:
+                    raise NotImplementedError(
+                        f"{backend.display_root} is vector data, which is not yet "
+                        "supported for sidecar generation or validation."
+                    )
+                raise InvalidInputError(
+                    f"{backend.display_root} is not a supported file type (or it "
+                    "is empty or a preview/thumbnail derivative)."
+                )
             raise RuntimeError(f"No supported files found in {backend.display_root}")
 
     supported_keys = list(types_by_key)
@@ -1168,7 +1186,7 @@ def _generate(
     full: bool = False,
     local_copy: bool = False,
     spatial_reference: str | None = None,
-) -> tuple[str, list[str]]:
+) -> tuple[str, list[str], StorageBackend]:
     logger.info(
         f"Starting sidecar CSV generation — directory={directory!r} "
         f"data_type={data_type} output={output_filename!r} "
@@ -1184,6 +1202,15 @@ def _generate(
         full=full,
         spatial_reference=spatial_reference,
     )
+    if backend.single_file is not None and backend.output_exists(output_filename):
+        # A single-file run yields a one-row sidecar; silently replacing the
+        # folder's real sidecar (which an intake watcher may pick up) loses data.
+        raise InvalidInputError(
+            f"Refusing to overwrite {backend.output_location}/{output_filename}: "
+            f"this run covers only {PurePosixPath(backend.single_file).name}, so its "
+            "sidecar would replace the existing one with a single row. Pass "
+            "--output-filename with a name that isn't taken."
+        )
     crs_failures = _crs_failures(df)
 
     local_copy_path: Path | None = None
@@ -1199,7 +1226,7 @@ def _generate(
             diagnostic_path = Path.cwd() / output_filename
             shutil.copy2(local_csv, diagnostic_path)
             raise PointCloudCRSError(crs_failures, diagnostic_path)
-        logger.info(f"Writing sidecar CSV to {backend.display_root}/{output_filename}")
+        logger.info(f"Writing sidecar CSV to {backend.output_location}/{output_filename}")
         sidecar_path = backend.write_output(output_filename, local_csv)
         if local_copy:
             local_copy_path = Path.cwd() / output_filename
@@ -1215,7 +1242,7 @@ def _generate(
             f"Local copy at: {local_copy_path}", fg="green", bold=True, err=True
         )
 
-    return sidecar_path, vector_keys
+    return sidecar_path, vector_keys, backend
 
 
 def _format_replay_command(
@@ -1244,7 +1271,7 @@ def _format_replay_command(
         parts.append("--verbose")
     elif verbosity == "silent":
         parts.append("--silent")
-    parts += [*subcommand, "--directory", shlex.quote(directory)]
+    parts += [*subcommand, "--path", shlex.quote(directory)]
     if data_type is not None:
         parts += ["--datatype", data_type.value]
     if output_filename is not None:
@@ -1396,7 +1423,7 @@ def _run_generate(result: WizardResult, *, wizard_ran: bool) -> None:
         output_filename = basename
 
     if not directory:
-        raise typer.BadParameter("Directory is required.")
+        raise typer.BadParameter("--path is required.")
     # data_type is an optional filter now — None means auto-detect.
 
     if wizard_ran:
@@ -1418,7 +1445,7 @@ def _run_generate(result: WizardResult, *, wizard_ran: bool) -> None:
         )
 
     try:
-        sidecar_path, skipped_vector = _generate(
+        sidecar_path, skipped_vector, backend = _generate(
             directory=directory,
             data_type=data_type,
             output_filename=output_filename,
@@ -1450,6 +1477,7 @@ def _run_generate(result: WizardResult, *, wizard_ran: bool) -> None:
             data_type=data_type,
             schema_path=None,
             input_files_path=directory,
+            input_backend=backend,
             ignore_missing_orientation=result.ignore_missing_orientation,
             coco_path=result.coco,
         )
@@ -1522,9 +1550,13 @@ def generate(
     directory: Annotated[
         str | None,
         typer.Option(
+            "--path",
+            "--directory",
             help=(
-                "Directory to scan. Either an object-store URI "
-                "(s3://bucket/prefix, gs://..., az://...) or a local filesystem path."
+                "Directory or single file to scan (--directory is an alias). "
+                "Either an object-store URI (s3://bucket/prefix, "
+                "s3://bucket/key.jpg, gs://..., az://...) or a local filesystem "
+                "path. For a single file the sidecar is written beside it."
             ),
         ),
     ] = None,
@@ -1555,8 +1587,8 @@ def generate(
                 "one (the directory itself is not scanned, since the generated "
                 "sidecar is written there). All merged CSVs must share the same "
                 "schema (column count); a mismatch aborts and names the bad "
-                "file. Values are merged into the generated sidecar; client "
-                "values win on conflict."
+                "file. Client values fill fields the files are missing; where "
+                "both have a value, the file's own metadata is kept (with a warning)."
             ),
         ),
     ] = None,
@@ -1637,7 +1669,7 @@ def generate(
         ),
     ] = None,
 ) -> None:
-    """Scan a directory, extract per-file metadata, and write a sidecar CSV.
+    """Scan a directory or file, extract per-file metadata, and write a sidecar CSV.
 
     With no flags, prompts interactively for each value. Any flag that is
     passed on the command line is used as-is and not prompted for.
