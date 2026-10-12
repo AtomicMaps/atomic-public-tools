@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 
 import pandas as pd
 
+from atomic_tools.errors import InvalidInputError
 from atomic_tools.utils.object_store import store_for_bucket
 from atomic_tools.utils.utils import (
     find_sidecar_row,
@@ -62,11 +63,14 @@ def load_client_schema(path: str | Path | None) -> ClientSchema:
     """
     if path is None:
         return _EMPTY_SCHEMA
-    data = json.loads(read_text_uri(str(path)))
-    return ClientSchema(
-        column_names=tuple(data.get("column_names", ())),
-        column_name_mapping=dict(data.get("column_name_mapping", {})),
-    )
+    try:
+        data = json.loads(read_text_uri(str(path)))
+        return ClientSchema(
+            column_names=tuple(data.get("column_names", ())),
+            column_name_mapping=dict(data.get("column_name_mapping", {})),
+        )
+    except (json.JSONDecodeError, AttributeError, TypeError, ValueError) as e:
+        raise InvalidInputError(f"Client schema {str(path)!r} is not a valid schema: {e}") from e
 
 
 class SidecarMergeError(RuntimeError):

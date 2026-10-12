@@ -15,10 +15,11 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 from typing import TYPE_CHECKING
 
 from atomic_tools.schemas import field_registry
-from atomic_tools.utils.utils import has_value, run_exiftool
+from atomic_tools.utils.utils import ExiftoolNotFoundError, has_value, run_exiftool
 
 if TYPE_CHECKING:
     from timezonefinder import TimezoneFinder
@@ -33,14 +34,18 @@ _DATE_FROM_PATH_PATTERN = re.compile(
 # Lazy singleton — TimezoneFinder() loads a binary KD-tree (~400ms) so we
 # build it on first use and reuse across files.
 _TIMEZONE_FINDER: "TimezoneFinder | None" = None
+# Guards the lazy init so concurrent server threads build it only once.
+_TIMEZONE_FINDER_LOCK = threading.Lock()
 
 
 def _timezone_finder() -> "TimezoneFinder":
     global _TIMEZONE_FINDER
     if _TIMEZONE_FINDER is None:
-        from timezonefinder import TimezoneFinder
+        with _TIMEZONE_FINDER_LOCK:
+            if _TIMEZONE_FINDER is None:
+                from timezonefinder import TimezoneFinder
 
-        _TIMEZONE_FINDER = TimezoneFinder()
+                _TIMEZONE_FINDER = TimezoneFinder()
     return _TIMEZONE_FINDER
 
 
@@ -274,6 +279,13 @@ def extract_exif_metadata(local_path: str, filename: str) -> dict:
             cleaned[tag] = value if not isinstance(value, (dict, list)) else json.dumps(value)
         logger.info(f"Extracted {len(cleaned)} EXIF field(s) from {filename}")
         return cleaned
+    except ExiftoolNotFoundError:
+        # A missing binary is a setup problem, not a per-file gap: surface it
+        # instead of reporting every file as missing all its metadata.
+        raise
+    except subprocess.TimeoutExpired as exc:
+        logger.warning(f"EXIF extraction timed out after {exc.timeout}s for {filename}")
+        return {}
     except subprocess.CalledProcessError as exc:
         logger.warning(f"EXIF extraction failed (exiftool error) for {filename}: {exc}")
         return {}
