@@ -8,20 +8,22 @@ the sidecar to the remote/local directory. It exists for the common case of
 The metadata extraction, sidecar assembly, wizard prompts, and lint pathway are
 all shared with ``sidecar`` (see :mod:`atomic_tools.commands.sidecar`);
 this module only swaps the persist step for linting the in-memory DataFrame
-(see :func:`atomic_tools.validators.sidecar.lint_sidecar_df`).
+(see :mod:`atomic_tools.api`, which also powers ``--api-mode``).
 """
 
 from __future__ import annotations
 
+import contextlib
+import json
 import logging
+import sys
 from typing import Annotated
 
 import click
 import typer
 
+from atomic_tools.api import error_payload, run_validation, validate_path
 from atomic_tools.commands.sidecar import (
-    _build_sidecar,
-    _crs_failures,
     _echo_replay_command,
     _fail,
     _format_replay_command,
@@ -29,54 +31,57 @@ from atomic_tools.commands.sidecar import (
     _run_interactive_wizard,
     _warn_skipped_vectors,
 )
+from atomic_tools.models import ValidationResponse
 from atomic_tools.utils.utils import DataTypeEnum, DataTypeFilter
-from atomic_tools.validators.sidecar import lint_sidecar_df
 
 logger = logging.getLogger(__name__)
 
 
-def _validate(
-    directory: str,
+def _emit_json(payload: ValidationResponse, stream) -> None:
+    stream.write(json.dumps(payload.to_json_dict()))
+    stream.write("\n")
+    stream.flush()
+
+
+def _run_api_mode(
+    *,
+    path: str | None,
     data_type: DataTypeEnum | None,
     client_sidecar: str | None,
     client_schema: str | None,
-    full: bool = False,
-    spatial_reference: str | None = None,
-    ignore_missing_orientation: bool = False,
-    coco: str | None = None,
-):
-    """Build the sidecar in memory and lint it without persisting anything."""
-    logger.info(
-        f"Starting validation — directory={directory!r} data_type={data_type} "
-        f"client_sidecar={client_sidecar!r} client_schema={client_schema!r} "
-        f"full={full} spatial_reference={spatial_reference!r} coco={coco!r}"
-    )
+    full: bool,
+    spatial_reference: str | None,
+    ignore_missing_orientation: bool,
+    coco: str | None,
+    include: str | None,
+    verbose: bool,
+) -> None:
+    """Print one JSON document to stdout. Exit 0 if validation ran, else 2/1."""
+    real_stdout = sys.stdout
+    if not verbose:
+        # Per-file warnings would flood a server's logs.
+        logging.getLogger().setLevel(logging.ERROR)
 
-    df, backend, _detected, skipped_vector = _build_sidecar(
-        directory=directory,
-        data_type=data_type,
-        client_sidecar=client_sidecar,
-        client_schema=client_schema,
-        full=full,
-        spatial_reference=spatial_reference,
-    )
-    crs_failures = _crs_failures(df)
+    if not path:
+        response = error_payload("invalid_input", "--path is required with --api-mode.")
+    else:
+        # Keep stray prints off stdout, which carries only the JSON.
+        with contextlib.redirect_stdout(sys.stderr):
+            response = validate_path(
+                path,
+                data_type=data_type,
+                client_sidecar=client_sidecar,
+                client_schema=client_schema,
+                full=full,
+                spatial_reference=spatial_reference,
+                ignore_missing_orientation=ignore_missing_orientation,
+                coco=coco,
+                include=include,
+            )
 
-    logger.info("Linting in-memory sidecar (not saved)…")
-    report = lint_sidecar_df(
-        df,
-        final=True,
-        data_type=data_type,
-        input_files_path=directory,
-        input_backend=backend,
-        ignore_missing_orientation=ignore_missing_orientation,
-        coco_path=coco,
-        # validate is informational — a COCO referencing images absent from
-        # the scanned directory is reported as a warning here, not a hard
-        # failure (it blocks only when generating a sidecar that ships).
-        coco_not_on_disk_is_error=False,
-    )
-    return report, skipped_vector, crs_failures
+    _emit_json(response, real_stdout)
+    if response.error is not None:
+        raise typer.Exit(code=2 if response.error.type == "invalid_input" else 1)
 
 
 def validate(
@@ -179,8 +184,31 @@ def validate(
                 "Optional COCO label file (local path, s3://… URI, or a directory "
                 "containing one). Image data types only. Reports how many labels "
                 "sit on images with missing/zero-size metadata "
-                "(degraded/unusable/not_on_disk), and adds those tiers to the "
-                "failed-rows CSV (--report)."
+                "(degraded/unusable/not_on_disk). With --api-mode, per-image "
+                "tiers are returned under details.coco and missing_data."
+            ),
+        ),
+    ] = None,
+    api_mode: Annotated[
+        bool,
+        typer.Option(
+            "--api-mode",
+            help=(
+                "Machine mode for API use: never prompts, skips the update "
+                "check, and prints a single JSON document to stdout instead of "
+                "the text report. Exit 0 when validation ran (see 'status'), "
+                "2 for bad input, 1 if the run errored. Requires --path."
+            ),
+        ),
+    ] = False,
+    include: Annotated[
+        str | None,
+        typer.Option(
+            "--include",
+            help=(
+                "With --api-mode: comma-separated JSON sections to return — "
+                "findings, missing_data, metadata, details, or 'all'. "
+                "Default: findings,missing_data,details."
             ),
         ),
     ] = None,
@@ -190,7 +218,7 @@ def validate(
     Identical to ``sidecar`` except nothing is written: no sidecar is
     saved to the input directory or locally. With no flags, prompts
     interactively for each value. Any flag passed on the command line is used
-    as-is and not prompted for.
+    as-is and not prompted for. ``--api-mode`` never prompts and prints JSON.
     """
     from atomic_tools.cli import Verbosity, level_for
 
@@ -202,6 +230,23 @@ def validate(
     data_type_enum: DataTypeEnum | None = (
         DataTypeEnum(data_type.value) if data_type is not None else None
     )
+
+    if api_mode:
+        _run_api_mode(
+            path=path,
+            data_type=data_type_enum,
+            client_sidecar=client_sidecar,
+            client_schema=client_schema,
+            full=full,
+            spatial_reference=spatial_reference,
+            ignore_missing_orientation=ignore_missing_orientation,
+            coco=coco,
+            include=include,
+            verbose=verbosity_state.verbose,
+        )
+        return
+    if include is not None:
+        raise typer.BadParameter("--include only applies with --api-mode.")
 
     # The wizard now only runs when the path is missing; --datatype being
     # unset just means auto-detect, not "ask me".
@@ -271,8 +316,8 @@ def validate(
         )
 
     try:
-        report, skipped_vector, crs_failures = _validate(
-            directory=path,
+        result = run_validation(
+            path,
             data_type=data_type_enum,
             client_sidecar=client_sidecar,
             client_schema=client_schema,
@@ -284,8 +329,8 @@ def validate(
     except Exception as e:
         _fail("Failed to validate data", e)
 
-    typer.echo(report.render())
-    _warn_skipped_vectors(skipped_vector)
-    _raise_crs_failures_loudly(crs_failures)
-    if report.has_errors() or crs_failures:
+    typer.echo(result.report.render())
+    _warn_skipped_vectors(result.skipped_vector)
+    _raise_crs_failures_loudly(result.crs_failures)
+    if result.failed:
         raise typer.Exit(code=1)

@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING
 
 from atomic_tools.utils.utils import (
@@ -130,6 +130,22 @@ class CocoImpact:
                 "error" if self.not_on_disk_is_error else "warn",
             ),
         ]
+
+    def to_dict(self) -> dict:
+        return {
+            "coco_path": self.coco_path,
+            "images_in_coco": self.images_in_coco,
+            "total_labels": self.total_labels,
+            "affected_labels": self.affected_labels,
+            "unusable_labels": self.unusable_labels,
+            "not_on_disk_is_error": self.not_on_disk_is_error,
+            "out_of_scope": self.out_of_scope,
+            "tiers": [
+                {"tier": tier, "images": images, "labels": labels, "severity": severity}
+                for tier, images, labels, severity in self.tier_counts()
+            ],
+            "verdicts": [asdict(v) for v in self.verdicts],
+        }
 
     def summary_lines(self) -> list[str]:
         return [
