@@ -14,7 +14,7 @@ from atomic_tools.client_sidecar import (
     build_global_alias_map,
     load_client_schema,
 )
-from atomic_tools.io.storage import from_directory
+from atomic_tools.io.storage import StorageBackend, from_path
 from atomic_tools.utils.aws_errors import S3AuthError
 from atomic_tools.utils.utils import (
     DATA_TYPE_INFO,
@@ -48,6 +48,7 @@ def lint_sidecar_file(
     ignore_missing_orientation: bool = False,
     coco_path: str | None = None,
     coco_not_on_disk_is_error: bool = True,
+    input_backend: StorageBackend | None = None,
 ) -> LintReport:
     report = LintReport()
 
@@ -114,6 +115,7 @@ def lint_sidecar_file(
         ignore_missing_orientation=ignore_missing_orientation,
         coco_path=coco_path,
         coco_not_on_disk_is_error=coco_not_on_disk_is_error,
+        input_backend=input_backend,
     )
 
 
@@ -127,10 +129,12 @@ def lint_sidecar_df(
     coco_path: str | None = None,
     coco_not_on_disk_is_error: bool = True,
     normalize: bool = True,
+    input_backend: StorageBackend | None = None,
 ) -> LintReport:
     """Same as :func:`lint_sidecar_file` with no schema, without the CSV round trip.
 
     Pass ``normalize=False`` if ``df`` already looks like a CSV read back.
+    ``input_backend`` reuses an open backend for ``input_files_path``.
     """
     report = LintReport()
     if data_type is not None and data_type not in ALL_SIDECAR_FIELD_GROUPS:
@@ -148,6 +152,7 @@ def lint_sidecar_df(
         ignore_missing_orientation=ignore_missing_orientation,
         coco_path=coco_path,
         coco_not_on_disk_is_error=coco_not_on_disk_is_error,
+        input_backend=input_backend,
     )
 
 
@@ -168,6 +173,7 @@ def _lint_loaded_df(
     ignore_missing_orientation: bool,
     coco_path: str | None,
     coco_not_on_disk_is_error: bool,
+    input_backend: StorageBackend | None = None,
 ) -> LintReport:
     columns = list(df.columns)
     columns_set = set(columns)
@@ -236,8 +242,10 @@ def _lint_loaded_df(
 
     _check_value_formats(df, columns, default_row_idx, report)
 
+    inventory_backend = input_backend
     if input_files_path:
-        _check_file_inventory(
+        inventory_backend = _check_file_inventory(
+            backend=input_backend,
             df=df,
             row_types=row_types,
             data_type_filter=data_type,
@@ -264,6 +272,9 @@ def _lint_loaded_df(
             default_row_idx=default_row_idx,
             report=report,
             not_on_disk_is_error=coco_not_on_disk_is_error,
+            scope_to_sidecar=(
+                inventory_backend is not None and inventory_backend.single_file is not None
+            ),
         )
 
     # An explicit --datatype restricts every other check to the matching rows, so
@@ -676,7 +687,12 @@ def _check_file_inventory(
     final: bool,
     default_satisfied: dict[tuple[str, str], bool],
     report: LintReport,
-) -> None:
+    backend: StorageBackend | None = None,
+) -> StorageBackend | None:
+    """Compare sidecar rows with the files actually at ``input_files_path``.
+
+    Returns the backend for later checks to reuse, or None if it couldn't be opened.
+    """
     detected_types = list(dict.fromkeys(t for t in row_types.values() if t is not None))
 
     if data_type_filter is not None:
@@ -696,10 +712,11 @@ def _check_file_inventory(
 
     if not include:
         # No typed rows to inventory against (auto mode, nothing classified).
-        return
+        return backend
 
     try:
-        backend = from_directory(input_files_path)
+        if backend is None:
+            backend = from_path(input_files_path)
         keys = backend.list_keys(include=include, exclude=exclude)
         if data_type_filter is None:
             # Mirror generation's auto-detect listing, which drops preview .tif
@@ -712,20 +729,20 @@ def _check_file_inventory(
             f"Could not enumerate input files at {input_files_path}: {e}",
             fix_hint=e.help_text(),
         )
-        return
+        return None
     except (FileNotFoundError, NotADirectoryError, ValueError, RuntimeError) as e:
         report.add_error(
             f"Could not enumerate input files at {input_files_path}: {e}",
             fix_hint="Check the path exists and is readable.",
         )
-        return
+        return None
 
     if not keys:
         report.add_warning(
             f"No files matching {include} found in {input_files_path}.",
             fix_hint="Confirm the directory and datatype are correct.",
         )
-        return
+        return backend
 
     # Classify each listed key to the type(s) it could be; in auto mode drop keys
     # that can't be any of the detected row types (or are unclassifiable).
@@ -757,7 +774,7 @@ def _check_file_inventory(
         kept_keys.append(key)
     keys = kept_keys
     if not keys:
-        return
+        return backend
 
     file_col = df.columns[0]
     sidecar_filenames = df[file_col].astype(str).str.strip()
@@ -804,7 +821,7 @@ def _check_file_inventory(
             )
 
     if not missing:
-        return
+        return backend
     missing.sort()
 
     def _listing(items: list[str]) -> str:
@@ -859,6 +876,7 @@ def _check_file_inventory(
                 "The generator will fill in any missing files automatically; this is informational."
             ),
         )
+    return backend
 
 
 def _image_group_union(
@@ -898,6 +916,7 @@ def _apply_coco_impact(
     default_row_idx: int | None,
     report: LintReport,
     not_on_disk_is_error: bool = True,
+    scope_to_sidecar: bool = False,
 ) -> None:
     """Map COCO labels onto the sidecar's per-row verdicts and report impact."""
     from atomic_tools.validators import coco as coco_mod
@@ -950,6 +969,7 @@ def _apply_coco_impact(
         optional_groups=optional_groups,
         columns_set=columns_set,
         default_row_idx=image_default_idx,
+        scope_to_sidecar=scope_to_sidecar,
     )
     impact.not_on_disk_is_error = not_on_disk_is_error
     report.coco_impact = impact

@@ -1,6 +1,6 @@
 """``am-tools validate`` — lint data without saving a sidecar.
 
-Does exactly what ``am-tools sidecar`` does — scan a directory,
+Does exactly what ``am-tools sidecar`` does — scan a directory (or one file),
 extract per-file metadata, assemble a sidecar, and lint it — but never writes
 the sidecar to the remote/local directory. It exists for the common case of
 "I just want to know whether my data is clean" without leaving a file behind.
@@ -52,8 +52,7 @@ def _validate(
         f"full={full} spatial_reference={spatial_reference!r} coco={coco!r}"
     )
 
-    # validate never persists, so the backend is unused.
-    df, _, _detected, skipped_vector = _build_sidecar(
+    df, backend, _detected, skipped_vector = _build_sidecar(
         directory=directory,
         data_type=data_type,
         client_sidecar=client_sidecar,
@@ -69,6 +68,7 @@ def _validate(
         final=True,
         data_type=data_type,
         input_files_path=directory,
+        input_backend=backend,
         ignore_missing_orientation=ignore_missing_orientation,
         coco_path=coco,
         # validate is informational — a COCO referencing images absent from
@@ -81,12 +81,16 @@ def _validate(
 
 def validate(
     ctx: typer.Context,
-    directory: Annotated[
+    path: Annotated[
         str | None,
         typer.Option(
+            "--path",
+            "--directory",
             help=(
-                "Directory to scan. Either an object-store URI "
-                "(s3://bucket/prefix, gs://..., az://...) or a local filesystem path."
+                "Directory or single file to validate (--directory is an "
+                "alias). Either an object-store "
+                "URI (s3://bucket/prefix, s3://bucket/key.jpg, gs://..., az://...) "
+                "or a local filesystem path."
             ),
         ),
     ] = None,
@@ -111,8 +115,9 @@ def validate(
                 "Point it at a single CSV, or at a directory: when it's a "
                 "directory, every CSV in a subdirectory BELOW it is merged into "
                 "one. All merged CSVs must share the same schema (column count); "
-                "a mismatch aborts and names the bad file. Client values win on "
-                "conflict."
+                "a mismatch aborts and names the bad file. Client values fill "
+                "fields the files are missing; where both have a value, the "
+                "file's own metadata is kept (with a warning)."
             ),
         ),
     ] = None,
@@ -180,7 +185,7 @@ def validate(
         ),
     ] = None,
 ) -> None:
-    """Scan a directory, extract metadata, and lint it — without saving a sidecar.
+    """Scan a directory or file, extract metadata, and lint it — without saving a sidecar.
 
     Identical to ``sidecar`` except nothing is written: no sidecar is
     saved to the input directory or locally. With no flags, prompts
@@ -198,9 +203,9 @@ def validate(
         DataTypeEnum(data_type.value) if data_type is not None else None
     )
 
-    # The wizard now only runs when the directory is missing; --datatype being
+    # The wizard now only runs when the path is missing; --datatype being
     # unset just means auto-detect, not "ask me".
-    wizard_ran = directory is None
+    wizard_ran = path is None
     if wizard_ran:
         full_provided = (
             ctx.get_parameter_source("full") == click.core.ParameterSource.COMMANDLINE
@@ -212,7 +217,7 @@ def validate(
         # output_filename / local_copy are irrelevant when nothing is saved, so
         # they're left at their defaults and ignored (hence save=False).
         result = _run_interactive_wizard(
-            directory,
+            path,
             data_type_enum,
             None,
             client_sidecar,
@@ -229,7 +234,7 @@ def validate(
             coco=coco,
             save=False,
         )
-        directory = result.directory
+        path = result.directory
         data_type_enum = result.data_type
         client_sidecar = result.client_sidecar
         client_schema = result.client_schema
@@ -245,15 +250,15 @@ def validate(
             )
         )
 
-    if not directory:
-        raise typer.BadParameter("Directory is required.")
+    if not path:
+        raise typer.BadParameter("--path is required.")
     # data_type is an optional filter now — None means auto-detect.
 
     if wizard_ran:
         _echo_replay_command(
             _format_replay_command(
                 ["validate"],
-                directory=directory,
+                directory=path,
                 data_type=data_type_enum,
                 client_sidecar=client_sidecar,
                 client_schema=client_schema,
@@ -267,7 +272,7 @@ def validate(
 
     try:
         report, skipped_vector, crs_failures = _validate(
-            directory=directory,
+            directory=path,
             data_type=data_type_enum,
             client_sidecar=client_sidecar,
             client_schema=client_schema,
