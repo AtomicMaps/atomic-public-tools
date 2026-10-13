@@ -66,10 +66,14 @@ REQUIRED_SIDECAR_FIELD_GROUPS: dict[str, list[list[str]]] = {
         ["Heading", "Yaw", "GimbalYawDegree", "PoseHeadingDegrees", "GPSImgDirection"],
         ["Roll", "CameraRoll", "GimbalRollDegree", "PoseRollDegrees"],
     ],
+    # Matches what the backend needs from an ortho: its footprint and a date.
+    # The CRS is checked by the geography validator, which also accepts the
+    # DEFAULT row's fallback_srs.
     DataTypeEnum.ortho_image: [
-        ["GPSLatitude"],
-        ["GPSLongitude"],
-        ["GPSAltitude"],
+        ["bounds.minx"],
+        ["bounds.miny"],
+        ["bounds.maxx"],
+        ["bounds.maxy"],
         _DATE_GROUP,
     ],
     DataTypeEnum.video: [
@@ -155,6 +159,9 @@ REFERENCED_SIDECAR_FIELD_GROUPS: dict[str, list[list[str]]] = {
         ["ImageHeight", "ExifImageHeight", "FullPanoHeightPixels", "CroppedAreaImageHeightPixels"],
     ],
     DataTypeEnum.ortho_image: [
+        ["GPSLatitude"],
+        ["GPSLongitude"],
+        ["GPSAltitude"],
         ["FocalLength", "FocalLengthIn35mmFormat", "FocalLength35efl"],
         ["Make"],
         ["Model"],

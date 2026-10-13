@@ -38,6 +38,7 @@ from atomic_tools.utils.coordinates import (
     transform_coordinates,
     vertical_meters_per_unit,
 )
+from atomic_tools.utils.raster import CUSTOM_CRS_COLUMN
 from atomic_tools.utils.utils import infer_data_type
 from atomic_tools.validators.constants import DEFAULT_ROW_NAME, MAX_LISTED_FILES
 from atomic_tools.validators.values import parse_elevation, to_decimal_degree
@@ -59,6 +60,9 @@ _FILE_SRS_COL = "file_srs"
 _FALLBACK_SRS_COL = "fallback_srs"
 _DATA_TYPE_COL = "DataType"
 _POINT_CLOUD_TYPE = "point_cloud"
+_ORTHO_TYPE = "ortho_image"
+# Row types that must carry a CRS Flow can project to Web Mercator.
+_GEOREFERENCED_TYPES = {_POINT_CLOUD_TYPE: "point cloud", _ORTHO_TYPE: "ortho image"}
 
 # Point-cloud bounding-box columns (see extractors.extract_pdal_metadata).
 _BOUNDS_MINX = "bounds.minx"
@@ -273,46 +277,65 @@ def _check_point_cloud_crs(
     """
     if not _is_point_cloud_sidecar(rows):
         return
+    types = _row_type_names(rows, filenames)
+
+    for dtype, noun in _GEOREFERENCED_TYPES.items():
+        missing: list[str] = []
+        unreadable: list[str] = []
+        untransformable: list[str] = []
+        for name, (_, row), row_type in zip(filenames, rows.iterrows(), types, strict=True):
+            if row_type != dtype:
+                continue
+            crs = _row_crs(row, fallback)
+            if crs is None and str(row.get(CUSTOM_CRS_COLUMN, "")).strip():
+                unreadable.append(name)
+            elif crs is None:
+                missing.append(name)
+            elif not _row_crs_reaches_web_mercator(row, crs):
+                untransformable.append(name)
+
+        reader = "PDAL" if dtype == _POINT_CLOUD_TYPE else "am-tools"
+        if missing:
+            report.add_error(
+                f"{len(missing)} {noun} row(s) have no CRS in either "
+                f"'{_FILE_SRS_COL}' or '{_FALLBACK_SRS_COL}': "
+                f"{_truncated_listing([repr(n) for n in missing])}",
+                fix_hint=(
+                    f"Regenerate the sidecar so {reader} records each file's CRS in "
+                    f"'{_FILE_SRS_COL}', or pass --spatial-reference to set a "
+                    f"'{_FALLBACK_SRS_COL}'."
+                ),
+            )
+        if unreadable:
+            report.add_warning(
+                f"{len(unreadable)} {noun} row(s) define a custom CRS this machine "
+                f"can't read: {_truncated_listing([repr(n) for n in unreadable])}",
+                fix_hint=(
+                    "Flow reads it during intake. Install GDAL to check it here, or "
+                    "pass --spatial-reference if it's wrong."
+                ),
+            )
+        if untransformable:
+            report.add_error(
+                f"{len(untransformable)} {noun} row(s) have a CRS that cannot be "
+                f"transformed to {WEB_MERCATOR_EPSG}: "
+                f"{_truncated_listing([repr(n) for n in untransformable])}",
+                fix_hint=(
+                    f"Flow renders {noun}s in Web Mercator; the CRS in "
+                    f"'{_FILE_SRS_COL}' (or the '{_FALLBACK_SRS_COL}' fallback) must be "
+                    "convertible to it. Correct the CRS or pass a valid "
+                    "--spatial-reference."
+                ),
+            )
+
+
+def _row_type_names(rows: pd.DataFrame, filenames: pd.Series) -> list[str]:
     has_type_col = _DATA_TYPE_COL in rows.columns
     types: list[str] = []
     for (_, row), name in zip(rows.iterrows(), filenames, strict=True):
         raw = str(row[_DATA_TYPE_COL]).strip() if has_type_col else ""
         types.append(raw or infer_data_type(name) or _POINT_CLOUD_TYPE)
-
-    missing: list[str] = []
-    untransformable: list[str] = []
-    for name, (_, row), dtype in zip(filenames, rows.iterrows(), types, strict=True):
-        if dtype != _POINT_CLOUD_TYPE:
-            continue
-        crs = _row_crs(row, fallback)
-        if crs is None:
-            missing.append(name)
-        elif not _row_crs_reaches_web_mercator(row, crs):
-            untransformable.append(name)
-
-    if missing:
-        report.add_error(
-            f"{len(missing)} point cloud row(s) have no CRS in either "
-            f"'{_FILE_SRS_COL}' or '{_FALLBACK_SRS_COL}': "
-            f"{_truncated_listing([repr(n) for n in missing])}",
-            fix_hint=(
-                "Regenerate the sidecar so PDAL records each file's CRS in "
-                f"'{_FILE_SRS_COL}', or pass --spatial-reference to set a "
-                f"'{_FALLBACK_SRS_COL}'."
-            ),
-        )
-    if untransformable:
-        report.add_error(
-            f"{len(untransformable)} point cloud row(s) have a CRS that cannot be "
-            f"transformed to {WEB_MERCATOR_EPSG}: "
-            f"{_truncated_listing([repr(n) for n in untransformable])}",
-            fix_hint=(
-                "Flow renders point clouds in Web Mercator; the CRS in "
-                f"'{_FILE_SRS_COL}' (or the '{_FALLBACK_SRS_COL}' fallback) must be "
-                "convertible to it. Correct the CRS or pass a valid "
-                "--spatial-reference."
-            ),
-        )
+    return types
 
 
 def _row_crs_reaches_web_mercator(row: pd.Series, crs: str) -> bool:
@@ -356,7 +379,8 @@ def analyze_spatial_distribution(
     _analyze_coordinates(rows, filenames, report)
     _analyze_altitude(rows, filenames, report)
     _check_point_cloud_crs(rows, filenames, fallback, report)
-    _analyze_point_cloud_bounds(rows, filenames, report, fallback)
+    is_pc = [t == _POINT_CLOUD_TYPE for t in _row_type_names(rows, filenames)]
+    _analyze_point_cloud_bounds(rows[is_pc], filenames[is_pc], report, fallback)
 
 
 def _analyze_coordinates(

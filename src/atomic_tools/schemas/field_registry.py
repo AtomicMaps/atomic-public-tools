@@ -105,3 +105,11 @@ CAM_HEADING_ONLY_FIELDS: list[str] = field_list("CAM_HEADING_ONLY_FIELDS")
 
 # Canonical: capture_date — LAS/LAZ (creation_year, creation_doy) header pair.
 PC_CAPTURE_DATE_LAS_FIELDS: tuple[str, ...] = field_tuple("PC_CAPTURE_DATE_LAS_FIELDS")
+
+# ECW header items read through GDAL's ECW driver. The acquisition date feeds
+# DATETIME_FIELDS[0]; the rest are carried as-is. SRS fields live in GDAL's
+# "ECW" metadata domain, the others in the default domain.
+ORTHO_ECW_ACQUISITION_DATE_FIELD: str = field_scalar("ORTHO_ECW_ACQUISITION_DATE_FIELD")
+ORTHO_ECW_FILE_METADATA_FIELDS: list[str] = field_list("ORTHO_ECW_FILE_METADATA_FIELDS")
+ORTHO_ECW_RASTER_PROPERTY_FIELDS: list[str] = field_list("ORTHO_ECW_RASTER_PROPERTY_FIELDS")
+ORTHO_ECW_SRS_FIELDS: list[str] = field_list("ORTHO_ECW_SRS_FIELDS")

@@ -209,6 +209,9 @@ def test_object_store_read_output_and_version(monkeypatch, tmp_path):
     backend._scheme, backend._bucket, backend._prefix = "s3", "bucket", "sub/c.jpg"
     backend._store = LocalStore(prefix=str(tmp_path))
     backend._single_key, backend._single_size, backend._listing = None, 0, None
+    backend._folders = {}
+    backend._modified = {}
+    backend._listing_indexed = False
     backend.list_keys(include=[".jpg"], exclude=[])  # resolves the single object
 
     df, version = backend.read_output("sidecar.csv")

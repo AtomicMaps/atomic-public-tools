@@ -17,6 +17,7 @@ import shutil
 import sys
 import tempfile
 from collections import Counter, defaultdict
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Annotated, NamedTuple, NoReturn
 
@@ -41,6 +42,14 @@ from atomic_tools.io.storage import (
     normalize_directory,
 )
 from atomic_tools.utils.aws_errors import find_auth_error, print_help_block
+from atomic_tools.utils.companions import (
+    drop_ecw_shadowed_by_tif,
+    drop_mesh_textures,
+    is_telemetry,
+    listing_extensions,
+    pair_telemetry,
+    unsupported_reason,
+)
 from atomic_tools.utils.coordinates import (
     WEB_MERCATOR_EPSG,
     can_transform_to_web_mercator,
@@ -55,6 +64,15 @@ from atomic_tools.utils.extractors import (
     find_pdal_bin,
     infer_date_from_filepath,
     spherical_signals_from_exif,
+)
+from atomic_tools.utils.raster import (
+    CUSTOM_CRS_COLUMN,
+    ECW_HEADER_ITEMS,
+    crs_from_projection_text,
+    extract_geotiff_georef,
+    gdal_status,
+    projection_companion_names,
+    read_ecw_header,
 )
 from atomic_tools.utils.utils import (
     DATA_TYPE_INFO,
@@ -78,7 +96,12 @@ from atomic_tools.validators.required_fields import (
 from atomic_tools.validators.required_fields import (
     REQUIRED_SIDECAR_FIELD_GROUPS as _REQUIRED_SIDECAR_FIELD_GROUPS,
 )
-from atomic_tools.validators.sidecar import _as_csv_strings, lint_sidecar_df, lint_sidecar_file
+from atomic_tools.validators.sidecar import (
+    ECW_HEADER_FIELDS,
+    _as_csv_strings,
+    lint_sidecar_df,
+    lint_sidecar_file,
+)
 from atomic_tools.validators.values import parse_elevation, to_decimal_degree
 
 logger = logging.getLogger(__name__)
@@ -317,8 +340,8 @@ def _ask_spatial_reference() -> str | None:
         "Optional spatial reference (CRS) of the source coordinates:",
         instruction=(
             "(e.g. 'EPSG:32612' or '32612'. For images/videos lat/lon/altitude "
-            "are reprojected to EPSG:4326; for point clouds it's recorded as a "
-            "column. Press Enter to skip)"
+            "are reprojected to EPSG:4326; for point clouds and orthos it's the "
+            "fallback CRS. Press Enter to skip)"
         ),
     ).unsafe_ask()
     answer = answer.strip()
@@ -396,14 +419,29 @@ def _fill_missing_dates_from_filepath(
     file_metadata: list[tuple[str, dict]],
     required_field_groups: list[list[str]],
     display_to_key: dict[str, str],
+    modified_by_label: dict[str, datetime] | None = None,
 ) -> None:
-    """For each file with no date field after merge, infer one from its path."""
+    """For each file with no date field after merge, fall back like Flow does.
+
+    Flow's image order is date tags, then the file's modification time, then a
+    date in its path (BaseImage.get_datetime). ``modified_by_label`` holds the
+    modification times that may be used; ECWs are left out, as upstream.
+    """
     date_group = _date_group(required_field_groups)
     if date_group is None:
         return
     canonical = date_group[0]
     for display_label, meta in file_metadata:
         if any(has_value(meta.get(field)) for field in date_group):
+            continue
+        modified = (modified_by_label or {}).get(display_label)
+        if modified is not None:
+            meta[canonical] = modified.isoformat()
+            logger.warning(
+                f"Using the file modification time of {display_label!r} as its "
+                f"{canonical} ({meta[canonical]}), as Flow does: no date tag was "
+                "found. That's often when the file was copied, not captured."
+            )
             continue
         original = display_to_key.get(display_label, display_label)
         lat = to_decimal_degree(meta.get("GPSLatitude"))
@@ -444,6 +482,7 @@ def _warn_missing_required_fields(
             filename
             for filename, meta in file_metadata
             if not any(has_value(meta.get(field)) for field in group)
+            and not (canonical in ECW_HEADER_FIELDS and _is_ecw(filename))
         ]
         if missing_files:
             missing_by_group.append((canonical, list(group), missing_files))
@@ -594,13 +633,16 @@ def _add_spatial_reference_column(df, spatial_reference: str) -> None:
     df.loc[df["Filename"] == "DEFAULT", "fallback_srs"] = spatial_reference
 
 
-def _add_file_srs_column(df, file_metadata: list[tuple[str, dict]]) -> None:
-    """Add a 'file_srs' column holding each file's PDAL-read header CRS.
+def _add_file_srs_column(
+    df, pc_metadata: list[tuple[str, dict]], ortho_crs: dict[str, str] | None = None
+) -> None:
+    """Add a 'file_srs' column holding each point cloud's and ortho's own CRS.
 
-    Blank for files whose header carried no CRS (those rely on the DEFAULT row's
+    Blank for files that carried no CRS (those rely on the DEFAULT row's
     'fallback_srs') and blank on the DEFAULT row itself.
     """
-    crs_by_label = {label: (extract_pdal_crs(meta) or "") for label, meta in file_metadata}
+    crs_by_label = {label: (extract_pdal_crs(meta) or "") for label, meta in pc_metadata}
+    crs_by_label.update(ortho_crs or {})
     df["file_srs"] = df["Filename"].map(lambda name: crs_by_label.get(name, ""))
 
 
@@ -759,18 +801,51 @@ def _raise_crs_failures_loudly(crs_failures: list[str]) -> None:
 
 
 def _union_include_extensions() -> list[str]:
-    """Union (order-stable) of every data type's ``include`` extensions.
+    """Union (order-stable) of every data type's ``include`` and ``sidecars`` extensions.
 
     Used for auto-detect listing: we list everything and let ``infer_data_type``
     (which applies per-type excludes itself) do the classification. Vector is
     included so vector files can be counted and warned about.
     """
-    union: list[str] = []
-    for info in DATA_TYPE_INFO.values():
-        for ext in info.get("include") or []:
-            if ext not in union:
-                union.append(ext)
-    return union
+    return listing_extensions(DATA_TYPE_INFO)
+
+
+def _filter_intake_keys(
+    backend: StorageBackend, keys: list[str]
+) -> tuple[list[str], list[str]]:
+    """Apply the backend's intake rules: returns ``(data_keys, telemetry_keys)``."""
+    telemetry = [k for k in keys if is_telemetry(k)]
+    keys = [k for k in keys if not is_telemetry(k)]
+    single = backend.single_file
+    if single is not None and infer_data_type(single) == DataTypeEnum.video.value:
+        # Telemetry beside a single video is never listed, so look for it.
+        telemetry = [k for k in backend.files_beside(single) if is_telemetry(k)]
+    keys, shadowed = drop_ecw_shadowed_by_tif(keys)
+    if shadowed:
+        _log_dropped(shadowed, "ECW file(s) skipped: a .tif with the same name takes precedence")
+    keys, textures = drop_mesh_textures(keys, backend.sibling_exists)
+    if textures:
+        _log_dropped(textures, "mesh texture image(s) (same name as an .obj/.mtl) skipped")
+    return keys, telemetry
+
+
+def _log_dropped(keys: list[str], message: str) -> None:
+    sample = keys[:5]
+    suffix = f" (+{len(keys) - 5} more)" if len(keys) > 5 else ""
+    logger.info(f"{len(keys)} {message}: {sample}{suffix}")
+
+
+def _drop_unsupported(types_by_key: dict[str, DataTypeEnum]) -> list[tuple[str, str]]:
+    """Remove files intake recognizes but can't process; returns ``(key, reason)``."""
+    dropped: dict[str, list[str]] = {}
+    for key, data_type in list(types_by_key.items()):
+        reason = unsupported_reason(key, data_type)
+        if reason:
+            dropped.setdefault(reason, []).append(key)
+            del types_by_key[key]
+    for reason, keys in dropped.items():
+        _warn_skipped(keys, f"{len(keys)} file(s) skipped — {reason}")
+    return [(k, reason) for reason, keys in dropped.items() for k in keys]
 
 
 # Camera/software-generated derivative files (previews, thumbnails, annotation
@@ -942,9 +1017,17 @@ def _sparse_read_problem(meta: dict, stats: SparseStats | None = None) -> str | 
     return f"exiftool warning: {text}"
 
 
-def _extract_exif_with_fallback(backend: StorageBackend, key: str, label: str) -> dict:
+def _extract_exif_with_fallback(
+    backend: StorageBackend, key: str, label: str, *, georef: bool = False
+) -> dict:
+    def read(path: str) -> dict:
+        meta = extract_exif_metadata(path, filename=label)
+        if georef and meta:
+            meta.update(extract_geotiff_georef(path, label))
+        return meta
+
     with backend.open_metadata_view(key) as view:
-        meta = extract_exif_metadata(view.path, filename=label)
+        meta = read(view.path)
         if not view.sparse:
             return meta
         problem = _sparse_read_problem(meta, view.stats)
@@ -952,7 +1035,38 @@ def _extract_exif_with_fallback(backend: StorageBackend, key: str, label: str) -
             return meta
     logger.info(f"Partial read of {label} wasn't enough ({problem}); downloading it in full.")
     with backend.open_local(key) as local_path:
-        return extract_exif_metadata(local_path, filename=label)
+        return read(local_path)
+
+
+def _is_ecw(key: str) -> bool:
+    return key.lower().endswith(".ecw")
+
+
+def _extract_ecw(backend: StorageBackend, key: str, label: str) -> dict:
+    """Header via GDAL when it has the ECW driver; CRS from a projection file otherwise.
+
+    Same CRS order as the backend: the header's own, then the first usable
+    ``.prj``/``.aux.xml`` beside it. ``fallback_srs`` is applied by the linter.
+    """
+    meta: dict = {}
+    if gdal_status().ecw:
+        with backend.open_local(key) as local_path:
+            meta = read_ecw_header(local_path, label)
+    if "file_srs" not in meta:
+        for name in projection_companion_names(key):
+            companion = backend.find_sibling(name)
+            if companion is None:
+                continue
+            try:
+                crs = crs_from_projection_text(backend.read_text(companion))
+            except Exception as e:  # noqa: BLE001 — an unreadable projection file is just absent
+                logger.warning(f"Could not read projection file {companion}: {e}")
+                continue
+            if crs:
+                logger.info(f"Using the CRS in {companion} for {label}.")
+                meta["file_srs"] = crs
+                break
+    return meta
 
 
 def _build_sidecar(
@@ -965,6 +1079,8 @@ def _build_sidecar(
     *,
     quiet: bool = False,
     unclassified_out: list[str] | None = None,
+    unsupported_out: list[tuple[str, str]] | None = None,
+    use_file_dates: bool = True,
 ) -> tuple["object", StorageBackend, set[DataTypeEnum], list[str]]:
     """Scan a directory, extract metadata, and assemble the sidecar DataFrame.
 
@@ -985,7 +1101,10 @@ def _build_sidecar(
       ``--datatype spherical_image`` must not have panoramas reclassified).
 
     ``quiet`` hides console-only output (progress bar, missing-fields block) but
-    not logging. ``unclassified_out`` collects keys that matched no data type.
+    not logging. ``unclassified_out`` collects keys that matched no data type,
+    ``unsupported_out`` ``(key, reason)`` for recognized files Flow can't process.
+    ``use_file_dates=False`` stops modification times standing in for capture
+    dates, for files that are fresh copies (uploads).
     """
     if spatial_reference:
         # Fail fast on an unparseable CRS before doing any extraction work.
@@ -1015,10 +1134,15 @@ def _build_sidecar(
             )
         info = DATA_TYPE_INFO[data_type]
         keys = backend.list_keys(
-            include=list(info.get("include") or []),
+            include=listing_extensions([data_type]),
             exclude=list(info.get("exclude") or []),
         )
-        if not keys:
+        keys, telemetry_keys = _filter_intake_keys(backend, keys)
+        types_by_key: dict[str, DataTypeEnum] = {key: data_type for key in keys}
+        unsupported = _drop_unsupported(types_by_key)
+        if unsupported_out is not None:
+            unsupported_out.extend(unsupported)
+        if not types_by_key:
             if backend.single_file is not None:
                 raise InvalidInputError(
                     f"{backend.display_root} is not a '{data_type.value}' file "
@@ -1027,15 +1151,18 @@ def _build_sidecar(
             raise NoSupportedFilesError(
                 f"No valid files found for '{data_type.value}' in {backend.display_root}"
             )
-        types_by_key: dict[str, DataTypeEnum] = {key: data_type for key in keys}
         vector_keys: list[str] = []
     else:
         # --- Auto-detect: list everything, classify per file. ---
         keys = backend.list_keys(include=_union_include_extensions(), exclude=[])
         keys = _drop_preview_tifs(keys)
+        keys, telemetry_keys = _filter_intake_keys(backend, keys)
         types_by_key, unclassified, vector_keys = _classify_keys(keys)
+        unsupported = _drop_unsupported(types_by_key)
         if unclassified_out is not None:
             unclassified_out.extend(unclassified)
+        if unsupported_out is not None:
+            unsupported_out.extend(unsupported)
         if unclassified:
             _warn_skipped(
                 unclassified,
@@ -1076,8 +1203,29 @@ def _build_sidecar(
     # once per file as we walk the directory.
     if any(t == DataTypeEnum.point_cloud for t in types_by_key.values()):
         find_pdal_bin()
-    if any(t != DataTypeEnum.point_cloud for t in types_by_key.values()):
+    if any(
+        t != DataTypeEnum.point_cloud and not _is_ecw(k) for k, t in types_by_key.items()
+    ):
         find_exiftool_bin()
+    ecw_count = sum(1 for k in types_by_key if _is_ecw(k))
+    if ecw_count and not gdal_status().ecw:
+        msg = (
+            f"{ecw_count} ECW file(s): GDAL's ECW driver isn't available, so their "
+            "headers can't be read. Their CRS comes from a .prj/.aux.xml beside "
+            "each file (or --spatial-reference), and dates from the path or a "
+            "client sidecar."
+        )
+        logger.warning(msg)
+        if not quiet:
+            click.secho(msg, fg="yellow", err=True)
+
+    videos = [k for k, t in types_by_key.items() if t in _VIDEO_DATA_TYPES]
+    telemetry_by_video, orphan_telemetry = pair_telemetry(sorted([*videos, *telemetry_keys]))
+    if orphan_telemetry:
+        _warn_skipped(
+            orphan_telemetry,
+            f"{len(orphan_telemetry)} telemetry file(s) (.gpx/.kmz/.srt) match no video by name",
+        )
 
     file_metadata: list[tuple[str, dict]] = []
     empty_count = 0
@@ -1094,13 +1242,21 @@ def _build_sidecar(
             display_label = display_labels[key]
             key_type = types_by_key[key]
             is_pc = key_type == DataTypeEnum.point_cloud
-            tool = "PDAL" if is_pc else "EXIF"
+            tool = "PDAL" if is_pc else "ECW" if _is_ecw(key) else "EXIF"
             logger.info(f"[{i}/{total}] Extracting {tool}: {key}")
             if is_pc:
                 with backend.open_local(key) as local_path:
                     meta = extract_pdal_metadata(local_path, filename=display_label)
+            elif tool == "ECW":
+                meta = _extract_ecw(backend, key, display_label)
             else:
-                meta = _extract_exif_with_fallback(backend, key, display_label)
+                meta = _extract_exif_with_fallback(
+                    backend,
+                    key,
+                    display_label,
+                    georef=key_type == DataTypeEnum.ortho_image
+                    and key.lower().endswith((".tif", ".tiff")),
+                )
                 # Auto mode only: refine ambiguous images oriented↔spherical
                 # from EXIF signals. The filename already chose the (shared)
                 # EXIF extractor, so this never changes which extractor ran.
@@ -1135,6 +1291,7 @@ def _build_sidecar(
 
     pc_labels = _labels_for(DataTypeEnum.point_cloud)
     pc_metadata = [(label, meta) for label, meta in file_metadata if label in pc_labels]
+    ortho_labels = _labels_for(DataTypeEnum.ortho_image)
 
     if client_sidecar:
         client_url = client_sidecar.strip()
@@ -1156,9 +1313,25 @@ def _build_sidecar(
             client_df = client_df.drop(columns=["DataType"])
         merge_client_metadata(file_metadata, client_df)
 
+    # After the merge, so a CRS the client sidecar supplies is kept.
+    ortho_metadata = [(label, meta) for label, meta in file_metadata if label in ortho_labels]
+    ortho_crs = {label: str(meta.get("file_srs") or "") for label, meta in ortho_metadata}
+    custom_crs = {
+        label: meta[CUSTOM_CRS_COLUMN]
+        for label, meta in ortho_metadata
+        if meta.get(CUSTOM_CRS_COLUMN) and not meta.get("file_srs")
+    }
+
     # Per detected type: canonicalize + date-infer + warn on its own row subset
     # and field groups. All (required + optional) groups drive canonicalization/
     # column selection; only the loud warning is restricted to required groups.
+    modified_by_label: dict[str, datetime] = {}
+    for key, kind in types_by_key.items():
+        if use_file_dates and kind in IMAGE_DATA_TYPES and not _is_ecw(key):
+            modified = backend.modified_time(key)
+            if modified is not None:
+                modified_by_label[display_labels[key]] = modified
+
     field_groups_by_type: dict[str, list[list[str]]] = {}
     multi = len(detected_types) > 1
     for detected in detected_types:
@@ -1170,7 +1343,9 @@ def _build_sidecar(
         subset = [
             (label, meta) for label, meta in file_metadata if label in labels_of_type
         ]
-        _fill_missing_dates_from_filepath(subset, field_groups, display_to_key)
+        _fill_missing_dates_from_filepath(
+            subset, field_groups, display_to_key, modified_by_label
+        )
         if not quiet:
             _warn_missing_required_fields(
                 subset, required_field_groups, type_label=type_value if multi else None
@@ -1188,19 +1363,34 @@ def _build_sidecar(
         f"{len(df.columns)} column(s)."
     )
 
+    if pc_metadata or ortho_crs:
+        # Record each file's own CRS (with or without --spatial-reference) so the
+        # linter can convert bounds into the goal CRS.
+        _add_file_srs_column(df, pc_metadata, ortho_crs)
+    if custom_crs:
+        df[CUSTOM_CRS_COLUMN] = df["Filename"].map(lambda name: custom_crs.get(name, ""))
+    # ECW header items aren't in any field group; carry the ones that were read.
+    for field in ECW_HEADER_ITEMS:
+        values = {label: str(meta[field]) for label, meta in ortho_metadata if meta.get(field)}
+        if values and field not in df.columns:
+            df[field] = df["Filename"].map(lambda name, v=values: v.get(name, ""))
     if pc_metadata:
-        # Record each point cloud's header CRS (with or without
-        # --spatial-reference) so the linter can convert bounds into the goal CRS.
-        _add_file_srs_column(df, pc_metadata)
         # Customer-facing flag: did each point cloud's effective CRS convert to
         # Web Mercator? (Uses the same fallback the linter does; rows marked "no"
         # are also reported as lint errors.)
         _add_crs_web_mercator_column(df, pc_metadata, spatial_reference)
 
+    if telemetry_by_video:
+        names = {
+            display_labels[video]: ", ".join(PurePosixPath(t).name for t in telemetry)
+            for video, telemetry in telemetry_by_video.items()
+        }
+        df["telemetry_sidecar"] = df["Filename"].map(lambda name: names.get(name, ""))
+
     if spatial_reference:
-        # Mixed content does BOTH: record the point-cloud fallback CRS on DEFAULT
-        # and reproject image/video coordinates.
-        if pc_metadata:
+        # Mixed content does BOTH: record the fallback CRS on DEFAULT (for point
+        # clouds and orthos without one) and reproject image/video coordinates.
+        if pc_metadata or ortho_crs:
             logger.info(
                 f"Recording fallback_srs={spatial_reference!r} in the DEFAULT row."
             )
@@ -1519,11 +1709,12 @@ def _run_interactive_wizard(
         # COCO label impact only applies to imagery.
         if coco is None and (data_type is None or data_type in IMAGE_DATA_TYPES):
             coco = _ask_coco()
-        # fallback_srs applies to point clouds; in auto mode --spatial-reference
-        # also reprojects image/video coordinates, so offer it unless an explicit
-        # non-point-cloud filter rules it out.
+        # fallback_srs applies to point clouds and orthos; in auto mode
+        # --spatial-reference also reprojects image/video coordinates, so offer it
+        # unless an explicit filter for another type rules it out.
         if spatial_reference is None and (
-            data_type is None or data_type in _POINT_CLOUD_DATA_TYPES
+            data_type is None
+            or data_type in (*_POINT_CLOUD_DATA_TYPES, DataTypeEnum.ortho_image)
         ):
             spatial_reference = _ask_spatial_reference()
         if not full_provided:
@@ -1801,9 +1992,9 @@ def generate(
             help=(
                 "CRS of the source coordinates (e.g. 'EPSG:32612' or '32612'). "
                 "For images, lat/lon (and altitude) are treated as X/Y/Z "
-                "in this CRS and reprojected to EPSG:4326. For point clouds, a "
-                "'fallback_srs' column is added with this value in the "
-                "DEFAULT row."
+                "in this CRS and reprojected to EPSG:4326. For point clouds and "
+                "orthos, a 'fallback_srs' column is added with this value in the "
+                "DEFAULT row, used by files that carry no CRS of their own."
             ),
         ),
     ] = None,

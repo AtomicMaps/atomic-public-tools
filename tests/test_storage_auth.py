@@ -51,6 +51,9 @@ def _make_backend_without_store(monkeypatch) -> ObjectStoreBackend:
     backend._single_key = None
     backend._single_size = 0
     backend._listing = None
+    backend._folders = {}
+    backend._modified = {}
+    backend._listing_indexed = False
     return backend
 
 

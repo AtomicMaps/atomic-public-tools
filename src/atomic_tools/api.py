@@ -36,7 +36,13 @@ from atomic_tools.models import (
 )
 from atomic_tools.utils.aws_errors import find_auth_error
 from atomic_tools.utils.extractors import PdalNotFoundError, find_pdal_bin
-from atomic_tools.utils.utils import DataTypeEnum, ExiftoolNotFoundError, find_exiftool_bin
+from atomic_tools.utils.raster import gdal_status
+from atomic_tools.utils.utils import (
+    DataTypeEnum,
+    DataTypeFilter,
+    ExiftoolNotFoundError,
+    find_exiftool_bin,
+)
 from atomic_tools.validators.constants import DEFAULT_ROW_NAME
 from atomic_tools.validators.report import LintReport
 from atomic_tools.validators.sidecar import _as_csv_strings, lint_sidecar_df
@@ -73,6 +79,7 @@ class ValidationResult:
     skipped_vector: list[str]
     crs_failures: list[str]
     unclassified: list[str] = field(default_factory=list)
+    skipped_unsupported: list[tuple[str, str]] = field(default_factory=list)
 
     @property
     def failed(self) -> bool:
@@ -129,6 +136,7 @@ def run_validation(
     ignore_missing_orientation: bool = False,
     coco: str | None = None,
     quiet: bool = False,
+    use_file_dates: bool = True,
 ) -> ValidationResult:
     """Build the sidecar in memory and lint it. Unlike :func:`validate_path`, raises."""
     logger.info(
@@ -137,6 +145,7 @@ def run_validation(
         f"full={full} spatial_reference={spatial_reference!r} coco={coco!r}"
     )
     unclassified: list[str] = []
+    unsupported: list[tuple[str, str]] = []
     df, backend, detected_types, skipped_vector = _build_sidecar(
         directory=path,
         data_type=data_type,
@@ -146,6 +155,8 @@ def run_validation(
         spatial_reference=spatial_reference,
         quiet=quiet,
         unclassified_out=unclassified,
+        unsupported_out=unsupported,
+        use_file_dates=use_file_dates,
     )
     df = _as_csv_strings(df)
     crs_failures = _crs_failures(df)
@@ -170,6 +181,7 @@ def run_validation(
         skipped_vector=list(skipped_vector),
         crs_failures=list(crs_failures),
         unclassified=unclassified,
+        skipped_unsupported=unsupported,
     )
 
 
@@ -196,6 +208,7 @@ def build_payload(result: ValidationResult, include: Iterable[str]) -> Validatio
             "crs_failures": len(result.crs_failures),
             "skipped_vector": len(result.skipped_vector),
             "unclassified": len(result.unclassified),
+            "skipped_unsupported": len(result.skipped_unsupported),
         },
         "error": None,
     }
@@ -215,6 +228,9 @@ def build_payload(result: ValidationResult, include: Iterable[str]) -> Validatio
             "crs_failures": result.crs_failures,
             "skipped_vector": result.skipped_vector,
             "unclassified": result.unclassified,
+            "skipped_unsupported": [
+                {"file": key, "reason": reason} for key, reason in result.skipped_unsupported
+            ],
             "coco": report.coco_impact.to_dict() if report.coco_impact else None,
         }
     return ValidationResponse.model_validate(fields)
@@ -262,16 +278,24 @@ def validate_path(
     ignore_missing_orientation: bool = False,
     coco: str | None = None,
     include: str | Iterable[str] | None = None,
+    use_file_dates: bool = True,
 ) -> ValidationResponse:
     """Validate a directory/prefix or a single file/object. Never raises.
 
     A folder is scanned recursively, so never point this at a shared one.
+    Pass ``use_file_dates=False`` when the files are fresh copies, so their
+    modification times aren't taken as capture dates.
     """
     try:
         sections = parse_include(include)
         if not path:
             raise InvalidInputError("path is required.")
         dt = DataTypeEnum(data_type) if isinstance(data_type, str) else data_type
+        if dt is not None and dt.value not in {f.value for f in DataTypeFilter}:
+            raise InvalidInputError(
+                f"data_type {dt.value!r} can't be validated; choose one of "
+                f"{[f.value for f in DataTypeFilter]} or leave it unset to auto-detect."
+            )
     except ValueError as e:
         return error_payload("invalid_input", str(e))
 
@@ -286,6 +310,7 @@ def validate_path(
             ignore_missing_orientation=ignore_missing_orientation,
             coco=coco,
             quiet=True,
+            use_file_dates=use_file_dates,
         )
     except Exception as e:  # noqa: BLE001 — API contract: never raise
         logger.error(f"Validation failed: {e}", exc_info=logger.isEnabledFor(logging.INFO))
@@ -565,6 +590,8 @@ def _save_and_validate(
         client_sidecar=extra_paths["client_sidecar"],
         client_schema=extra_paths["client_schema"],
         coco=extra_paths["coco"],
+        # The saved copies' mtimes are the upload time, not the capture time.
+        use_file_dates=False,
         **validate_kwargs,
     )
 
@@ -625,9 +652,21 @@ def check_dependencies() -> DependencyReport:
     except Exception as e:  # noqa: BLE001 — ImportError, broken native lib, …
         pye57_status = ToolStatus(found=False, usable=False, detail=f"{type(e).__name__}: {e}")
 
+    gdal_status.cache_clear()
+    gdal = gdal_status()
+    ecw = ToolStatus(
+        found=gdal.path is not None,
+        usable=gdal.ecw,
+        path=gdal.path,
+        version=gdal.version,
+        detail=gdal.detail,
+        optional=True,
+    )
+
     return DependencyReport(
         ok=exiftool.usable and pdal.usable and pye57_status.usable,
         exiftool=exiftool,
         pdal=pdal,
         pye57=pye57_status,
+        ecw=ecw,
     )

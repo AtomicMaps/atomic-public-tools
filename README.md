@@ -16,6 +16,7 @@ The main tool of this repo is the the library `am-tools`. It is designed to vali
     - Windows: download from https://exiftool.org/
 - **pdal** — required only if you generate sidecars for point clouds.
     - macOS / Linux: `conda install -c conda-forge pdal` (the tool currently looks for `/opt/conda/envs/pdal/bin/pdal`)
+- **GDAL with the ECW driver** — optional, only for reading `.ecw` headers (CRS, footprint, acquisition date). The ECW driver is a proprietary Hexagon plugin and isn't part of standard GDAL builds, including conda-forge's. Without it, an `.ecw` still gets a row: its CRS comes from a `.prj` or `.aux.xml` beside it (or `--spatial-reference`), its date from the path or a client sidecar, and missing bounds are only a warning because Flow reads them itself. Found on `PATH`, or set `GDALINFO_BIN`.
 - **AWS CLI** — required only if you point `--path`/`--directory` (or a client sidecar/schema) at an `s3://` URI. Install from https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html and see the *Authenticating with AWS* section below.
 
 ### Python package
@@ -80,6 +81,11 @@ The primary use of `am-tools sidecar` is to format a client-provided sidecar int
     - **You no longer need to tell it the data type.** By default every file in the directory is classified individually (oriented image, spherical image, ortho image, point cloud, or video) using the exact same logic Atomic Flow uses, and the detected type is written into a `DataType` column in the sidecar. A **mixed** directory (drone images + point clouds + video in one folder) now works in a single run — each file gets its own type and its own required columns.
     - Spherical vs oriented images are disambiguated from EXIF signals (GPano/`ProjectionType` tags, a ~2:1 equirectangular aspect ratio, or the e57 `UserComment` marker). A plain image with none of those signals is treated as oriented.
     - You can still pass `--datatype <type>` (or pick a single type in the wizard) to **restrict** the scan to just that type. Files of other types are then skipped. An explicit `--datatype spherical_image` is taken at your word — those images are never reclassified to oriented. Valid filter values are `oriented_image`, `spherical_image`, `ortho_image`, `point_cloud`, and `full_motion_video`. Vector data is not supported for sidecar generation and is skipped (with a warning) in auto mode.
+    - Files are picked the same way Flow's intake picks them:
+        - `.ecw` orthos are included, unless a `.tif` with the same name sits beside it (the `.tif` wins).
+        - `.gpx`, `.kmz` and `.srt` telemetry files are matched to the video with the most similar name and listed in a `telemetry_sidecar` column, not given rows of their own. One that matches no video is reported.
+        - A `.jpg`/`.png` with an `.obj` or `.mtl` of the same name is a mesh texture and is skipped.
+        - Gaussian splats (`.ply`, `.splat`) and Esri `.zlas` point clouds are skipped with a warning; Flow can't process them yet.
 - Output Filename
     - What would you like the sidecar to be named?
 - Client-Supplied Sidecar
@@ -346,6 +352,8 @@ The image needs two system tools besides this package:
 - **exiftool:** `apt-get install libimage-exiftool-perl`. It's found on `PATH`, or set `EXIFTOOL_BIN`.
 - **pdal:** easiest from conda-forge with micromamba. It's found on `PATH`, or set `PDAL_BIN`.
 
+GDAL's ECW driver is optional and not in this snippet (see Prerequisites); `/health` reports it under `ecw` without affecting `ok`.
+
 ```dockerfile
 FROM mambaorg/micromamba:1.5.10
 USER root
@@ -368,7 +376,7 @@ Tuning and operations:
 |---|---|
 | `AM_TOOLS_EXIFTOOL_TIMEOUT` | Seconds per exiftool call; the default is 120. A timeout logs a warning and treats the file as having no EXIF. |
 | `AM_TOOLS_SPARSE_READS` | Set to `0` to always download remote (S3/GCS/Azure) files in full instead of reading only their metadata. On by default. |
-| `EXIFTOOL_BIN`, `PDAL_BIN` | Explicit tool paths. |
+| `EXIFTOOL_BIN`, `PDAL_BIN`, `GDALINFO_BIN` | Explicit tool paths. |
 | Logging | The library logs to the `atomic_tools` logger and adds a `NullHandler`, so configure logging in your app to see its warnings. |
 | Concurrency | pdal can take up to about 3 × 120 s on a large point cloud. Limit concurrent point-cloud requests, for example with a semaphore or a dedicated worker. |
 
@@ -427,7 +435,7 @@ Each data type requires one column from each required row below (the canonical n
 
 | Data type | Required canonical columns | Optional columns |
 |---|---|---|
-| `ortho_image` | `Filename`, `GPSLatitude`, `GPSLongitude`, `GPSAltitude` | `CreateDate` |
+| `ortho_image` | `Filename`, `bounds.minx`, `bounds.miny`, `bounds.maxx`, `bounds.maxy`, plus a CRS in `file_srs` or the DEFAULT row's `fallback_srs` (read from the GeoTIFF tags; a custom projection without an EPSG code needs GDAL to read, and is only a warning without it) | `CreateDate` |
 | `oriented_image` | `Filename`, `GPSLatitude`, `GPSLongitude`, `GPSAltitude` | `CreateDate`, `Pitch`, `Heading`, `Roll` |
 | `spherical_image` | `Filename`, `GPSLatitude`, `GPSLongitude`, `GPSAltitude`, `Pitch`, `Heading`, `Roll` | `CreateDate` |
 | `point_cloud` | `Filename`, `bounds.minx`, `bounds.maxx`, `bounds.miny`, `bounds.maxy`, `bounds.minz`, `bounds.maxz`, `num_points`, `creation_year`, `creation_doy` | — |
@@ -435,7 +443,7 @@ Each data type requires one column from each required row below (the canonical n
 
 Notes on optional columns:
 - **Orientation** — If an `oriented_image` is missing `Pitch`, `Heading`, or `Roll`, it will appear in Lens without orientation but still processes successfully.
-- **Dates** — `CreateDate` is optional: if omitted, Lens will try to find the acquisition date from the filename. Processing fails only if no date can be found in the metadata *or* the filename.
+- **Dates** — `CreateDate` is optional. Without a date tag, images fall back the way Flow does: first the file's modification time (logged as a warning, since it's often when the file was copied rather than captured), then a date in the path. ECW files skip the modification time and go straight to the path. Video uses the path. Processing fails only if none of these yields a date.
 
 Common aliases that the linter accepts and rewrites to their canonical name:
 - **Dates** — `CreateDate`, `DateTimeOriginal`, `ModifyDate`, `GPSDateStamp` are interchangeable.
