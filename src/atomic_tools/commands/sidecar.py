@@ -32,6 +32,7 @@ from atomic_tools.client_sidecar import (
     load_and_clean_client_sidecar,
     merge_client_metadata,
 )
+from atomic_tools.errors import InvalidInputError
 from atomic_tools.io.storage import (
     StorageBackend,
     from_directory,
@@ -57,8 +58,10 @@ from atomic_tools.utils.utils import (
     DATA_TYPE_INFO,
     DataTypeEnum,
     DataTypeFilter,
+    ExiftoolNotFoundError,
     _split_path_components,
     drop_preview_tifs,
+    find_exiftool_bin,
     has_value,
     infer_data_type,
     is_remote_uri,
@@ -92,7 +95,7 @@ def _fail(message: str, exc: Exception) -> NoReturn:
     """Log a failure, surface AWS auth help if applicable, and exit non-zero."""
     # A missing pdal is a setup problem, not a bug — show the install
     # instructions plainly rather than burying them under a traceback.
-    if isinstance(exc, PdalNotFoundError):
+    if isinstance(exc, (PdalNotFoundError, ExiftoolNotFoundError)):
         logger.error(f"{message}: {exc}")
         raise typer.Exit(code=1) from None
     logger.exception(message)
@@ -931,7 +934,7 @@ def _build_sidecar(
         try:
             CRS(spatial_reference)
         except CRSError:
-            raise ValueError(
+            raise InvalidInputError(
                 f"--spatial-reference value {spatial_reference!r} is not a valid "
                 "spatial reference (try e.g. 'EPSG:32612' or '32612')."
             ) from None
@@ -945,7 +948,7 @@ def _build_sidecar(
                 "Vector data type is not yet supported for sidecar CSV generation."
             )
         if data_type not in DATA_TYPE_INFO:
-            raise ValueError(
+            raise InvalidInputError(
                 f"Unsupported data_type '{data_type}'. "
                 f"Valid values: {list(DATA_TYPE_INFO.keys())}"
             )
@@ -995,6 +998,8 @@ def _build_sidecar(
     # once per file as we walk the directory.
     if any(t == DataTypeEnum.point_cloud for t in types_by_key.values()):
         find_pdal_bin()
+    if any(t != DataTypeEnum.point_cloud for t in types_by_key.values()):
+        find_exiftool_bin()
 
     file_metadata: list[tuple[str, dict]] = []
     empty_count = 0
@@ -1058,7 +1063,7 @@ def _build_sidecar(
     if client_sidecar:
         client_url = client_sidecar.strip()
         if not client_url:
-            raise ValueError("--client-sidecar value cannot be empty.")
+            raise InvalidInputError("--client-sidecar value cannot be empty.")
         logger.info(f"Merging client sidecar from {client_url}")
         client_df = load_and_clean_client_sidecar(
             url=client_url,

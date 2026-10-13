@@ -39,7 +39,6 @@ _DATETIME_FORMATS = (
     "%Y-%m-%d",
 )
 
-_CURRENT_YEAR = datetime.now().year
 
 
 def _try_float(value: str) -> float | None:
@@ -185,7 +184,8 @@ def parse_bound(value: str) -> ParseResult:
     return True, None
 
 
-def _int_range_parser(label: str, lo: int, hi: int) -> Validator:
+def _int_range_parser(label: str, lo: int, hi: int | Callable[[], int]) -> Validator:
+    # A callable `hi` keeps "next year" from freezing at import in a server.
     def _parser(value: str) -> ParseResult:
         s = value.strip()
         if not s:
@@ -194,15 +194,18 @@ def _int_range_parser(label: str, lo: int, hi: int) -> Validator:
             n = int(float(s))
         except ValueError:
             return False, f"{label} not parseable as an integer: {value!r}"
-        if not (lo <= n <= hi):
-            return False, f"{label} {n} is outside [{lo}, {hi}]"
+        upper = hi() if callable(hi) else hi
+        if not (lo <= n <= upper):
+            return False, f"{label} {n} is outside [{lo}, {upper}]"
         return True, None
 
     return _parser
 
 
 parse_num_points = _int_range_parser("num_points", 1, 2**63 - 1)
-parse_creation_year = _int_range_parser("creation_year", 1900, _CURRENT_YEAR + 1)
+parse_creation_year = _int_range_parser(
+    "creation_year", 1900, lambda: datetime.now().year + 1
+)
 parse_creation_doy = _int_range_parser("creation_doy", 1, 366)
 
 
