@@ -33,7 +33,7 @@ from atomic_tools.commands.sidecar import (
     _warn_missing_required_fields,
     build_sidecar_df,
 )
-from atomic_tools.io.storage import from_directory
+from atomic_tools.io.storage import from_path
 from atomic_tools.utils.extractors import extract_pdal_crs
 from atomic_tools.utils.utils import DataTypeEnum, drop_preview_tifs
 
@@ -920,7 +920,7 @@ def test_generate_does_not_write_unusable_sidecar_to_input_dir(tmp_path, monkeyp
     cwd = tmp_path / "cwd"
     cwd.mkdir()
     monkeypatch.chdir(cwd)
-    _stub_build_sidecar(monkeypatch, _pc_df("no"), from_directory(str(indir)))
+    _stub_build_sidecar(monkeypatch, _pc_df("no"), from_path(str(indir)))
 
     with pytest.raises(PointCloudCRSError) as excinfo:
         sidecar_mod._generate(
@@ -943,7 +943,7 @@ def test_generate_writes_when_crs_is_usable(tmp_path, monkeypatch):
     indir = tmp_path / "client-bucket"
     indir.mkdir()
     monkeypatch.chdir(tmp_path)
-    _stub_build_sidecar(monkeypatch, _pc_df("yes"), from_directory(str(indir)))
+    _stub_build_sidecar(monkeypatch, _pc_df("yes"), from_path(str(indir)))
 
     sidecar_mod._generate(
         directory=str(indir),

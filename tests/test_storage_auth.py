@@ -6,7 +6,7 @@ import pytest
 from obstore.exceptions import PermissionDeniedError, UnauthenticatedError
 
 from atomic_tools.io import storage
-from atomic_tools.io.storage import ObjectStoreBackend, from_directory
+from atomic_tools.io.storage import ObjectStoreBackend, from_path
 from atomic_tools.utils import object_store as object_store_module
 from atomic_tools.utils.aws_errors import (
     S3CredentialsMissingError,
@@ -26,14 +26,14 @@ class _FakeSession:
         return object() if self._has_credentials else None
 
 
-def test_from_directory_raises_credentials_missing(monkeypatch):
+def test_from_path_raises_credentials_missing(monkeypatch):
     monkeypatch.setattr(
         object_store_module.boto3,
         "Session",
         lambda *a, **kw: _FakeSession(has_credentials=False),
     )
     with pytest.raises(S3CredentialsMissingError) as ei:
-        from_directory("s3://example-bucket/some/prefix")
+        from_path("s3://example-bucket/some/prefix")
     assert ei.value.profile == "fake-profile"
     assert "fake-profile" in ei.value.help_text()
 
@@ -48,6 +48,9 @@ def _make_backend_without_store(monkeypatch) -> ObjectStoreBackend:
     backend._bucket = "denied-bucket"
     backend._prefix = "deep/path"
     backend._store = object()
+    backend._single_key = None
+    backend._single_size = 0
+    backend._listing = None
     return backend
 
 
@@ -57,13 +60,13 @@ def _make_backend_without_store(monkeypatch) -> ObjectStoreBackend:
 def test_list_keys_translates_obstore_auth_failure(monkeypatch, obstore_exc_cls):
     backend = _make_backend_without_store(monkeypatch)
 
-    def fake_get_object_keys(**kwargs):
+    def fake_get_keys_and_metadata(store, prefix):
         # Mirror the wrap-as-RuntimeError pattern in utils.utils
         inner = obstore_exc_cls("denied")
         outer = RuntimeError("Failed to list keys with prefix deep/path: denied")
         raise outer from inner
 
-    monkeypatch.setattr(storage, "get_object_keys", fake_get_object_keys)
+    monkeypatch.setattr(storage, "get_keys_and_metadata", fake_get_keys_and_metadata)
 
     with pytest.raises(S3PermissionDeniedError) as ei:
         backend.list_keys(include=[".jpg"], exclude=[])
@@ -115,10 +118,10 @@ def test_write_output_translates_obstore_auth_failure(monkeypatch, tmp_path):
 def test_list_keys_passes_through_non_auth_runtime_error(monkeypatch):
     backend = _make_backend_without_store(monkeypatch)
 
-    def fake_get_object_keys(**kwargs):
+    def fake_get_keys_and_metadata(store, prefix):
         raise RuntimeError("disk full")
 
-    monkeypatch.setattr(storage, "get_object_keys", fake_get_object_keys)
+    monkeypatch.setattr(storage, "get_keys_and_metadata", fake_get_keys_and_metadata)
 
     with pytest.raises(RuntimeError, match="disk full"):
         backend.list_keys(include=[], exclude=[])

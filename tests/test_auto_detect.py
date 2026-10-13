@@ -127,8 +127,8 @@ _PC_META = {
 
 @pytest.fixture
 def patched_extractors(monkeypatch):
-    """Stub exiftool/pdal so scans need no external binaries. Records whether
-    find_pdal_bin was called."""
+    """Stub exiftool/pdal (and their lookups) so scans need no external
+    binaries. Records whether find_pdal_bin was called."""
     calls = {"find_pdal": 0}
 
     def fake_exif(local_path, filename):
@@ -149,6 +149,7 @@ def patched_extractors(monkeypatch):
     monkeypatch.setattr(sidecar_mod, "extract_exif_metadata", fake_exif)
     monkeypatch.setattr(sidecar_mod, "extract_pdal_metadata", fake_pdal)
     monkeypatch.setattr(sidecar_mod, "find_pdal_bin", fake_find_pdal)
+    monkeypatch.setattr(sidecar_mod, "find_exiftool_bin", lambda: "/fake/exiftool")
     return calls
 
 

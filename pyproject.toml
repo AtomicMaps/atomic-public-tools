@@ -45,6 +45,11 @@ dev = [
     "pytest>=8",
     "ruff>=0.6",
     "mypy>=1.10",
+    # Only for the FastAPI end-to-end test (tests/test_validate_upload.py);
+    # the library itself has no web-framework dependency.
+    "fastapi>=0.110",
+    "httpx>=0.27",
+    "python-multipart>=0.0.9",
 ]
 
 [project.scripts]
