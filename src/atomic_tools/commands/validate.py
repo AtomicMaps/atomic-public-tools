@@ -7,15 +7,13 @@ the sidecar to the remote/local directory. It exists for the common case of
 
 The metadata extraction, sidecar assembly, wizard prompts, and lint pathway are
 all shared with ``sidecar`` (see :mod:`atomic_tools.commands.sidecar`);
-this module only swaps the persist step for an in-memory temp file that is
-linted and discarded.
+this module only swaps the persist step for linting the in-memory DataFrame
+(see :func:`atomic_tools.validators.sidecar.lint_sidecar_df`).
 """
 
 from __future__ import annotations
 
 import logging
-import tempfile
-from pathlib import Path
 from typing import Annotated
 
 import click
@@ -32,7 +30,7 @@ from atomic_tools.commands.sidecar import (
     _warn_skipped_vectors,
 )
 from atomic_tools.utils.utils import DataTypeEnum, DataTypeFilter
-from atomic_tools.validators.sidecar import lint_sidecar_file
+from atomic_tools.validators.sidecar import lint_sidecar_df
 
 logger = logging.getLogger(__name__)
 
@@ -65,26 +63,20 @@ def _validate(
     )
     crs_failures = _crs_failures(df)
 
-    # Lint reads from a path, so stage the assembled sidecar in a throwaway temp
-    # file rather than writing it back to the (possibly remote) input directory.
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        local_csv = Path(tmp_dir) / "sidecar.csv"
-        df.to_csv(local_csv, index=False)
-        logger.info("Linting in-memory sidecar (not saved)…")
-        report = lint_sidecar_file(
-            str(local_csv),
-            final=True,
-            data_type=data_type,
-            schema_path=None,
-            input_files_path=directory,
-            ignore_missing_orientation=ignore_missing_orientation,
-            coco_path=coco,
-            # validate is informational — a COCO referencing images absent from
-            # the scanned directory is reported as a warning here, not a hard
-            # failure (it blocks only when generating a sidecar that ships).
-            coco_not_on_disk_is_error=False,
-        )
-        return report, skipped_vector, crs_failures
+    logger.info("Linting in-memory sidecar (not saved)…")
+    report = lint_sidecar_df(
+        df,
+        final=True,
+        data_type=data_type,
+        input_files_path=directory,
+        ignore_missing_orientation=ignore_missing_orientation,
+        coco_path=coco,
+        # validate is informational — a COCO referencing images absent from
+        # the scanned directory is reported as a warning here, not a hard
+        # failure (it blocks only when generating a sidecar that ships).
+        coco_not_on_disk_is_error=False,
+    )
+    return report, skipped_vector, crs_failures
 
 
 def validate(
