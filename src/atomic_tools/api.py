@@ -1,17 +1,23 @@
-"""Library entry point behind ``validate --api-mode``.
+"""Library entry points for web services and ``validate --api-mode``.
 
-:func:`validate_path` never prompts, prints or raises; failures come back as
-``status == "error"``. It blocks on exiftool/pdal, so call it from a worker
-thread in async code.
+The validate functions never prompt, print or raise; failures come back as
+``status == "error"``. They block on exiftool/pdal, so call them from a worker
+thread in async code (a plain ``def`` FastAPI endpoint does this).
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any
+from pathlib import Path
+from typing import IO, Any
 
 from atomic_tools.client_sidecar import SidecarMergeError
 from atomic_tools.commands.sidecar import (
@@ -23,12 +29,14 @@ from atomic_tools.commands.sidecar import (
 from atomic_tools.errors import InvalidInputError
 from atomic_tools.models import (
     SCHEMA_VERSION,
+    DependencyReport,
     ErrorInfo,
+    ToolStatus,
     ValidationResponse,
 )
 from atomic_tools.utils.aws_errors import find_auth_error
-from atomic_tools.utils.extractors import PdalNotFoundError
-from atomic_tools.utils.utils import DataTypeEnum, ExiftoolNotFoundError
+from atomic_tools.utils.extractors import PdalNotFoundError, find_pdal_bin
+from atomic_tools.utils.utils import DataTypeEnum, ExiftoolNotFoundError, find_exiftool_bin
 from atomic_tools.validators.constants import DEFAULT_ROW_NAME
 from atomic_tools.validators.report import LintReport
 from atomic_tools.validators.sidecar import _as_csv_strings, lint_sidecar_df
@@ -39,7 +47,10 @@ __all__ = [
     "DEFAULT_SECTIONS",
     "SCHEMA_VERSION",
     "SECTIONS",
+    "UploadedFile",
+    "check_dependencies",
     "validate_path",
+    "validate_upload",
 ]
 
 SECTIONS: tuple[str, ...] = ("findings", "missing_data", "metadata", "details")
@@ -285,3 +296,338 @@ def validate_path(
     except Exception as e:  # noqa: BLE001 — API contract: never raise
         logger.exception("Could not build the validation response")
         return error_payload("internal_error", f"Could not build the response: {e}")
+
+
+# ---- uploads -------------------------------------------------------------------
+
+
+@dataclass
+class UploadedFile:
+    """Uploaded bytes or binary stream, with the user's original filename.
+
+    Type detection, filename dates and sidecar/COCO matching use the name.
+    """
+
+    content: bytes | IO[bytes]
+    filename: str
+
+
+# Or anything shaped like Starlette's UploadFile (``.file`` + ``.filename``).
+UploadLike = UploadedFile | Any
+
+_COPY_CHUNK = 1024 * 1024
+_EXTRA_ROLES = ("client_sidecar", "client_schema", "coco")
+_MAX_NAME_BYTES = 255
+
+
+class UploadError(InvalidInputError):
+    """An upload that can't be validated as given (bad name, too large…)."""
+
+
+def _safe_filename(name: str | None, role: str) -> str:
+    if not name or not name.strip():
+        raise UploadError(f"The {role} upload has no filename; send its original name.")
+    base = re.split(r"[\\/]", name)[-1]
+    base = "".join(ch for ch in base if ch.isprintable()).strip()
+    if base in ("", ".", ".."):
+        raise UploadError(f"The {role} upload has an invalid filename: {name!r}.")
+    if len(base.encode("utf-8")) > _MAX_NAME_BYTES:
+        stem, ext = os.path.splitext(base)
+        budget = _MAX_NAME_BYTES - len(ext.encode("utf-8"))
+        if budget < 1:
+            raise UploadError(f"The {role} upload's filename is too long: {name[:40]!r}…")
+        stem = stem.encode("utf-8")[:budget].decode("utf-8", errors="ignore")
+        base = stem + ext
+    return base
+
+
+def _unpack_upload(obj: UploadLike, filename: str | None, role: str) -> tuple[Any, str]:
+    if isinstance(obj, UploadedFile):
+        return obj.content, filename or obj.filename
+    if hasattr(obj, "file") and hasattr(obj, "filename"):  # Starlette UploadFile
+        return obj.file, filename or obj.filename
+    if isinstance(obj, str):
+        raise UploadError(
+            f"The {role} upload is a str; pass bytes or a binary stream, not text."
+        )
+    if isinstance(obj, (bytes, bytearray, memoryview)) or hasattr(obj, "read"):
+        if not filename:
+            raise UploadError(
+                f"The {role} upload is raw bytes/stream; pass its original filename "
+                "(or wrap it in UploadedFile)."
+            )
+        return obj, filename
+    raise UploadError(f"Unsupported {role} upload type: {type(obj).__name__}.")
+
+
+def _is_empty_form_field(obj: UploadLike) -> bool:
+    """HTML forms send an empty file input as an ``UploadFile`` with ``filename=""``, not None."""
+    if isinstance(obj, UploadedFile) or not (hasattr(obj, "file") and hasattr(obj, "filename")):
+        return False
+    if obj.filename:
+        return False
+    stream = obj.file
+    try:
+        pos = stream.tell()
+        empty = stream.read(1) in (b"", "")
+        stream.seek(pos)
+    except (AttributeError, OSError, ValueError):
+        return False  # can't tell; let _save_upload report it
+    return empty
+
+
+def _save_upload(
+    obj: UploadLike,
+    dest_dir: Path,
+    role: str,
+    *,
+    filename: str | None = None,
+    max_bytes: int | None = None,
+    require_extension: bool = False,
+) -> Path:
+    content, raw_name = _unpack_upload(obj, filename, role)
+    name = _safe_filename(raw_name, role)
+    if require_extension and not Path(name).suffix:
+        raise UploadError(
+            f"The {role} upload {name!r} has no file extension; the file type is "
+            "detected from it, so send the file under its original name."
+        )
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / name
+
+    if isinstance(content, str):
+        raise UploadError(f"The {role} upload {name!r} is text; pass bytes or a binary stream.")
+    if not isinstance(content, (bytes, bytearray, memoryview)) and not hasattr(content, "read"):
+        raise UploadError(
+            f"The {role} upload {name!r} has unsupported content: {type(content).__name__}."
+        )
+
+    written = 0
+    with open(dest, "wb") as out:
+        if isinstance(content, (bytes, bytearray, memoryview)):
+            written = memoryview(content).nbytes
+            if max_bytes is None or written <= max_bytes:
+                out.write(content)  # no intermediate copy of a large buffer
+        else:
+            # Rewind if possible; an unseekable stream is read from where it is.
+            with contextlib.suppress(AttributeError, OSError, ValueError):
+                content.seek(0)
+            while chunk := content.read(_COPY_CHUNK):
+                if isinstance(chunk, str):
+                    raise UploadError(
+                        f"The {role} upload {name!r} was opened in text mode; "
+                        "open it in binary mode ('rb')."
+                    )
+                written += len(chunk)
+                if max_bytes is not None and written > max_bytes:
+                    break
+                out.write(chunk)
+    if max_bytes is not None and written > max_bytes:
+        raise UploadError(f"The {role} upload {name!r} exceeds the {max_bytes}-byte limit.")
+    return dest
+
+
+def _scrub(value: Any, replacements: list[tuple[str, str]]) -> Any:
+    if isinstance(value, str):
+        for old, new in replacements:
+            value = value.replace(old, new)
+        return value
+    if isinstance(value, list):
+        return [_scrub(v, replacements) for v in value]
+    if isinstance(value, dict):
+        return {k: _scrub(v, replacements) for k, v in value.items()}
+    return value
+
+
+_UPLOAD_SUBDIRS = ("data", *(f"extras{os.sep}{role}" for role in _EXTRA_ROLES))
+
+
+def _path_replacements(tmp_root: Path, saved: list[Path]) -> list[tuple[str, str]]:
+    """Temp paths, raw and resolved (/var vs /private/var on macOS), longest first."""
+    pairs: dict[str, str] = {}
+    for p in saved:
+        for variant in {str(p), str(p.resolve())}:
+            pairs[variant] = p.name
+    for root in {str(tmp_root), str(tmp_root.resolve())}:
+        for sub in _UPLOAD_SUBDIRS:
+            pairs[f"{root}{os.sep}{sub}{os.sep}"] = ""
+        pairs[root + os.sep] = ""
+        pairs[root] = "<upload>"
+    return sorted(pairs.items(), key=lambda kv: len(kv[0]), reverse=True)
+
+
+def _scrubbed(
+    response: ValidationResponse, tmp_root: Path, saved: list[Path]
+) -> ValidationResponse:
+    try:
+        cleaned = _scrub(
+            response.model_dump(mode="json", exclude_unset=True),
+            _path_replacements(tmp_root, saved),
+        )
+        return ValidationResponse.model_validate(cleaned)
+    except Exception:  # noqa: BLE001 — API contract: never raise (or leak paths)
+        logger.exception("Could not scrub the validation response")
+        return error_payload("internal_error", "Could not build the response.")
+
+
+def validate_upload(
+    file: UploadLike,
+    *,
+    filename: str | None = None,
+    client_sidecar: UploadLike | None = None,
+    client_schema: UploadLike | None = None,
+    coco: UploadLike | None = None,
+    data_type: DataTypeEnum | str | None = None,
+    full: bool = False,
+    spatial_reference: str | None = None,
+    ignore_missing_orientation: bool = False,
+    include: str | Iterable[str] | None = None,
+    work_dir: str | os.PathLike[str] | None = None,
+    max_bytes: int | None = None,
+) -> ValidationResponse:
+    """Validate one uploaded data file plus optional companion uploads. Never raises.
+
+    ``file`` may also be raw bytes or a binary stream, given with ``filename``.
+    Temp paths in messages are replaced by the original filenames.
+    """
+    try:
+        tmp_root = Path(tempfile.mkdtemp(prefix="amtools-", dir=work_dir))
+    except OSError as e:
+        # Log the path for operators; don't send it to the HTTP client.
+        logger.error(f"Could not create a temp dir in {work_dir!r}: {e}")
+        reason = e.strerror or type(e).__name__
+        return error_payload("internal_error", f"Could not create a temp dir ({reason}).")
+
+    saved: list[Path] = []
+    try:
+        try:
+            response = _save_and_validate(
+                tmp_root,
+                saved,
+                file,
+                filename=filename,
+                extras={"client_sidecar": client_sidecar, "client_schema": client_schema,
+                        "coco": coco},
+                max_bytes=max_bytes,
+                data_type=data_type,
+                full=full,
+                spatial_reference=spatial_reference,
+                ignore_missing_orientation=ignore_missing_orientation,
+                include=include,
+            )
+        except UploadError as e:
+            response = error_payload("invalid_input", str(e))
+        except OSError as e:
+            logger.error(f"Could not save upload: {e}")
+            response = error_payload("internal_error", f"Could not save upload: {e}")
+        except Exception as e:  # noqa: BLE001 — API contract: never raise
+            logger.exception("Unexpected error while handling an upload")
+            response = error_payload("internal_error", f"Unexpected error: {e}")
+        # Scrub before the temp dir goes, so paths still resolve the same way.
+        return _scrubbed(response, tmp_root, saved)
+    finally:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
+
+def _save_and_validate(
+    tmp_root: Path,
+    saved: list[Path],
+    file: UploadLike,
+    *,
+    filename: str | None,
+    extras: dict[str, UploadLike | None],
+    max_bytes: int | None,
+    **validate_kwargs: Any,
+) -> ValidationResponse:
+    data_path = _save_upload(
+        file,
+        tmp_root / "data",
+        "data file",
+        filename=filename,
+        max_bytes=max_bytes,
+        require_extension=True,
+    )
+    saved.append(data_path)
+    extra_paths: dict[str, str | None] = {}
+    for role in _EXTRA_ROLES:
+        obj = extras.get(role)
+        if obj is None or _is_empty_form_field(obj):
+            extra_paths[role] = None
+            continue
+        p = _save_upload(
+            obj, tmp_root / "extras" / role, role.replace("_", " "), max_bytes=max_bytes
+        )
+        saved.append(p)
+        extra_paths[role] = str(p)
+
+    return validate_path(
+        str(data_path),
+        client_sidecar=extra_paths["client_sidecar"],
+        client_schema=extra_paths["client_schema"],
+        coco=extra_paths["coco"],
+        **validate_kwargs,
+    )
+
+
+# ---- health ---------------------------------------------------------------------
+
+
+def _probe_tool(path: str, args: list[str], pattern: str | None = None) -> ToolStatus:
+    try:
+        proc = subprocess.run(
+            [path, *args],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return ToolStatus(found=True, usable=False, path=path, detail=f"Could not run: {e}")
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout).strip().splitlines()
+        return ToolStatus(
+            found=True,
+            usable=False,
+            path=path,
+            detail=f"Exited {proc.returncode}: {err[0] if err else 'no output'}",
+        )
+    out = proc.stdout.strip()
+    version = None
+    if pattern and (m := re.search(pattern, out)):
+        version = m.group(1)
+    elif out:
+        version = out.splitlines()[0]
+    return ToolStatus(found=True, usable=True, path=path, version=version)
+
+
+def check_dependencies() -> DependencyReport:
+    """Report whether exiftool, pdal and pye57 are usable. Never raises.
+
+    Binaries are run, not just located, so a broken install (e.g. missing
+    shared libraries) fails ``/health`` instead of the first upload.
+    """
+    try:
+        exiftool = _probe_tool(find_exiftool_bin(), ["-ver"])
+    except ExiftoolNotFoundError as e:
+        exiftool = ToolStatus(found=False, usable=False, detail=str(e))
+
+    try:
+        pdal = _probe_tool(find_pdal_bin(), ["--version"], r"pdal\s+(\S+)")
+    except PdalNotFoundError as e:
+        pdal = ToolStatus(found=False, usable=False, detail=str(e).strip().splitlines()[0])
+
+    try:
+        from importlib.metadata import version
+
+        import pye57  # noqa: F401
+
+        pye57_status = ToolStatus(found=True, usable=True, version=version("pye57"))
+    except Exception as e:  # noqa: BLE001 — ImportError, broken native lib, …
+        pye57_status = ToolStatus(found=False, usable=False, detail=f"{type(e).__name__}: {e}")
+
+    return DependencyReport(
+        ok=exiftool.usable and pdal.usable and pye57_status.usable,
+        exiftool=exiftool,
+        pdal=pdal,
+        pye57=pye57_status,
+    )

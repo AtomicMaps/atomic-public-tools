@@ -191,6 +191,8 @@ Exit codes:
 
 On servers, also set `AM_TOOLS_NO_VERSION_CHECK=1` so no other command makes the outbound update check.
 
+The same thing is available in Python without a subprocess. See [Using atomic_tools in a server](#using-atomic_tools-in-a-server).
+
 ### `am-tools lint`
 There are two subcommands in `am-tools lint`:
 
@@ -275,6 +277,93 @@ am-tools sidecar --path ./imgs --datatype oriented_image --coco labels.coco.json
 ```
 
 > Note: the tier respects the same required/optional policy the linter uses. For `oriented_image`, orientation is required by default (so a missing heading makes an image *unusable*); pass `--ignore-missing-orientation` to treat orientation as optional (so it only makes an image *degraded*).
+
+## Using atomic_tools in a server
+
+The library can be imported directly into a web service. The main use case is a FastAPI app that receives an uploaded file and validates it. Everything below is synchronous, never prompts, never prints, and never raises; failures come back as `status: "error"` with an `error.type`.
+
+| Function | Use it for |
+|---|---|
+| `validate_upload(file, ...)` | A file received over HTTP, plus optional `client_sidecar`, `client_schema` and `coco` uploads. Takes a FastAPI `UploadFile` directly. |
+| `validate_path(path, ...)` | A file or folder already on disk, or an `s3://`/`gs://`/`az://` URI. |
+| `check_dependencies()` | A `/health` endpoint: whether exiftool, pdal and pye57 are installed **and actually run**. |
+
+Both validate functions return a Pydantic `ValidationResponse`, the same JSON as `validate --api-mode`. Sections you don't request with `include` are left unset, so serialize with `exclude_unset=True`.
+
+```python
+from fastapi import FastAPI, Form, UploadFile
+
+from atomic_tools import DependencyReport, ValidationResponse, check_dependencies, validate_upload
+
+app = FastAPI()
+
+
+@app.post("/validate", response_model=ValidationResponse, response_model_exclude_unset=True)
+def validate(  # plain `def`: FastAPI runs it in a worker thread (it blocks on exiftool/pdal)
+    file: UploadFile,
+    client_sidecar: UploadFile | None = None,
+    client_schema: UploadFile | None = None,
+    coco: UploadFile | None = None,
+    include: str | None = Form(None),  # e.g. "findings,metadata" or "all"
+    ignore_missing_orientation: bool = Form(False),
+):
+    return validate_upload(
+        file,
+        client_sidecar=client_sidecar,
+        client_schema=client_schema,
+        coco=coco,
+        include=include,
+        ignore_missing_orientation=ignore_missing_orientation,
+        max_bytes=2 * 1024**3,  # optional per-upload size cap
+    )
+
+
+@app.get("/health", response_model=DependencyReport)
+def health():
+    return check_dependencies()
+```
+
+How `validate_upload` handles an upload:
+
+- **It keeps the original filename.** The data type, the extractor, dates parsed from the name, thumbnail detection, and client-sidecar/COCO row matching all depend on it. Each upload is saved under its original name in a fresh private temp folder and deleted afterwards. Directory parts are stripped (`../../x.jpg` is saved as `x.jpg`), and a file with no extension is rejected as `invalid_input`.
+- **Server paths don't leak.** Temp paths in messages are replaced with the uploaded filename.
+- **Parallel requests are safe.** Each call has its own temp folder, and nothing is shared between calls.
+- **Inputs can be in several forms.** `file` can also be raw bytes or a binary stream with `filename=...`, or an `UploadedFile(content, filename)`. Pass `work_dir=` to choose where temp folders go, for example a volume with enough room for large point clouds.
+- **Client-sidecar values fill gaps only.** Where the file's own metadata has a value, that value wins.
+
+If you call `validate_path` yourself, point it at the file, or at a folder holding only this request's data. A folder is scanned recursively, so never pass a shared folder like `/tmp`.
+
+### Running it in Docker
+
+The image needs two system tools besides this package:
+
+- **exiftool:** `apt-get install libimage-exiftool-perl`. It's found on `PATH`, or set `EXIFTOOL_BIN`.
+- **pdal:** easiest from conda-forge with micromamba. It's found on `PATH`, or set `PDAL_BIN`.
+
+```dockerfile
+FROM mambaorg/micromamba:1.5.10
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends libimage-exiftool-perl git \
+    && rm -rf /var/lib/apt/lists/*
+RUN micromamba install -y -n base -c conda-forge python=3.11 pdal && micromamba clean -a -y
+ENV PDAL_BIN=/opt/conda/bin/pdal \
+    AM_TOOLS_NO_VERSION_CHECK=1
+# Pin to a tag or commit; don't run `am-tools update` inside images.
+ARG ATOMIC_TOOLS_REF=main
+RUN /opt/conda/bin/pip install "atomic-public-tools @ git+https://github.com/AtomicMaps/atomic-public-tools@${ATOMIC_TOOLS_REF}" \
+    fastapi uvicorn python-multipart
+```
+
+This snippet is a starting point and isn't built or tested in CI. Hit `/health` after deploying. `ok` is `false` if a tool is missing or present but broken, for example a binary with a missing shared library, and `detail` says why.
+
+Tuning and operations:
+
+| Setting | Effect |
+|---|---|
+| `AM_TOOLS_EXIFTOOL_TIMEOUT` | Seconds per exiftool call; the default is 120. A timeout logs a warning and treats the file as having no EXIF. |
+| `EXIFTOOL_BIN`, `PDAL_BIN` | Explicit tool paths. |
+| Logging | The library logs to the `atomic_tools` logger and adds a `NullHandler`, so configure logging in your app to see its warnings. |
+| Concurrency | pdal can take up to about 3 × 120 s on a large point cloud. Limit concurrent point-cloud requests, for example with a semaphore or a dedicated worker. |
 
 ## Project layout
 
