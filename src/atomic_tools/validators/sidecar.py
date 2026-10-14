@@ -16,6 +16,13 @@ from atomic_tools.client_sidecar import (
 )
 from atomic_tools.io.storage import StorageBackend, from_path
 from atomic_tools.utils.aws_errors import S3AuthError
+from atomic_tools.utils.companions import (
+    drop_ecw_shadowed_by_tif,
+    drop_mesh_textures,
+    is_telemetry,
+    listing_extensions,
+    unsupported_reason,
+)
 from atomic_tools.utils.utils import (
     DATA_TYPE_INFO,
     DataTypeEnum,
@@ -221,13 +228,17 @@ def _lint_loaded_df(
             required_groups, optional_groups = rules_by_type[detected]
             has_rows = detected in detected_types
             label = detected.value if multi else None
-            if has_rows:
-                # Column-presence errors apply only to a type that has rows.
-                _check_required_columns(required_groups, columns_set, report, type_label=label)
-                _check_optional_columns(optional_groups, columns_set, report, type_label=label)
             type_rows = df.loc[
                 [idx for idx, tt in row_types.items() if tt == detected]
             ]
+            if has_rows:
+                # Column-presence errors apply only to a type that has rows.
+                names = type_rows[df.columns[0]].astype(str).str.strip().str.lower()
+                _check_required_columns(
+                    required_groups, columns_set, report, type_label=label,
+                    soft=ECW_HEADER_FIELDS if names.str.endswith(".ecw").all() else frozenset(),
+                )
+                _check_optional_columns(optional_groups, columns_set, report, type_label=label)
             sat = _check_required_values(
                 df, type_rows, required_groups, columns_set, default_row_idx, report,
                 type_label=label,
@@ -433,12 +444,23 @@ def _check_required_columns(
     columns_set: set[str],
     report: LintReport,
     type_label: str | None = None,
+    soft: frozenset[str] = frozenset(),
 ) -> None:
+    """``soft`` columns only warn when absent (ECW bounds Flow reads itself)."""
     suffix = f" ({type_label})" if type_label else ""
     for group in required_groups:
         if not any(field in columns_set for field in group):
             canonical = group[0]
             aliases = ", ".join(group)
+            if canonical in soft:
+                report.add_warning(
+                    f"Column {canonical!r}{suffix} is missing; every row is an ECW.",
+                    fix_hint=(
+                        "Install GDAL with the ECW driver to read ECW headers here; "
+                        "Flow reads them itself during intake."
+                    ),
+                )
+                continue
             report.add_error(
                 f"Required column for {canonical!r}{suffix} is missing.",
                 fix_hint=f"Add a column named {canonical!r} (accepted aliases: {aliases}).",
@@ -469,6 +491,11 @@ def _check_optional_columns(
                     "Lens without orientation but still process successfully."
                 ),
             )
+
+
+# Without GDAL's ECW driver an ECW's bounds can't be read here, but Flow reads
+# them itself, so their absence is only a warning.
+ECW_HEADER_FIELDS = frozenset({"bounds.minx", "bounds.miny", "bounds.maxx", "bounds.maxy"})
 
 
 def _check_required_values(
@@ -507,11 +534,22 @@ def _check_required_values(
             continue
 
         missing_rows: list[tuple[int, str]] = []
+        ecw_rows: list[tuple[int, str]] = []
         for idx, row in non_default.iterrows():
             if not any(has_value(row[f]) for f in present_fields):
                 fname = str(row[file_col]).strip() if file_col else ""
-                missing_rows.append((int(idx), fname))
+                soft = canonical in ECW_HEADER_FIELDS and fname.lower().endswith(".ecw")
+                (ecw_rows if soft else missing_rows).append((int(idx), fname))
 
+        if ecw_rows:
+            names = ", ".join(repr(name) for _, name in ecw_rows[:MAX_LISTED_FILES])
+            report.add_warning(
+                f"{canonical!r}{suffix} is missing on {len(ecw_rows)} ECW row(s): {names}",
+                fix_hint=(
+                    "Install GDAL with the ECW driver to read ECW headers here; "
+                    "Flow reads them itself during intake."
+                ),
+            )
         if missing_rows:
             sample = missing_rows[:MAX_LISTED_FILES]
             tail = (
@@ -677,6 +715,11 @@ def _check_bounds_consistency(
                 )
 
 
+def _filename_type(key: str) -> DataTypeEnum | None:
+    inferred = infer_data_type(key)
+    return DataTypeEnum(inferred) if inferred else None
+
+
 def _check_file_inventory(
     *,
     df: pd.DataFrame,
@@ -697,17 +740,12 @@ def _check_file_inventory(
 
     if data_type_filter is not None:
         # Explicit filter: keep the exact single-type listing.
-        info = DATA_TYPE_INFO[data_type_filter]
-        include = list(info.get("include") or [])
-        exclude = list(info.get("exclude") or [])
+        include = listing_extensions([data_type_filter])
+        exclude = list(DATA_TYPE_INFO[data_type_filter].get("exclude") or [])
     else:
         # Auto: list the union include of the detected row types; per-type
         # excludes are applied by infer_data_type when we classify each key.
-        include = []
-        for detected in detected_types:
-            for ext in DATA_TYPE_INFO.get(detected, {}).get("include") or []:
-                if ext not in include:
-                    include.append(ext)
+        include = listing_extensions(detected_types)
         exclude = []
 
     if not include:
@@ -724,6 +762,13 @@ def _check_file_inventory(
             # every preview tif as an input file with no sidecar row — on a
             # sidecar the generator just produced correctly.
             keys, _ = drop_preview_tifs(keys)
+        # The same intake rules generation applies (see commands.sidecar).
+        keys = [
+            k for k in keys
+            if not is_telemetry(k) and unsupported_reason(k, _filename_type(k)) is None
+        ]
+        keys, _ = drop_ecw_shadowed_by_tif(keys)
+        keys, _ = drop_mesh_textures(keys, backend.sibling_exists)
     except S3AuthError as e:
         report.add_error(
             f"Could not enumerate input files at {input_files_path}: {e}",

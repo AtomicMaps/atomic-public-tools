@@ -22,6 +22,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlparse
@@ -126,11 +127,36 @@ class StorageBackend(ABC):
         """
         return None
 
+    @abstractmethod
+    def _folder_index(self, folder: str) -> dict[str, str]:
+        """``{lowercased key: key}`` for the files directly in ``folder``."""
+
+    @abstractmethod
+    def read_text(self, key: str, max_bytes: int = 1024 * 1024) -> str:
+        """Small text file at ``key`` (a projection file, not data)."""
+
+    @abstractmethod
+    def modified_time(self, key: str) -> datetime | None:
+        """When ``key`` was last modified at its source (not a local copy)."""
+
+    def find_sibling(self, key: str) -> str | None:
+        """The existing key matching ``key`` case-insensitively, in ``key``'s folder."""
+        folder = PurePosixPath(key).parent.as_posix()
+        return self._folder_index("" if folder == "." else folder).get(key.lower())
+
+    def sibling_exists(self, key: str) -> bool:
+        return self.find_sibling(key) == key
+
+    def files_beside(self, key: str) -> list[str]:
+        folder = PurePosixPath(key).parent.as_posix()
+        return list(self._folder_index("" if folder == "." else folder).values())
+
 
 class LocalBackend(StorageBackend):
     def __init__(self, root: Path, only: str | None = None) -> None:
         self._root = root
         self._only = only
+        self._folders: dict[str, dict[str, str]] = {}
 
     @property
     def display_root(self) -> str:
@@ -166,6 +192,29 @@ class LocalBackend(StorageBackend):
     @contextmanager
     def open_local(self, key: str) -> Iterator[str]:
         yield str(self._root / key)
+
+    def modified_time(self, key: str) -> datetime | None:
+        try:
+            return datetime.fromtimestamp((self._root / key).stat().st_mtime, tz=timezone.utc)
+        except OSError:
+            return None
+
+    def _folder_index(self, folder: str) -> dict[str, str]:
+        if folder not in self._folders:
+            index: dict[str, str] = {}
+            try:
+                for entry in os.scandir(self._root / folder):
+                    if entry.is_file():
+                        rel = f"{folder}/{entry.name}" if folder else entry.name
+                        index[rel.lower()] = rel
+            except OSError:
+                pass
+            self._folders[folder] = index
+        return self._folders[folder]
+
+    def read_text(self, key: str, max_bytes: int = 1024 * 1024) -> str:
+        with open(self._root / key, "rb") as fh:
+            return fh.read(max_bytes).decode("utf-8", errors="replace")
 
     def write_output(self, filename: str, source: Path) -> str:
         target = self._root / filename
@@ -203,6 +252,9 @@ class ObjectStoreBackend(StorageBackend):
         self._single_key: str | None = None
         self._single_size = 0
         self._listing: dict[str, int] | None = None
+        self._folders: dict[str, dict[str, str]] = {}
+        self._modified: dict[str, datetime] = {}
+        self._listing_indexed = False
         factory = ObjectStore(store_type)
         self._store = (
             factory.init_session(bucket=bucket)
@@ -247,6 +299,9 @@ class ObjectStoreBackend(StorageBackend):
                 self._reraise_if_auth(e, operation="list")
                 raise
             self._listing = {k: int(v["size"]) for k, v in info.items()}
+            self._modified.update(
+                {k: v["last_modified"] for k, v in info.items() if v.get("last_modified")}
+            )
         return self._listing
 
     def list_keys(self, include: Sequence[str], exclude: Sequence[str]) -> list[str]:
@@ -274,7 +329,12 @@ class ObjectStoreBackend(StorageBackend):
         except (PermissionDeniedError, UnauthenticatedError) as e:
             self._reraise_if_auth(e, operation="download")
             raise
+        if meta.get("last_modified"):
+            self._modified[key] = meta["last_modified"]
         return int(meta["size"])
+
+    def modified_time(self, key: str) -> datetime | None:
+        return self._modified.get(key)
 
     @contextmanager
     def open_metadata_view(self, key: str) -> Iterator[MetadataView]:
@@ -313,6 +373,32 @@ class ObjectStoreBackend(StorageBackend):
             # download below retries with backoff, so prefer it over failing.
             logger.debug(f"Sparse read of {key} failed ({e}); downloading it in full.")
         return None
+
+    def _folder_index(self, folder: str) -> dict[str, str]:
+        if self._listing and (folder + "/").startswith(self._prefix + "/"):
+            if not self._listing_indexed:
+                # Every folder under the prefix in one pass over the listing.
+                for k in self._listing:
+                    parent = PurePosixPath(k).parent.as_posix()
+                    self._folders.setdefault(parent, {})[k.lower()] = k
+                self._listing_indexed = True
+            return self._folders.get(folder, {})
+        if folder not in self._folders:
+            try:
+                listed = obstore.list_with_delimiter(self._store, folder or None)
+            except (PermissionDeniedError, UnauthenticatedError) as e:
+                self._reraise_if_auth(e, operation="list")
+                raise
+            self._folders[folder] = {obj["path"].lower(): obj["path"] for obj in listed["objects"]}
+        return self._folders[folder]
+
+    def read_text(self, key: str, max_bytes: int = 1024 * 1024) -> str:
+        try:
+            data = bytes(obstore.get(self._store, key).bytes())[:max_bytes]
+        except (PermissionDeniedError, UnauthenticatedError) as e:
+            self._reraise_if_auth(e, operation="download")
+            raise
+        return data.decode("utf-8", errors="replace")
 
     @contextmanager
     def open_local(self, key: str) -> Iterator[str]:

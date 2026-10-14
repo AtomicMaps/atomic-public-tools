@@ -299,6 +299,9 @@ def _backend(monkeypatch, root: Path) -> ObjectStoreBackend:
     backend._store = LocalStore(prefix=str(root))
     backend._single_key, backend._single_size = None, 0
     backend._listing = None
+    backend._folders = {}
+    backend._modified = {}
+    backend._listing_indexed = False
     return backend
 
 

@@ -279,4 +279,7 @@ def _object_backend(monkeypatch, root, prefix):
     backend._scheme, backend._bucket, backend._prefix = "s3", "bucket", prefix
     backend._store = LocalStore(prefix=str(root))
     backend._single_key, backend._single_size, backend._listing = None, 0, None
+    backend._folders = {}
+    backend._modified = {}
+    backend._listing_indexed = False
     return backend

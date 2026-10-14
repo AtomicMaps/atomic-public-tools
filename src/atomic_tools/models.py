@@ -34,6 +34,7 @@ class Summary(BaseModel):
     crs_failures: int
     skipped_vector: int
     unclassified: int
+    skipped_unsupported: int = 0
 
 
 class MissingData(BaseModel):
@@ -74,10 +75,19 @@ class CocoDetails(BaseModel):
     verdicts: list[CocoVerdict]
 
 
+class SkippedFile(BaseModel):
+    file: str
+    reason: str
+
+
 class Details(BaseModel):
     crs_failures: list[str]
     skipped_vector: list[str]
-    unclassified: list[str]
+    unclassified: list[str] = Field(description="Files that matched no data type.")
+    skipped_unsupported: list[SkippedFile] = Field(
+        default_factory=list,
+        description="Recognized files Flow can't process yet (e.g. Gaussian splats, .zlas).",
+    )
     coco: CocoDetails | None = None
 
 
@@ -114,12 +124,18 @@ class ToolStatus(BaseModel):
     detail: str | None = Field(
         default=None, description="Why the tool is unavailable, when it isn't."
     )
+    optional: bool = Field(
+        default=False, description="Validation still runs without it, with less detail."
+    )
 
 
 class DependencyReport(BaseModel):
-    """``ok`` is true when every tool is usable."""
+    """``ok`` is true when every required (non-optional) tool is usable."""
 
     ok: bool
     exiftool: ToolStatus
     pdal: ToolStatus
     pye57: ToolStatus
+    ecw: ToolStatus = Field(
+        description="GDAL with its ECW driver, used to read .ecw headers."
+    )
