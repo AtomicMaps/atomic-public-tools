@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from collections.abc import Sequence
 from pathlib import Path
 
 import pandas as pd
@@ -197,10 +198,6 @@ def _lint_loaded_df(
     # honouring the optional `data_type` filter. DEFAULT and unclassifiable rows
     # map to None and are excluded from per-type checks.
     row_types = _row_types(df, data_type, default_row_idx, report)
-    if df.shape[1]:
-        report.checked_files = [
-            str(df.iat[idx, 0]).strip() for idx, t in row_types.items() if t is not None
-        ]
     detected_types = list(dict.fromkeys(t for t in row_types.values() if t is not None))
     multi = len(detected_types) > 1
 
@@ -456,13 +453,12 @@ def _check_required_columns(
     report: LintReport,
     type_label: str | None = None,
     soft: frozenset[str] = frozenset(),
-    files: list[str] | None = None,
+    files: Sequence[str] = (),
 ) -> None:
     """``soft`` columns only warn when absent (ECW bounds Flow reads itself).
 
     ``files`` are the rows a missing column affects (this type's rows).
     """
-    files = files or []
     suffix = f" ({type_label})" if type_label else ""
     for group in required_groups:
         if not any(field in columns_set for field in group):
@@ -490,7 +486,7 @@ def _check_optional_columns(
     columns_set: set[str],
     report: LintReport,
     type_label: str | None = None,
-    files: list[str] | None = None,
+    files: Sequence[str] = (),
 ) -> None:
     """Warn (don't error) when an optional column group is entirely absent.
 
@@ -509,7 +505,7 @@ def _check_optional_columns(
                     "Images missing orientation (Pitch/Heading/Roll) will appear in "
                     "Lens without orientation but still process successfully."
                 ),
-                files=files or [],
+                files=files,
             )
 
 
@@ -679,7 +675,7 @@ def _check_value_formats(
     columns: list[str],
     default_row_idx: int | None,
     report: LintReport,
-    row_types: dict[int, DataTypeEnum | None] | None = None,
+    row_types: dict[int, DataTypeEnum | None],
 ) -> None:
     file_col = columns[0] if columns else None
     file_col_series = df[file_col].astype(str).str.strip() if file_col else None
@@ -698,7 +694,9 @@ def _check_value_formats(
                 continue
             if idx == default_row_idx:
                 label = DEFAULT_ROW_NAME
-                files = _rows_inheriting_default(df, col, default_row_idx, row_types or {})
+                files = _rows_inheriting_default(
+                    df, col, default_row_idx, row_types, file_col_series
+                )
             else:
                 fname = file_col_series[idx] if file_col_series is not None else ""
                 label = f"row {idx} ({fname!r})" if fname else f"row {idx}"
@@ -712,33 +710,34 @@ def _check_value_formats(
     _check_bounds_consistency(df, columns, report)
 
 
+# Field (canonical or alias) → the data types that list it.
+_TYPES_BY_FIELD: dict[str, set[DataTypeEnum]] = defaultdict(set)
+for _type, _groups in ALL_SIDECAR_FIELD_GROUPS_FULL.items():
+    for _group in _groups:
+        for _field in _group:
+            _TYPES_BY_FIELD[_field].add(DataTypeEnum(_type))
+
+
 def _rows_inheriting_default(
     df: pd.DataFrame,
     col: str,
     default_row_idx: int,
     row_types: dict[int, DataTypeEnum | None],
+    names: pd.Series | None,
 ) -> list[str]:
-    """Filenames of the rows that take ``col`` from DEFAULT.
+    """Filenames (from ``names``) of the rows that take ``col`` from DEFAULT.
 
     A row inherits it when its own cell is blank and ``col`` is one of its
     type's fields (a column no type lists, e.g. ``fallback_srs``, applies to all).
     """
-    def fields(t: DataTypeEnum) -> set[str]:
-        return {f for group in ALL_SIDECAR_FIELD_GROUPS_FULL.get(t, []) for f in group}
-
-    typed = {t for t in row_types.values() if t is not None}
-    users = {t for t in typed if col in fields(t)}
-    listed_anywhere = any(
-        col in group for groups in ALL_SIDECAR_FIELD_GROUPS_FULL.values() for group in groups
-    )
-    file_col = df.columns[0]
-    return [
-        str(row[file_col]).strip()
-        for idx, row in df.iterrows()
-        if idx != default_row_idx
-        and not has_value(row[col])
-        and (not listed_anywhere or row_types.get(int(idx)) in users)
-    ]
+    if names is None:
+        return []
+    mask = ~df[col].map(has_value)
+    mask[default_row_idx] = False
+    users = _TYPES_BY_FIELD.get(col)
+    if users:
+        mask &= pd.Series(row_types, dtype=object).reindex(df.index).isin(users)
+    return names[mask].tolist()
 
 
 def _check_bounds_consistency(

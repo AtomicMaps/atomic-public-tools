@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import csv
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
 import click
@@ -54,8 +54,8 @@ class MissingDataReport:
     # ``coco_status`` (tier) and ``coco_labels`` (annotation count) cell, and
     # the CSV grows two matching columns.
     include_coco: bool = False
-    # Filename → data type value for every typed row (rows added from COCO
-    # alone have none).
+    # Filename → data type value for every typed row, i.e. every row the
+    # per-type checks ran on (rows added from COCO alone have none).
     row_types: dict[str, str] = field(default_factory=dict)
 
     def is_empty(self) -> bool:
@@ -98,9 +98,6 @@ class LintReport:
     # Populated by the sidecar linter when a datatype (and thus a set of
     # required fields) is known. None when there's nothing to tabulate.
     missing_data: MissingDataReport | None = None
-    # Filenames of the rows the per-type checks ran on (typed, non-DEFAULT).
-    # None when the linter never got that far (e.g. an unreadable sidecar).
-    checked_files: list[str] | None = None
     # Populated when a COCO file is supplied (image datatypes only).
     coco_impact: CocoImpact | None = None
 
@@ -146,12 +143,16 @@ class LintReport:
     def exit_code(self) -> int:
         return 1 if self.has_errors() else 0
 
+    def api_findings(self) -> list[LintFinding]:
+        """The findings the API reports: all but the ``cli_only`` ones."""
+        return [f for f in self.findings if not f.cli_only]
+
     def findings_as_dicts(self) -> list[dict]:
-        """API-facing findings: drops ``cli_only`` ones and the internal fields."""
+        """:meth:`api_findings` as dicts, without the internal fields."""
         return [
-            {k: v for k, v in asdict(f).items() if k not in ("cli_only", "files")}
-            for f in self.findings
-            if not f.cli_only
+            {"level": f.level, "message": f.message, "fix_hint": f.fix_hint,
+             "location": f.location}
+            for f in self.api_findings()
         ]
 
     def render(self) -> str:

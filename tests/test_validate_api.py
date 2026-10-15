@@ -369,7 +369,9 @@ def test_bad_default_value_names_only_the_rows_that_inherit_it():
 
 def test_files_section_skips_untyped_rows_and_lists_rowless_files(stubbed, tmp_path):
     report = stubbed["report"]
-    report.checked_files = ["a.jpg"]  # b.jpg was untyped, so never checked
+    report.missing_data = MissingDataReport(  # b.jpg was untyped, so never checked
+        filename_column="Filename", field_columns=[], row_types={"a.jpg": "oriented_image"}
+    )
     report.add_error("no sidecar row", files=["extra/c.jpg"])
 
     files = validate_path(str(tmp_path))["files"]

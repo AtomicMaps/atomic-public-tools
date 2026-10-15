@@ -67,7 +67,8 @@ SECTIONS: tuple[str, ...] = ("findings", "missing_data", "metadata", "details", 
 # metadata is opt-in: one dict per file gets large.
 DEFAULT_SECTIONS: frozenset[str] = frozenset({"findings", "missing_data", "details", "files"})
 
-# Some findings embed click colours (e.g. the geography histogram).
+# Safety net: findings are plain text today, but a click-coloured one must not
+# leak escape codes into JSON.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
@@ -217,17 +218,11 @@ def file_results(result: ValidationResult) -> dict[str, Any]:
     names (e.g. an input file with no sidecar row). Rows skipped as untyped are
     left out unless a finding names them.
     """
-    checked = result.report.checked_files
-    if checked is None:
-        df = result.df
-        checked = [
-            str(name).strip()
-            for name in (df[df.columns[0]] if df.shape[1] else [])
-            if str(name).strip() != DEFAULT_ROW_NAME
-        ]
+    missing_data = result.report.missing_data
+    checked = missing_data.row_types if missing_data is not None else {}
     failed = set(result.crs_failures)
     warned: set[str] = set()
-    for finding in result.report.findings:
+    for finding in result.report.api_findings():
         if finding.level == "error":
             failed.update(finding.files)
         elif finding.level == "warning":
@@ -249,6 +244,7 @@ def build_payload(result: ValidationResult, include: Iterable[str]) -> Validatio
     """Serialise a :class:`ValidationResult` to the response model."""
     include = set(include)
     report = result.report
+    findings = report.api_findings()
     df = result.df
     filenames = df["Filename"].astype(str) if "Filename" in df.columns else None
     files_scanned = (
@@ -260,9 +256,9 @@ def build_payload(result: ValidationResult, include: Iterable[str]) -> Validatio
         "schema_version": SCHEMA_VERSION,
         "status": result.status,
         "summary": {
-            "errors": len(report.errors()),
-            "warnings": len(report.warnings()),
-            "infos": sum(not f.cli_only for f in report.infos()),
+            "errors": sum(f.level == "error" for f in findings),
+            "warnings": sum(f.level == "warning" for f in findings),
+            "infos": sum(f.level == "info" for f in findings),
             "files_scanned": files_scanned,
             "detected_types": sorted(t.value for t in result.detected_types),
             "crs_failures": len(result.crs_failures),
