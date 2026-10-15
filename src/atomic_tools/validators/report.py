@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Literal
 
@@ -28,6 +29,12 @@ class LintFinding:
     message: str
     fix_hint: str | None = None
     location: str | None = None
+    # Terminal-only output (e.g. the geography histograms); omitted from the
+    # API response.
+    cli_only: bool = False
+    # Sidecar Filename labels of the rows this finding is about; empty for a
+    # batch-level finding. Feeds the API's per-file pass/fail lists.
+    files: tuple[str, ...] = ()
 
 
 @dataclass
@@ -46,6 +53,9 @@ class MissingDataReport:
     # ``coco_status`` (tier) and ``coco_labels`` (annotation count) cell, and
     # the CSV grows two matching columns.
     include_coco: bool = False
+    # Filename → data type value for every typed row (rows added from COCO
+    # alone have none).
+    row_types: dict[str, str] = field(default_factory=dict)
 
     def is_empty(self) -> bool:
         return not self.rows
@@ -59,16 +69,26 @@ class MissingDataReport:
             writer.writeheader()
             writer.writerows(self.rows)
 
-    def to_dict(self) -> dict:
-        columns = [self.filename_column, *self.field_columns]
-        if self.include_coco:
-            columns += [COCO_STATUS_COLUMN, COCO_LABELS_COLUMN]
-        return {
-            "filename_column": self.filename_column,
-            "field_columns": list(self.field_columns),
-            "columns": columns,
-            "rows": [{col: row.get(col, "") for col in columns} for row in self.rows],
-        }
+    def to_dict(self, keys_by_name: dict[str, str] | None = None) -> dict:
+        """``{data_type: [{"file", "missing", ...}]}`` naming only missing fields.
+
+        ``keys_by_name`` maps a Filename to the path to report (default: as is).
+        Rows with no data type (COCO images with no sidecar row) go under
+        ``"unknown"``.
+        """
+        keys_by_name = keys_by_name or {}
+        grouped: dict[str, list[dict]] = {}
+        for row in self.rows:
+            name = row.get(self.filename_column, "")
+            entry: dict = {
+                "file": keys_by_name.get(name, name),
+                "missing": [c for c in self.field_columns if row.get(c) == MISSING_MARKER],
+            }
+            if self.include_coco:
+                entry["coco_status"] = row.get(COCO_STATUS_COLUMN, "")
+                entry["coco_labels"] = int(row.get(COCO_LABELS_COLUMN) or 0)
+            grouped.setdefault(self.row_types.get(name, "unknown"), []).append(entry)
+        return grouped
 
 
 @dataclass
@@ -86,8 +106,11 @@ class LintReport:
         *,
         fix_hint: str | None = None,
         location: str | None = None,
+        files: Iterable[str] = (),
     ) -> None:
-        self.findings.append(LintFinding("error", message, fix_hint, location))
+        self.findings.append(
+            LintFinding("error", message, fix_hint, location, files=tuple(files))
+        )
 
     def add_warning(
         self,
@@ -95,11 +118,14 @@ class LintReport:
         *,
         fix_hint: str | None = None,
         location: str | None = None,
+        files: Iterable[str] = (),
     ) -> None:
-        self.findings.append(LintFinding("warning", message, fix_hint, location))
+        self.findings.append(
+            LintFinding("warning", message, fix_hint, location, files=tuple(files))
+        )
 
-    def add_info(self, message: str) -> None:
-        self.findings.append(LintFinding("info", message))
+    def add_info(self, message: str, *, cli_only: bool = False) -> None:
+        self.findings.append(LintFinding("info", message, cli_only=cli_only))
 
     def errors(self) -> list[LintFinding]:
         return [f for f in self.findings if f.level == "error"]
@@ -117,7 +143,12 @@ class LintReport:
         return 1 if self.has_errors() else 0
 
     def findings_as_dicts(self) -> list[dict]:
-        return [asdict(f) for f in self.findings]
+        """API-facing findings: drops ``cli_only`` ones and the internal fields."""
+        return [
+            {k: v for k, v in asdict(f).items() if k not in ("cli_only", "files")}
+            for f in self.findings
+            if not f.cli_only
+        ]
 
     def render(self) -> str:
         lines: list[str] = []

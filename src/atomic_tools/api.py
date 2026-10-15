@@ -63,9 +63,9 @@ __all__ = [
     "validate_upload",
 ]
 
-SECTIONS: tuple[str, ...] = ("findings", "missing_data", "metadata", "details")
+SECTIONS: tuple[str, ...] = ("findings", "missing_data", "metadata", "details", "files")
 # metadata is opt-in: one dict per file gets large.
-DEFAULT_SECTIONS: frozenset[str] = frozenset({"findings", "missing_data", "details"})
+DEFAULT_SECTIONS: frozenset[str] = frozenset({"findings", "missing_data", "details", "files"})
 
 # Some findings embed click colours (e.g. the geography histogram).
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -85,6 +85,8 @@ class ValidationResult:
     unclassified: list[str] = field(default_factory=list)
     skipped_unsupported: list[tuple[str, str]] = field(default_factory=list)
     files_total: int | None = None  # set when --limit/--sample dropped files
+    # Sidecar Filename label → source key.
+    keys_by_label: dict[str, str] = field(default_factory=dict)
 
     @property
     def failed(self) -> bool:
@@ -156,6 +158,7 @@ def run_validation(
     unclassified: list[str] = []
     unsupported: list[tuple[str, str]] = []
     selection: list[tuple[int, int]] = []
+    keys_by_label: dict[str, str] = {}
     df, backend, detected_types, skipped_vector = _build_sidecar(
         directory=path,
         data_type=data_type,
@@ -171,6 +174,7 @@ def run_validation(
         sample=sample,
         seed=seed,
         selection_out=selection,
+        labels_out=keys_by_label,
     )
     df = _as_csv_strings(df)
     crs_failures = _crs_failures(df)
@@ -202,7 +206,34 @@ def run_validation(
         unclassified=unclassified,
         skipped_unsupported=unsupported,
         files_total=selection[0][1] if selection else None,
+        keys_by_label=keys_by_label,
     )
+
+
+def file_results(result: ValidationResult) -> dict[str, Any]:
+    """Sort every checked file into passed / passed_with_warnings / failed."""
+    df = result.df
+    labels = [
+        str(name).strip()
+        for name in (df[df.columns[0]] if df.shape[1] else [])
+        if str(name).strip() != DEFAULT_ROW_NAME
+    ]
+    failed = set(result.crs_failures)
+    warned: set[str] = set()
+    for finding in result.report.findings:
+        if finding.level == "error":
+            failed.update(finding.files)
+        elif finding.level == "warning":
+            warned.update(finding.files)
+
+    def keys(names: Iterable[str]) -> list[str]:
+        return sorted(result.keys_by_label.get(n, n) for n in names)
+
+    return {
+        "passed": keys(n for n in labels if n not in failed and n not in warned),
+        "passed_with_warnings": keys(n for n in labels if n in warned and n not in failed),
+        "failed": keys(n for n in labels if n in failed),
+    }
 
 
 def build_payload(result: ValidationResult, include: Iterable[str]) -> ValidationResponse:
@@ -222,7 +253,7 @@ def build_payload(result: ValidationResult, include: Iterable[str]) -> Validatio
         "summary": {
             "errors": len(report.errors()),
             "warnings": len(report.warnings()),
-            "infos": len(report.infos()),
+            "infos": sum(not f.cli_only for f in report.infos()),
             "files_scanned": files_scanned,
             "detected_types": sorted(t.value for t in result.detected_types),
             "crs_failures": len(result.crs_failures),
@@ -240,7 +271,9 @@ def build_payload(result: ValidationResult, include: Iterable[str]) -> Validatio
         ]
     if "missing_data" in include:
         fields["missing_data"] = (
-            report.missing_data.to_dict() if report.missing_data is not None else None
+            report.missing_data.to_dict(result.keys_by_label)
+            if report.missing_data is not None
+            else None
         )
     if "metadata" in include:
         fields["metadata"] = df.to_dict(orient="records")
@@ -254,6 +287,8 @@ def build_payload(result: ValidationResult, include: Iterable[str]) -> Validatio
             ],
             "coco": report.coco_impact.to_dict() if report.coco_impact else None,
         }
+    if "files" in include:
+        fields["files"] = file_results(result)
     return ValidationResponse.model_validate(fields)
 
 

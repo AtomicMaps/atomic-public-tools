@@ -417,7 +417,8 @@ def test_unrequested_sections_are_unset(tmp_path, patched_extractors):  # noqa: 
     assert response.model_fields_set >= {"schema_version", "status", "summary", "error"}
     assert "metadata" not in response.to_json_dict()
     assert set(response.to_json_dict()) == {
-        "schema_version", "status", "summary", "findings", "missing_data", "details", "error",
+        "schema_version", "status", "summary", "findings", "missing_data", "details",
+        "files", "error",
     }
 
 

@@ -1189,6 +1189,7 @@ def _build_sidecar(
     sample: int | None = None,
     seed: int | None = None,
     selection_out: list[tuple[int, int]] | None = None,
+    labels_out: dict[str, str] | None = None,
 ) -> tuple["object", StorageBackend, set[DataTypeEnum], list[str]]:
     """Scan a directory, extract metadata, and assemble the sidecar DataFrame.
 
@@ -1217,7 +1218,8 @@ def _build_sidecar(
     ``limit`` keeps the first N files by path; ``sample`` keeps N random files
     per (filename-detected) data type, reproducibly for a given ``seed``. Neither
     applies to a single-file path. ``selection_out`` receives
-    ``(selected, total)`` when that dropped any files.
+    ``(selected, total)`` when that dropped any files. ``labels_out`` maps each
+    sidecar Filename label to its source key.
     """
     check_selection_args(limit, sample, seed)
     if spatial_reference:
@@ -1317,6 +1319,8 @@ def _build_sidecar(
             if selection_out is not None:
                 selection_out.append((len(types_by_key), listed))
 
+    if labels_out is not None:
+        labels_out.update({label: key for key, label in display_labels.items()})
     supported_keys = list(types_by_key)
     total = len(supported_keys)
     logger.info(f"Found {total} file(s) to process in {backend.display_root}.")

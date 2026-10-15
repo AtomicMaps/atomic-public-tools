@@ -193,7 +193,11 @@ am-tools validate --path s3://bucket/prefix/IMG_0001.jpg --api-mode
 am-tools validate --path ./data --api-mode --include findings,metadata
 ```
 
-`--include` picks which sections come back: `findings`, `missing_data`, `metadata`, `details` or `all`. The default is `findings,missing_data,details`; `metadata`, which has every extracted field for every file, is opt-in because it can be large. `schema_version`, `status`, `summary` and `error` are always present. `summary.files_total` appears only when `--limit` or `--sample` left files out; it is how many files there were before the cut. `validate_path` takes the same `limit`, `sample` and `seed` keyword arguments.
+`--include` picks which sections come back: `findings`, `missing_data`, `metadata`, `details`, `files` or `all`. The default is `findings,missing_data,details,files`; `metadata`, which has every extracted field for every file, is opt-in because it can be large. `schema_version`, `status`, `summary` and `error` are always present. `summary.files_total` appears only when `--limit` or `--sample` left files out; it is how many files there were before the cut. `validate_path` takes the same `limit`, `sample` and `seed` keyword arguments.
+
+`files` sorts every checked file by outcome into `passed`, `passed_with_warnings` and `failed`, each a list of paths. A file is `failed` when an error names it and `passed_with_warnings` when only warnings do. Batch-level findings name no file, so they can fail the run while every file is still listed as `passed`.
+
+`missing_data` lists, per data type, each file that is missing required fields and only the fields it is missing. With `--coco`, each entry also has `coco_status` and `coco_labels`, and COCO images with no sidecar row are listed under `unknown`.
 
 ```json
 {
@@ -203,10 +207,10 @@ am-tools validate --path ./data --api-mode --include findings,metadata
               "detected_types": ["oriented_image"], "crs_failures": 0,
               "skipped_vector": 0, "unclassified": 0, "files_total": 1240},
   "findings": [{"level": "warning", "message": "...", "fix_hint": "...", "location": null}],
-  "missing_data": {"filename_column": "Filename", "field_columns": ["..."], "columns": ["..."],
-                   "rows": [{"Filename": "b.jpg", "GPSLatitude": "MISSING"}]},
+  "missing_data": {"oriented_image": [{"file": "b.jpg", "missing": ["GPSLatitude", "Pitch"]}]},
   "metadata": [{"Filename": "DEFAULT", "DataType": "", "...": "..."}],
   "details": {"crs_failures": [], "skipped_vector": [], "unclassified": [], "coco": null},
+  "files": {"passed": ["a.jpg"], "passed_with_warnings": [], "failed": ["b.jpg"]},
   "error": null
 }
 ```

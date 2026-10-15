@@ -40,13 +40,14 @@ class Summary(BaseModel):
     files_total: int | None = None
 
 
-class MissingData(BaseModel):
-    """Per-file table of missing required fields (``"MISSING"`` or ``""``)."""
+class MissingFile(BaseModel):
+    """One file's missing required fields (``missing_data`` groups these by data type)."""
 
-    filename_column: str
-    field_columns: list[str]
-    columns: list[str]
-    rows: list[dict[str, str]]
+    file: str
+    missing: list[str]
+    # Set only when a COCO file was supplied.
+    coco_status: str | None = None
+    coco_labels: int | None = None
 
 
 class CocoTier(BaseModel):
@@ -83,6 +84,21 @@ class SkippedFile(BaseModel):
     reason: str
 
 
+class FileResults(BaseModel):
+    """Every checked file, by outcome. Paths are as in ``details``, which lists
+    the files that weren't checked.
+
+    A file is ``failed`` when an error names it, ``passed_with_warnings`` when
+    only warnings do. Batch-level findings (e.g. an unreadable COCO file) name
+    no file, so they set ``status`` without moving any file out of ``passed``.
+    Telemetry paired with a video is part of that video and isn't listed.
+    """
+
+    passed: list[str]
+    passed_with_warnings: list[str]
+    failed: list[str]
+
+
 class Details(BaseModel):
     crs_failures: list[str]
     skipped_vector: list[str]
@@ -106,11 +122,18 @@ class ValidationResponse(BaseModel):
     status: Status
     summary: Summary | None = None
     findings: list[Finding] | None = None
-    missing_data: MissingData | None = None
+    missing_data: dict[str, list[MissingFile]] | None = Field(
+        default=None,
+        description=(
+            "Files missing required fields, keyed by data type ('unknown' for COCO "
+            "images with no sidecar row)."
+        ),
+    )
     metadata: list[dict[str, str]] | None = Field(
         default=None, description="One dict per sidecar row (all values strings)."
     )
     details: Details | None = None
+    files: FileResults | None = None
     error: ErrorInfo | None = None
 
     def to_json_dict(self) -> dict[str, Any]:

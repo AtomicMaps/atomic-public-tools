@@ -98,6 +98,7 @@ def test_api_mode_failed_lint_still_exits_zero(stubbed, tmp_path):
         filename_column="Filename",
         field_columns=["GPSLatitude"],
         rows=[{"Filename": "b.jpg", "GPSLatitude": "MISSING"}],
+        row_types={"b.jpg": "oriented_image"},
     )
     stubbed["report"] = report
 
@@ -113,7 +114,63 @@ def test_api_mode_failed_lint_still_exits_zero(stubbed, tmp_path):
         "fix_hint": "fix it",
         "location": "row 2",
     }
-    assert payload["missing_data"]["rows"] == [{"Filename": "b.jpg", "GPSLatitude": "MISSING"}]
+    assert payload["missing_data"] == {
+        "oriented_image": [{"file": "b.jpg", "missing": ["GPSLatitude"]}]
+    }
+
+
+def test_missing_data_lists_only_missing_fields_by_type():
+    table = MissingDataReport(
+        filename_column="Filename",
+        field_columns=["CreateDate", "GPSLatitude", "Pitch"],
+        rows=[
+            {"Filename": "v.avi", "CreateDate": "MISSING", "GPSLatitude": "", "Pitch": ""},
+            {"Filename": "p.jpg", "CreateDate": "", "GPSLatitude": "MISSING", "Pitch": "MISSING"},
+            # Added from COCO alone: no sidecar row, so no type.
+            {"Filename": "gone.jpg", "coco_status": "not_on_disk", "coco_labels": "3"},
+        ],
+        include_coco=True,
+        row_types={"v.avi": "full_motion_video", "p.jpg": "oriented_image"},
+    )
+    table.rows[0].update(coco_status="ok", coco_labels="0")
+    table.rows[1].update(coco_status="unusable", coco_labels="2")
+    assert table.to_dict({"p.jpg": "imgs/p.jpg"}) == {
+        "full_motion_video": [
+            {"file": "v.avi", "missing": ["CreateDate"], "coco_status": "ok", "coco_labels": 0}
+        ],
+        "oriented_image": [
+            {
+                "file": "imgs/p.jpg",
+                "missing": ["GPSLatitude", "Pitch"],
+                "coco_status": "unusable",
+                "coco_labels": 2,
+            }
+        ],
+        "unknown": [
+            {"file": "gone.jpg", "missing": [], "coco_status": "not_on_disk", "coco_labels": 3}
+        ],
+    }
+
+
+def test_api_mode_omits_cli_only_findings(stubbed, tmp_path):
+    stubbed["report"].add_info("Batch center (median): ...\n  [0 - 1] mi  1", cli_only=True)
+    stubbed["report"].add_info("kept")
+
+    payload = _json(_invoke("--path", str(tmp_path), "--api-mode"))
+    assert [f["message"] for f in payload["findings"]] == ["kept"]
+    assert payload["summary"]["infos"] == 1
+
+
+def test_files_section_sorts_files_by_outcome(stubbed, tmp_path):
+    stubbed["report"].add_error("missing lat", files=["b.jpg"])
+    stubbed["report"].add_warning("far away", files=["a.jpg", "b.jpg"])
+    stubbed["report"].add_error("batch-level, names no file")
+
+    files = validate_path(str(tmp_path))["files"]
+    assert files["passed"] == []
+    assert files["passed_with_warnings"] == ["a.jpg"]
+    assert files["failed"] == ["b.jpg"]  # an error outranks a warning
+    assert "skipped" not in files
 
 
 def test_api_mode_warnings_only_status(stubbed, tmp_path):
@@ -277,6 +334,22 @@ def test_validate_path_end_to_end(tmp_path, patched_extractors):  # noqa: F811
     names = {row["Filename"] for row in payload["metadata"]}
     assert {"DEFAULT", "a.jpg", "b.las", "c.mp4"} <= names
     assert any(k.endswith("d.geojson") for k in payload["details"]["skipped_vector"])
+
+
+def test_validate_path_files_end_to_end(tmp_path, patched_extractors):  # noqa: F811
+    _make_mixed_dir(tmp_path)
+    files = validate_path(str(tmp_path), limit=2)["files"]
+
+    checked = files["passed"] + files["passed_with_warnings"] + files["failed"]
+    # Keys as in ``details`` (relative to the scanned folder), only the files
+    # the limit kept.
+    assert sorted(checked) == ["a.jpg", "b.las"]
+
+
+def test_missing_required_value_names_the_row():
+    report = lint_sidecar_df(_df(), final=True, data_type=None, input_files_path=None)
+    missing = [f for f in report.errors() if "'GPSLatitude'" in f.message]
+    assert [f.files for f in missing] == [("b.jpg",)]
 
 
 # ---- in-memory lint parity ---------------------------------------------------

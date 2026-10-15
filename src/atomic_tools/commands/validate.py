@@ -217,8 +217,8 @@ def validate(
             "--include",
             help=(
                 "With --api-mode: comma-separated JSON sections to return — "
-                "findings, missing_data, metadata, details, or 'all'. "
-                "Default: findings,missing_data,details."
+                "findings, missing_data, metadata, details, files, or 'all'. "
+                "Default: findings,missing_data,details,files."
             ),
         ),
     ] = None,

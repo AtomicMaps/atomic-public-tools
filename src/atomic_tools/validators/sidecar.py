@@ -233,12 +233,20 @@ def _lint_loaded_df(
             ]
             if has_rows:
                 # Column-presence errors apply only to a type that has rows.
-                names = type_rows[df.columns[0]].astype(str).str.strip().str.lower()
+                names = type_rows[df.columns[0]].astype(str).str.strip()
                 _check_required_columns(
                     required_groups, columns_set, report, type_label=label,
-                    soft=ECW_HEADER_FIELDS if names.str.endswith(".ecw").all() else frozenset(),
+                    soft=(
+                        ECW_HEADER_FIELDS
+                        if names.str.lower().str.endswith(".ecw").all()
+                        else frozenset()
+                    ),
+                    files=names.tolist(),
                 )
-                _check_optional_columns(optional_groups, columns_set, report, type_label=label)
+                _check_optional_columns(
+                    optional_groups, columns_set, report, type_label=label,
+                    files=names.tolist(),
+                )
             sat = _check_required_values(
                 df, type_rows, required_groups, columns_set, default_row_idx, report,
                 type_label=label,
@@ -385,6 +393,7 @@ def _row_types(
             f"Row {idx} ({fname!r}) has unrecognized DataType {raw!r}; "
             "skipped for required-field checks.",
             fix_hint=f"Use one of: {[t.value for t in DataTypeEnum]}, or leave it blank.",
+            files=[fname],
         )
     if uninferable:
         sample = uninferable[:MAX_LISTED_FILES]
@@ -443,8 +452,13 @@ def _check_required_columns(
     report: LintReport,
     type_label: str | None = None,
     soft: frozenset[str] = frozenset(),
+    files: list[str] | None = None,
 ) -> None:
-    """``soft`` columns only warn when absent (ECW bounds Flow reads itself)."""
+    """``soft`` columns only warn when absent (ECW bounds Flow reads itself).
+
+    ``files`` are the rows a missing column affects (this type's rows).
+    """
+    files = files or []
     suffix = f" ({type_label})" if type_label else ""
     for group in required_groups:
         if not any(field in columns_set for field in group):
@@ -457,11 +471,13 @@ def _check_required_columns(
                         "Install GDAL with the ECW driver to read ECW headers here; "
                         "Flow reads them itself during intake."
                     ),
+                    files=files,
                 )
                 continue
             report.add_error(
                 f"Required column for {canonical!r}{suffix} is missing.",
                 fix_hint=f"Add a column named {canonical!r} (accepted aliases: {aliases}).",
+                files=files,
             )
 
 
@@ -470,6 +486,7 @@ def _check_optional_columns(
     columns_set: set[str],
     report: LintReport,
     type_label: str | None = None,
+    files: list[str] | None = None,
 ) -> None:
     """Warn (don't error) when an optional column group is entirely absent.
 
@@ -488,6 +505,7 @@ def _check_optional_columns(
                     "Images missing orientation (Pitch/Heading/Roll) will appear in "
                     "Lens without orientation but still process successfully."
                 ),
+                files=files or [],
             )
 
 
@@ -547,6 +565,7 @@ def _check_required_values(
                     "Install GDAL with the ECW driver to read ECW headers here; "
                     "Flow reads them itself during intake."
                 ),
+                files=[name for _, name in ecw_rows],
             )
         if missing_rows:
             sample = missing_rows[:MAX_LISTED_FILES]
@@ -562,6 +581,7 @@ def _check_required_values(
                 fix_hint=(
                     f"Either fill {canonical!r} on the listed rows or set a value in DEFAULT."
                 ),
+                files=[name for _, name in missing_rows],
             )
 
     return default_satisfied
@@ -616,6 +636,7 @@ def _build_missing_data_report(
         }
 
     rows: list[dict[str, str]] = []
+    types_by_name: dict[str, str] = {}
     for idx, row in df.iterrows():
         idx = int(idx)
         detected = row_types.get(idx)
@@ -623,7 +644,9 @@ def _build_missing_data_report(
             continue
         present = present_by_type[detected]
         default_covers = default_covers_by_type[detected]
-        record: dict[str, str] = {str(file_col): str(row[file_col]).strip()}
+        name = str(row[file_col]).strip()
+        types_by_name[name] = detected.value
+        record: dict[str, str] = {str(file_col): name}
         any_missing = False
         for canonical in field_columns:
             if canonical not in present:
@@ -643,6 +666,7 @@ def _build_missing_data_report(
         filename_column=str(file_col),
         field_columns=field_columns,
         rows=rows,
+        row_types=types_by_name,
     )
 
 
@@ -654,6 +678,12 @@ def _check_value_formats(
 ) -> None:
     file_col = columns[0] if columns else None
     file_col_series = df[file_col].astype(str).str.strip() if file_col else None
+    # A bad DEFAULT value is inherited by every file row.
+    all_files = (
+        [n for i, n in file_col_series.items() if i != default_row_idx]
+        if file_col_series is not None
+        else []
+    )
     for col in columns:
         validator = VALIDATORS.get(col)
         if validator is None:
@@ -669,12 +699,15 @@ def _check_value_formats(
                 continue
             if idx == default_row_idx:
                 label = DEFAULT_ROW_NAME
+                files = all_files
             else:
                 fname = file_col_series[idx] if file_col_series is not None else ""
                 label = f"row {idx} ({fname!r})" if fname else f"row {idx}"
+                files = [fname] if fname else []
             report.add_error(
                 f"{col}: {err}",
                 location=f"{label}, col {col!r}",
+                files=files,
             )
 
     _check_bounds_consistency(df, columns, report)
@@ -710,6 +743,7 @@ def _check_bounds_consistency(
                     f"{min_col} ({mn}) > {max_col} ({mx}).",
                     location=f"{label}",
                     fix_hint="Swap min/max for this axis.",
+                    files=[fname] if fname else [],
                 )
 
 
