@@ -111,6 +111,12 @@ def test_validate_passes_through_optional_args(captured_lint, tmp_path):
     assert captured_lint["build_kwargs"]["spatial_reference"] == "EPSG:32612"
 
 
+def test_validate_requires_orientation_by_default(captured_lint, tmp_path):
+    result = runner.invoke(app, ["validate", "--path", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    assert captured_lint["lint_kwargs"]["ignore_missing_orientation"] is False
+
+
 def test_validate_writes_no_sidecar(captured_lint, tmp_path):
     """The sidecar is linted in memory; the input directory is never written to."""
     result = runner.invoke(

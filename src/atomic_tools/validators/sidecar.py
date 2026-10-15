@@ -248,6 +248,10 @@ def _lint_loaded_df(
                 _check_optional_columns(
                     optional_groups, columns_set, report, type_label=label, files=names,
                 )
+                _check_required_values(
+                    df, type_rows, optional_groups, columns_set, default_row_idx, report,
+                    type_label=label, optional=True,
+                )
             sat = _check_required_values(
                 df, type_rows, required_groups, columns_set, default_row_idx, report,
                 type_label=label,
@@ -278,6 +282,15 @@ def _lint_loaded_df(
 
     report.missing_data = _build_missing_data_report(
         df, row_types, rules_by_type, columns_set, default_row_idx
+    )
+    # The builder tabulates each type's first (required) groups; hand it the
+    # optional ones in that slot.
+    report.optional_missing = _build_missing_data_report(
+        df,
+        row_types,
+        {t: (optional, []) for t, (_, optional) in rules_by_type.items()},
+        columns_set,
+        default_row_idx,
     )
 
     if coco_path:
@@ -522,12 +535,15 @@ def _check_required_values(
     default_row_idx: int | None,
     report: LintReport,
     type_label: str | None = None,
+    optional: bool = False,
 ) -> dict[str, bool]:
     """Return {canonical: covered_by_default} for one type's row subset.
 
     ``non_default`` is the subset of rows to check (this type's rows, excluding
     DEFAULT); DEFAULT-row coverage is read from ``df``. ``type_label`` names the
     type in the error message when a scan detected more than one.
+    ``optional`` groups only warn about rows missing a value (e.g. orientation
+    under --ignore-missing-orientation).
     """
     file_col = df.columns[0] if df.shape[1] else None
     default_row = df.iloc[default_row_idx] if default_row_idx is not None else None
@@ -575,12 +591,14 @@ def _check_required_values(
                 else ""
             )
             row_summary = ", ".join(f"row {idx} ({name!r})" for idx, name in sample) + tail
-            report.add_error(
+            add = report.add_warning if optional else report.add_error
+            hint = f"Either fill {canonical!r} on the listed rows or set a value in DEFAULT."
+            if optional:
+                hint += " Until then these process without it (e.g. no orientation in Lens)."
+            add(
                 f"{canonical!r}{suffix} is missing on {len(missing_rows)} row(s) and "
                 f"DEFAULT does not provide a value: {row_summary}",
-                fix_hint=(
-                    f"Either fill {canonical!r} on the listed rows or set a value in DEFAULT."
-                ),
+                fix_hint=hint,
                 files=[name for _, name in missing_rows],
             )
 

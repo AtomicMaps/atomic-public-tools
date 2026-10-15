@@ -296,6 +296,9 @@ def _check_point_cloud_crs(
                 untransformable.append(name)
 
         reader = "PDAL" if dtype == _POINT_CLOUD_TYPE else "am-tools"
+        if report.missing_data is not None:
+            for name in missing:
+                report.missing_data.mark(name, _FILE_SRS_COL, dtype)
         if missing:
             report.add_error(
                 f"{len(missing)} {noun} row(s) have no CRS in either "

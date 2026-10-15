@@ -131,6 +131,13 @@ class ValidationResponse(BaseModel):
             "images with no sidecar row)."
         ),
     )
+    optional_missing: dict[str, list[MissingFile]] | None = Field(
+        default=None,
+        description=(
+            "Files missing optional fields (orientation when it's ignored), keyed "
+            "by data type. These warn rather than fail."
+        ),
+    )
     metadata: list[dict[str, str]] | None = Field(
         default=None, description="One dict per sidecar row (all values strings)."
     )

@@ -61,6 +61,18 @@ class MissingDataReport:
     def is_empty(self) -> bool:
         return not self.rows
 
+    def mark(self, name: str, field_name: str, data_type: str) -> None:
+        """Record ``name`` as missing ``field_name`` (a check outside the
+        required-field groups, e.g. a CRS)."""
+        if field_name not in self.field_columns:
+            self.field_columns.append(field_name)
+        row = next((r for r in self.rows if r.get(self.filename_column) == name), None)
+        if row is None:
+            row = {self.filename_column: name}
+            self.rows.append(row)
+        row[field_name] = MISSING_MARKER
+        self.row_types.setdefault(name, data_type)
+
     def write_csv(self, path: str) -> None:
         header = [self.filename_column, *self.field_columns]
         if self.include_coco:
@@ -98,6 +110,9 @@ class LintReport:
     # Populated by the sidecar linter when a datatype (and thus a set of
     # required fields) is known. None when there's nothing to tabulate.
     missing_data: MissingDataReport | None = None
+    # Same, for optional fields (orientation under --ignore-missing-orientation):
+    # gaps that warn rather than fail.
+    optional_missing: MissingDataReport | None = None
     # Populated when a COCO file is supplied (image datatypes only).
     coco_impact: CocoImpact | None = None
 

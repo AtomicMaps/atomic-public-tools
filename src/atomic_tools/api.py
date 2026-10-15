@@ -63,9 +63,11 @@ __all__ = [
     "validate_upload",
 ]
 
-SECTIONS: tuple[str, ...] = ("findings", "missing_data", "metadata", "details", "files")
+SECTIONS: tuple[str, ...] = (
+    "findings", "missing_data", "optional_missing", "metadata", "details", "files"
+)
 # metadata is opt-in: one dict per file gets large.
-DEFAULT_SECTIONS: frozenset[str] = frozenset({"findings", "missing_data", "details", "files"})
+DEFAULT_SECTIONS: frozenset[str] = frozenset(SECTIONS) - {"metadata"}
 
 # Safety net: findings are plain text today, but a click-coloured one must not
 # leak escape codes into JSON.
@@ -141,7 +143,7 @@ def run_validation(
     client_schema: str | None = None,
     full: bool = False,
     spatial_reference: str | None = None,
-    ignore_missing_orientation: bool = False,
+    ignore_missing_orientation: bool = True,
     coco: str | None = None,
     quiet: bool = False,
     use_file_dates: bool = True,
@@ -274,12 +276,10 @@ def build_payload(result: ValidationResult, include: Iterable[str]) -> Validatio
             {**f, "message": _plain(f["message"]), "fix_hint": _plain(f["fix_hint"])}
             for f in report.findings_as_dicts()
         ]
-    if "missing_data" in include:
-        fields["missing_data"] = (
-            report.missing_data.to_dict(result.keys_by_label)
-            if report.missing_data is not None
-            else None
-        )
+    for section in ("missing_data", "optional_missing"):
+        if section in include:
+            table = getattr(report, section)
+            fields[section] = table.to_dict(result.keys_by_label) if table is not None else None
     if "metadata" in include:
         fields["metadata"] = df.to_dict(orient="records")
     if "details" in include:
@@ -336,7 +336,7 @@ def validate_path(
     client_schema: str | None = None,
     full: bool = False,
     spatial_reference: str | None = None,
-    ignore_missing_orientation: bool = False,
+    ignore_missing_orientation: bool = True,
     coco: str | None = None,
     include: str | Iterable[str] | None = None,
     use_file_dates: bool = True,
@@ -356,6 +356,10 @@ def validate_path(
 
     ``limit`` checks only the first N files by path; ``sample`` checks N random
     files per data type (repeatable with ``seed``). Not both.
+
+    Missing orientation (Pitch/Heading/Roll) only warns unless
+    ``ignore_missing_orientation=False``, so those images come back as
+    ``passed_with_warnings``.
     """
     try:
         sections = parse_include(include)
@@ -580,7 +584,7 @@ def validate_upload(
     data_type: DataTypeEnum | str | None = None,
     full: bool = False,
     spatial_reference: str | None = None,
-    ignore_missing_orientation: bool = False,
+    ignore_missing_orientation: bool = True,
     include: str | Iterable[str] | None = None,
     work_dir: str | os.PathLike[str] | None = None,
     max_bytes: int | None = None,

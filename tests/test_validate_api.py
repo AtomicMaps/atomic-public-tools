@@ -173,6 +173,16 @@ def test_files_section_sorts_files_by_outcome(stubbed, tmp_path):
     assert "skipped" not in files
 
 
+def test_api_mode_ignores_missing_orientation_by_default(stubbed, tmp_path):
+    assert _invoke("--path", str(tmp_path), "--api-mode").exit_code == 0
+    assert stubbed["lint_kwargs"]["ignore_missing_orientation"] is True
+    validate_path(str(tmp_path))
+    assert stubbed["lint_kwargs"]["ignore_missing_orientation"] is True
+
+    _invoke("--path", str(tmp_path), "--api-mode", "--require-orientation")
+    assert stubbed["lint_kwargs"]["ignore_missing_orientation"] is False
+
+
 def test_api_mode_warnings_only_status(stubbed, tmp_path):
     stubbed["report"].add_warning("meh")
     payload = _json(_invoke("--path", str(tmp_path), "--api-mode"))
@@ -398,6 +408,27 @@ def test_inventory_findings_name_their_files(tmp_path):
     assert [f.files for f in ambiguous] == [("a.jpg",)]
     rowless = [f for f in report.errors() if "have no sidecar row" in f.message]
     assert [f.files for f in rowless] == [("b.jpg",)]
+
+
+def test_missing_crs_is_listed_in_missing_data():
+    df = pd.DataFrame(
+        [
+            {"Filename": "DEFAULT", "DataType": "", "file_srs": "", "fallback_srs": ""},
+            {"Filename": "has.tif", "DataType": "ortho_image", "file_srs": "EPSG:32618",
+             "fallback_srs": ""},
+            {"Filename": "none.tif", "DataType": "ortho_image", "file_srs": "",
+             "fallback_srs": ""},
+        ]
+    )
+    report = lint_sidecar_df(df, final=True, data_type=None, input_files_path=None)
+    assert any("have no CRS" in f.message for f in report.errors())
+    assert report.missing_data is not None
+    # (Both rows also lack the ortho's other required fields; only CRS differs.)
+    no_crs = [
+        e["file"] for e in report.missing_data.to_dict()["ortho_image"]
+        if "file_srs" in e["missing"]
+    ]
+    assert no_crs == ["none.tif"]
 
 
 # ---- in-memory lint parity ---------------------------------------------------
