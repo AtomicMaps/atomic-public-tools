@@ -77,14 +77,30 @@ class MetadataView:
 class StorageBackend(ABC):
     """A storage backend the sidecar pipeline can read from and write to."""
 
+    # Set by a --limit/--sample run so later listings (the linter's inventory)
+    # see only the files that run processed, as a single-file run does.
+    subset: frozenset[str] | None = None
+
     @property
     @abstractmethod
     def display_root(self) -> str:
         """Human-readable root for log messages, e.g. ``s3://bucket/prefix`` or ``/abs/path``."""
 
-    @abstractmethod
     def list_keys(self, include: Sequence[str], exclude: Sequence[str]) -> list[str]:
         """List candidate files under the root, filtered by suffix rules."""
+        keys = self._list_keys(include, exclude)
+        if self.subset is None:
+            return keys
+        return [k for k in keys if k in self.subset]
+
+    @abstractmethod
+    def _list_keys(self, include: Sequence[str], exclude: Sequence[str]) -> list[str]:
+        """:meth:`list_keys` before any :attr:`subset` is applied."""
+
+    @property
+    def scoped(self) -> bool:
+        """True when listings cover only part of the root (one file, or a subset)."""
+        return self.single_file is not None or self.subset is not None
 
     @abstractmethod
     @contextmanager
@@ -166,7 +182,7 @@ class LocalBackend(StorageBackend):
     def single_file(self) -> str | None:
         return self._only
 
-    def list_keys(self, include: Sequence[str], exclude: Sequence[str]) -> list[str]:
+    def _list_keys(self, include: Sequence[str], exclude: Sequence[str]) -> list[str]:
         if self._only is not None:
             try:
                 size = (self._root / self._only).stat().st_size
@@ -304,7 +320,7 @@ class ObjectStoreBackend(StorageBackend):
             )
         return self._listing
 
-    def list_keys(self, include: Sequence[str], exclude: Sequence[str]) -> list[str]:
+    def _list_keys(self, include: Sequence[str], exclude: Sequence[str]) -> list[str]:
         if self._single_key is None:
             listing = self._raw_listing()
             if listing:

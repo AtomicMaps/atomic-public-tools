@@ -37,8 +37,20 @@ def _folder(tmp_path):
 def test_single_file_sidecar_refuses_to_overwrite(tmp_path, patched_extractors):  # noqa: F811
     _folder(tmp_path)
     before = (tmp_path / "sidecar.csv").read_text()
-    result = runner.invoke(app, ["sidecar", "--path", str(tmp_path / "a.jpg")])
+    result = runner.invoke(
+        app, ["sidecar", "--path", str(tmp_path / "a.jpg"), "--output-filename", "sidecar.csv"]
+    )
     assert result.exit_code == 1
+    assert (tmp_path / "sidecar.csv").read_text() == before
+
+
+def test_single_file_sidecar_defaults_to_its_own_name(tmp_path, patched_extractors):  # noqa: F811
+    _folder(tmp_path)
+    before = (tmp_path / "sidecar.csv").read_text()
+    for _ in range(2):  # a rerun replaces its own default-named sidecar
+        result = runner.invoke(app, ["sidecar", "--path", str(tmp_path / "a.jpg")])
+        assert result.exit_code == 0, result.output
+    assert (tmp_path / "sidecar_a_jpg.csv").exists()
     assert (tmp_path / "sidecar.csv").read_text() == before
 
 

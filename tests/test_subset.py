@@ -151,6 +151,36 @@ def test_validate_report_says_it_was_partial(tmp_path, patched_extractors):  # n
     assert "Checked 1 of 6 files (--limit 1)" in result.stdout
 
 
+@pytest.mark.parametrize("kwargs", [{"limit": 1}, {"sample": 1, "seed": 0}])
+def test_partial_run_does_not_flag_unselected_files(tmp_path, patched_extractors, kwargs):  # noqa: F811
+    payload = validate_path(str(_make_dir(tmp_path)), **kwargs).to_json_dict()
+    full = validate_path(str(tmp_path)).to_json_dict()
+    assert not any("no sidecar row" in f["message"] for f in payload["findings"])
+    assert payload["summary"]["errors"] <= full["summary"]["errors"]
+
+
+def test_partial_run_scopes_the_backend(tmp_path, patched_extractors):  # noqa: F811
+    _make_dir(tmp_path)
+    _df, backend, *_ = _build_sidecar(
+        directory=str(tmp_path), data_type=None, client_sidecar=None, client_schema=None,
+        limit=2,
+    )
+    assert backend.scoped
+    assert sorted(backend.list_keys(include=[".jpg", ".las", ".mp4"], exclude=[])) == [
+        "a.jpg", "b.jpg",
+    ]
+
+
+def test_partial_run_keeps_full_run_labels(tmp_path, patched_extractors):  # noqa: F811
+    for flight in ("flightA", "flightB"):
+        (tmp_path / flight).mkdir()
+        (tmp_path / flight / "IMG_001.jpg").write_text("x")
+    df, _ = _build(tmp_path, limit=1)
+    full, _ = _build(tmp_path)
+    assert _rows(df)[0] in _rows(full)
+    assert _rows(df) != ["IMG_001.jpg"]
+
+
 def test_validate_rejects_limit_with_sample(tmp_path):
     result = runner.invoke(
         app, ["validate", "--path", str(tmp_path), "--limit", "1", "--sample", "1"]
@@ -202,16 +232,53 @@ def test_api_mode_reports_both_as_json(tmp_path):
 # ---- sidecar ---------------------------------------------------------------------------
 
 
-def test_sidecar_with_limit_writes_partial_csv(tmp_path, patched_extractors):  # noqa: F811
+def test_sidecar_with_limit_writes_sidecar_limit_csv(tmp_path, patched_extractors):  # noqa: F811
     _make_dir(tmp_path)
     result = runner.invoke(app, ["sidecar", "--path", str(tmp_path), "--limit", "1"])
     assert "covers only 1 of 6 files" in result.stderr
-    df = pd.read_csv(tmp_path / "sidecar.csv", dtype=str)
+    assert "no sidecar row" not in result.stdout
+    assert not (tmp_path / "sidecar.csv").exists()
+    df = pd.read_csv(tmp_path / "sidecar_limit.csv", dtype=str)
     assert _rows(df) == ["a.jpg"]
 
 
-def test_sidecar_rejects_limit_with_update_existing(tmp_path):
+def test_sidecar_limit_that_cuts_nothing_writes_sidecar_csv(tmp_path, patched_extractors):  # noqa: F811
+    _make_dir(tmp_path)
+    runner.invoke(app, ["sidecar", "--path", str(tmp_path), "--limit", "6"])
+    assert not (tmp_path / "sidecar_limit.csv").exists()
+    assert len(_rows(pd.read_csv(tmp_path / "sidecar.csv", dtype=str))) == 6
+
+
+def test_sidecar_with_sample_writes_sidecar_sample_csv(tmp_path, patched_extractors):  # noqa: F811
+    _make_dir(tmp_path)
+    runner.invoke(app, ["sidecar", "--path", str(tmp_path), "--sample", "1"])
+    assert not (tmp_path / "sidecar.csv").exists()
+    assert len(_rows(pd.read_csv(tmp_path / "sidecar_sample.csv", dtype=str))) == 3
+
+
+def test_sidecar_partial_respects_output_filename(tmp_path, patched_extractors):  # noqa: F811
+    _make_dir(tmp_path)
+    runner.invoke(
+        app, ["sidecar", "--path", str(tmp_path), "--limit", "1", "--output-filename", "x.csv"]
+    )
+    assert _rows(pd.read_csv(tmp_path / "x.csv", dtype=str)) == ["a.jpg"]
+    assert not (tmp_path / "sidecar_limit.csv").exists()
+
+
+def test_sidecar_partial_update_existing_adds_rows(tmp_path, patched_extractors):  # noqa: F811
+    _make_dir(tmp_path)
+    runner.invoke(app, ["sidecar", "--path", str(tmp_path)])
+    (tmp_path / "0.jpg").write_text("x")  # sorts first, so --limit 1 picks it
     result = runner.invoke(
         app, ["sidecar", "--path", str(tmp_path), "--limit", "1", "--update-existing"]
     )
-    assert result.exit_code == 2
+    assert "no sidecar row" not in result.stdout
+    assert not (tmp_path / "sidecar_limit.csv").exists()
+    rows = _rows(pd.read_csv(tmp_path / "sidecar.csv", dtype=str))
+    assert rows == ["0.jpg", "a.jpg", "b.jpg", "c.jpg", "d.las", "e.las", "f.mp4"]
+
+
+def test_full_folder_still_rejects_update_existing(tmp_path, patched_extractors):  # noqa: F811
+    _make_dir(tmp_path)
+    result = runner.invoke(app, ["sidecar", "--path", str(tmp_path), "--update-existing"])
+    assert result.exit_code == 1

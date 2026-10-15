@@ -49,6 +49,7 @@ from atomic_tools.utils.companions import (
     is_telemetry,
     listing_extensions,
     pair_telemetry,
+    telemetry_near,
     unsupported_reason,
 )
 from atomic_tools.utils.coordinates import (
@@ -200,10 +201,15 @@ def _ask_ignore_missing_orientation() -> bool:
 
 
 def _ask_output_filename() -> str:
+    # Empty means the default: sidecar.csv, or sidecar_<file>_<ext>.csv for a
+    # single file (see _default_output_filename).
     return questionary.text(
         "Output filename:",
-        default="sidecar.csv",
-        instruction="(Press Enter to keep the default)",
+        default="",
+        instruction=(
+            "(Press Enter for the default: sidecar.csv, or sidecar_<file>_<ext>.csv "
+            "for one file)"
+        ),
     ).unsafe_ask()
 
 
@@ -1241,23 +1247,23 @@ def _build_sidecar(
                 )
             raise NoSupportedFilesError(f"No supported files found in {backend.display_root}")
 
-    # Pair on the full listing (the backend's grouping is greedy, so pairing a
-    # subset could group differently), before any --limit/--sample cut.
-    videos = [k for k, t in types_by_key.items() if t in _VIDEO_DATA_TYPES]
-    telemetry_by_video, orphan_telemetry = (
-        pair_telemetry(sorted([*videos, *telemetry_keys])) if telemetry_keys else ({}, [])
-    )
+    # Labels come from the full listing, so a --limit/--sample run names each
+    # file the way a full run would.
+    display_labels = _disambiguate_filenames(list(types_by_key))
 
     if (limit is not None or sample is not None) and backend.single_file is None:
         listed = len(types_by_key)
         types_by_key = _select_keys(types_by_key, limit=limit, sample=sample, seed=seed)
-        telemetry_by_video = {
-            v: ts for v, ts in telemetry_by_video.items() if v in types_by_key
-        }
         if len(types_by_key) < listed:
             logger.info(
                 f"Selected {selection_note(len(types_by_key), listed, limit, sample)}."
             )
+            # Only the selected videos' telemetry is in scope (and paired below).
+            videos = [k for k, t in types_by_key.items() if t in _VIDEO_DATA_TYPES]
+            telemetry_keys = telemetry_near(videos, telemetry_keys)
+            display_labels = {k: display_labels[k] for k in types_by_key}
+            # The linter's inventory then checks only these files.
+            backend.subset = frozenset(types_by_key)
             if selection_out is not None:
                 selection_out.append((len(types_by_key), listed))
 
@@ -1265,7 +1271,6 @@ def _build_sidecar(
     total = len(supported_keys)
     logger.info(f"Found {total} file(s) to process in {backend.display_root}.")
 
-    display_labels = _disambiguate_filenames(supported_keys)
     display_to_key = {v: k for k, v in display_labels.items()}
     n_disambiguated = sum(
         1 for k, v in display_labels.items() if v != Path(k).name
@@ -1297,6 +1302,8 @@ def _build_sidecar(
         if not quiet:
             click.secho(msg, fg="yellow", err=True)
 
+    videos = [k for k, t in types_by_key.items() if t in _VIDEO_DATA_TYPES]
+    telemetry_by_video, orphan_telemetry = pair_telemetry(sorted([*videos, *telemetry_keys]))
     if orphan_telemetry:
         _warn_skipped(
             orphan_telemetry,
@@ -1550,10 +1557,28 @@ def _merge_into_existing(existing, new):
     return merged, list(to_add["Filename"]), kept
 
 
+def _default_output_filename(
+    backend: StorageBackend, cut: bool, limit: int | None, update_existing: bool
+) -> str:
+    """``sidecar.csv`` for a full run (or one adding to it); otherwise a name a
+    full sidecar never uses: ``sidecar_IMG_0001_jpg.csv`` for one file,
+    ``sidecar_limit.csv``/``sidecar_sample.csv`` when --limit/--sample left files out.
+    """
+    if update_existing:
+        return "sidecar.csv"
+    if backend.single_file is not None:
+        name = PurePosixPath(backend.single_file).name
+        stem, dot, ext = name.rpartition(".")
+        return f"sidecar_{stem}_{ext}.csv" if dot and stem else f"sidecar_{name}.csv"
+    if cut:
+        return "sidecar_limit.csv" if limit is not None else "sidecar_sample.csv"
+    return "sidecar.csv"
+
+
 def _generate(
     directory: str,
     data_type: DataTypeEnum | None,
-    output_filename: str,
+    output_filename: str | None,
     client_sidecar: str | None,
     client_schema: str | None,
     full: bool = False,
@@ -1566,6 +1591,7 @@ def _generate(
 ) -> tuple[str, list[str], StorageBackend, "object | None"]:
     """Build and write the sidecar.
 
+    ``output_filename=None`` picks one with :func:`_default_output_filename`.
     ``lint_df`` is set when an existing sidecar was updated: lint only those
     rows, not the whole file.
     """
@@ -1589,30 +1615,40 @@ def _generate(
         seed=seed,
         selection_out=selection,
     )
-    if selection:
+    if selection and not update_existing:
         msg = (
             f"This sidecar covers only {selection_note(*selection[0], limit, sample)}; "
             "it is not a complete intake sidecar."
         )
         logger.warning(msg)
         click.secho(msg, fg="yellow", err=True)
-    if update_existing and backend.single_file is None:
+    explicit_name = output_filename is not None
+    output_filename = output_filename or _default_output_filename(
+        backend, bool(selection), limit, update_existing
+    )
+    partial = backend.single_file is not None or limit is not None or sample is not None
+    if update_existing and not partial:
         raise InvalidInputError(
-            "--update-existing only applies when --path is a single file; a folder "
-            "run regenerates the whole sidecar."
+            "--update-existing only applies when --path is a single file or with "
+            "--limit/--sample; a full folder run regenerates the whole sidecar."
         )
     out_df = df
     lint_df = None
     existing_version: str | None = None
-    if backend.single_file is not None and backend.output_exists(output_filename):
+    # A default name is this run's own, so it's simply replaced; an explicit
+    # one may be a full sidecar that a single file must not overwrite.
+    if (
+        (update_existing or (backend.single_file is not None and explicit_name))
+        and backend.output_exists(output_filename)
+    ):
         target = f"{backend.output_location}/{output_filename}"
         if not update_existing:
             raise InvalidInputError(
                 f"Refusing to overwrite {target}: this run covers only "
                 f"{PurePosixPath(backend.single_file).name}, so its sidecar would "
                 "replace the existing one with a single row. Pass --update-existing "
-                "to add this file to it, or --output-filename with a name that "
-                "isn't taken."
+                "to add this file to it, or drop --output-filename to write "
+                f"{_default_output_filename(backend, False, None, False)}."
             )
         existing, existing_version = backend.read_output(output_filename)
         out_df, added, kept = _merge_into_existing(existing, df)
@@ -1861,8 +1897,10 @@ def _run_generate(
     directory = result.directory
     data_type = result.data_type
 
-    output_filename = result.output_filename or "sidecar.csv"
-    basename = Path(output_filename).name
+    # None (or an empty wizard answer) means the default, picked once the run
+    # knows whether it covers one file, part of a folder, or all of it.
+    output_filename = result.output_filename or None
+    basename = Path(output_filename).name if output_filename else None
     if basename != output_filename:
         logger.warning(
             f"--output-filename ignored directory portion of {output_filename!r}; "
@@ -2183,10 +2221,11 @@ def generate(
         typer.Option(
             "--update-existing",
             help=(
-                "Only with a single-file --path: if the file's folder already has "
-                "a sidecar generated by am-tools, add this file's row to it instead "
-                "of refusing. A file that already has a row keeps it unchanged, and "
-                "only this file's row is linted."
+                "Only with a single-file --path, --limit or --sample: if the "
+                "folder already has a sidecar generated by am-tools, add this run's "
+                "rows to it instead of refusing (single file) or writing "
+                "sidecar_limit.csv / sidecar_sample.csv. A file that already has a "
+                "row keeps it unchanged, and only this run's rows are linted."
             ),
         ),
     ] = False,
@@ -2200,8 +2239,6 @@ def generate(
     passed on the command line is used as-is and not prompted for.
     """
     _check_selection_options(limit, sample, seed)
-    if update_existing and (limit is not None or sample is not None):
-        raise typer.BadParameter("--update-existing can't be combined with --limit or --sample.")
     from atomic_tools.cli import Verbosity, level_for
 
     verbosity_state: Verbosity = ctx.ensure_object(Verbosity)

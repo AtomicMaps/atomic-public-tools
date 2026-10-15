@@ -98,6 +98,15 @@ def _similar(a: str, b: str) -> bool:
     return SequenceMatcher(None, a, b).ratio() >= _TELEMETRY_SIMILARITY
 
 
+def telemetry_near(videos: Iterable[str], telemetry: list[str]) -> list[str]:
+    """The telemetry files whose names are similar enough to pair with one of ``videos``."""
+    stems = [os.path.splitext(os.path.basename(v))[0] for v in videos]
+    return [
+        t for t in telemetry
+        if any(_similar(os.path.splitext(os.path.basename(t))[0], s) for s in stems)
+    ]
+
+
 def pair_telemetry(keys: list[str]) -> tuple[dict[str, list[str]], list[str]]:
     """Attach telemetry files to videos the way the backend groups them.
 
