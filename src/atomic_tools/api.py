@@ -25,6 +25,7 @@ from atomic_tools.commands.sidecar import (
     PointCloudCRSError,
     _build_sidecar,
     _crs_failures,
+    selection_note,
 )
 from atomic_tools.errors import InvalidInputError
 from atomic_tools.models import (
@@ -80,6 +81,7 @@ class ValidationResult:
     crs_failures: list[str]
     unclassified: list[str] = field(default_factory=list)
     skipped_unsupported: list[tuple[str, str]] = field(default_factory=list)
+    files_total: int | None = None  # set when --limit/--sample dropped files
 
     @property
     def failed(self) -> bool:
@@ -137,15 +139,20 @@ def run_validation(
     coco: str | None = None,
     quiet: bool = False,
     use_file_dates: bool = True,
+    limit: int | None = None,
+    sample: int | None = None,
+    seed: int | None = None,
 ) -> ValidationResult:
     """Build the sidecar in memory and lint it. Unlike :func:`validate_path`, raises."""
     logger.info(
         f"Starting validation — path={path!r} data_type={data_type} "
         f"client_sidecar={client_sidecar!r} client_schema={client_schema!r} "
-        f"full={full} spatial_reference={spatial_reference!r} coco={coco!r}"
+        f"full={full} spatial_reference={spatial_reference!r} coco={coco!r} "
+        f"limit={limit} sample={sample} seed={seed}"
     )
     unclassified: list[str] = []
     unsupported: list[tuple[str, str]] = []
+    selection: list[tuple[int, int]] = []
     df, backend, detected_types, skipped_vector = _build_sidecar(
         directory=path,
         data_type=data_type,
@@ -157,6 +164,10 @@ def run_validation(
         unclassified_out=unclassified,
         unsupported_out=unsupported,
         use_file_dates=use_file_dates,
+        limit=limit,
+        sample=sample,
+        seed=seed,
+        selection_out=selection,
     )
     df = _as_csv_strings(df)
     crs_failures = _crs_failures(df)
@@ -174,6 +185,11 @@ def run_validation(
         # Informational run: only sidecar generation blocks on this.
         coco_not_on_disk_is_error=False,
     )
+    if selection:
+        report.add_info(
+            f"Checked {selection_note(*selection[0], limit, sample)}; "
+            "results cover only those files."
+        )
     return ValidationResult(
         df=df,
         report=report,
@@ -182,6 +198,7 @@ def run_validation(
         crs_failures=list(crs_failures),
         unclassified=unclassified,
         skipped_unsupported=unsupported,
+        files_total=selection[0][1] if selection else None,
     )
 
 
@@ -209,6 +226,7 @@ def build_payload(result: ValidationResult, include: Iterable[str]) -> Validatio
             "skipped_vector": len(result.skipped_vector),
             "unclassified": len(result.unclassified),
             "skipped_unsupported": len(result.skipped_unsupported),
+            **({"files_total": result.files_total} if result.files_total is not None else {}),
         },
         "error": None,
     }
@@ -279,12 +297,18 @@ def validate_path(
     coco: str | None = None,
     include: str | Iterable[str] | None = None,
     use_file_dates: bool = True,
+    limit: int | None = None,
+    sample: int | None = None,
+    seed: int | None = None,
 ) -> ValidationResponse:
     """Validate a directory/prefix or a single file/object. Never raises.
 
     A folder is scanned recursively, so never point this at a shared one.
     Pass ``use_file_dates=False`` when the files are fresh copies, so their
     modification times aren't taken as capture dates.
+
+    ``limit`` checks only the first N files by path; ``sample`` checks N random
+    files per data type (repeatable with ``seed``). Not both.
     """
     try:
         sections = parse_include(include)
@@ -311,6 +335,9 @@ def validate_path(
             coco=coco,
             quiet=True,
             use_file_dates=use_file_dates,
+            limit=limit,
+            sample=sample,
+            seed=seed,
         )
     except Exception as e:  # noqa: BLE001 — API contract: never raise
         logger.error(f"Validation failed: {e}", exc_info=logger.isEnabledFor(logging.INFO))

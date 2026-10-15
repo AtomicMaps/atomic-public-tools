@@ -11,6 +11,7 @@ Requires the following external binaries at runtime (NOT pip-installable):
 """
 
 import logging
+import random
 import re
 import shlex
 import shutil
@@ -48,6 +49,7 @@ from atomic_tools.utils.companions import (
     is_telemetry,
     listing_extensions,
     pair_telemetry,
+    telemetry_near,
     unsupported_reason,
 )
 from atomic_tools.utils.coordinates import (
@@ -156,6 +158,46 @@ def _ask_directory() -> str:
     return normalize_directory(answer)
 
 
+_ALL_FILES_CHOICE = "All files (recommended)"
+_LIMIT_CHOICE = "The first N files, sorted by path"
+_SAMPLE_CHOICE = "N random files of each data type"
+
+
+def _is_single_file_path(directory: str) -> bool:
+    """Best guess, before listing, that ``directory`` names one file."""
+    if is_remote_uri(directory):
+        return infer_data_type(directory) is not None
+    return Path(directory).is_file()
+
+
+def _ask_selection() -> tuple[int | None, int | None, int | None]:
+    """``(limit, sample, seed)`` for a quick check of part of a folder."""
+    choice = questionary.select(
+        "Which files?",
+        instruction="(Checking only some of them is quicker on a large folder)",
+        choices=[_ALL_FILES_CHOICE, _LIMIT_CHOICE, _SAMPLE_CHOICE],
+        default=_ALL_FILES_CHOICE,
+    ).unsafe_ask()
+    if choice == _ALL_FILES_CHOICE:
+        return None, None, None
+    n = int(
+        questionary.text(
+            "How many files?" if choice == _LIMIT_CHOICE else "How many files per data type?",
+            validate=lambda v: (
+                (v.strip().isdigit() and int(v) >= 1) or "A whole number, 1 or more."
+            ),
+        ).unsafe_ask()
+    )
+    if choice == _LIMIT_CHOICE:
+        return n, None, None
+    seed = questionary.text(
+        "Random seed:",
+        instruction="(Optional — the same seed picks the same files again)",
+        validate=lambda v: not v.strip() or v.strip().lstrip("-").isdigit() or "A whole number.",
+    ).unsafe_ask().strip()
+    return None, n, int(seed) if seed else None
+
+
 def _ask_data_type() -> DataTypeEnum:
     choice = questionary.select(
         "Data type of the input data:",
@@ -199,10 +241,15 @@ def _ask_ignore_missing_orientation() -> bool:
 
 
 def _ask_output_filename() -> str:
+    # Empty means the default: sidecar.csv, or sidecar_<file>_<ext>.csv for a
+    # single file (see _default_output_filename).
     return questionary.text(
         "Output filename:",
-        default="sidecar.csv",
-        instruction="(Press Enter to keep the default)",
+        default="",
+        instruction=(
+            "(Press Enter for the default: sidecar.csv, or sidecar_<file>_<ext>.csv "
+            "for one file)"
+        ),
     ).unsafe_ask()
 
 
@@ -901,6 +948,53 @@ def _classify_keys(
     return types_by_key, unclassified, vector_keys
 
 
+def check_selection_args(limit: int | None, sample: int | None, seed: int | None) -> None:
+    """Raise :class:`InvalidInputError` for a bad ``limit``/``sample``/``seed`` combination."""
+    if limit is not None and sample is not None:
+        raise InvalidInputError("--limit and --sample can't be used together; pick one.")
+    if seed is not None and sample is None:
+        raise InvalidInputError("--seed only applies with --sample.")
+    for name, value in (("limit", limit), ("sample", sample)):
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise InvalidInputError(
+                f"--{name} must be a whole number of at least 1, got {value!r}."
+            )
+
+
+def selection_note(selected: int, total: int, limit: int | None, sample: int | None) -> str:
+    """E.g. ``"5 of 1,240 files (--limit 5)"``."""
+    how = f"--limit {limit}" if limit is not None else f"--sample {sample} per data type"
+    return f"{selected:,} of {total:,} files ({how})"
+
+
+def _select_keys(
+    types_by_key: dict[str, DataTypeEnum],
+    *,
+    limit: int | None = None,
+    sample: int | None = None,
+    seed: int | None = None,
+) -> dict[str, DataTypeEnum]:
+    """Keep the first ``limit`` keys by path, or ``sample`` random keys per type.
+
+    Keys are sorted before picking, so a given seed picks the same files whatever
+    order the listing came back in. Types are the filename-based ones, before any
+    oriented↔spherical refinement from EXIF.
+    """
+    if limit is not None:
+        return {key: types_by_key[key] for key in sorted(types_by_key)[:limit]}
+    rng = random.Random(seed)
+    by_type: dict[DataTypeEnum, list[str]] = defaultdict(list)
+    for key in sorted(types_by_key):
+        by_type[types_by_key[key]].append(key)
+    return {
+        key: t
+        for t in sorted(by_type, key=lambda t: t.value)
+        for key in rng.sample(by_type[t], min(sample, len(by_type[t])))  # type: ignore[arg-type]
+    }
+
+
 def _warn_skipped(keys: list[str], message: str) -> None:
     sample = keys[:5]
     suffix = f" (+{len(keys) - 5} more)" if len(keys) > 5 else ""
@@ -1081,6 +1175,10 @@ def _build_sidecar(
     unclassified_out: list[str] | None = None,
     unsupported_out: list[tuple[str, str]] | None = None,
     use_file_dates: bool = True,
+    limit: int | None = None,
+    sample: int | None = None,
+    seed: int | None = None,
+    selection_out: list[tuple[int, int]] | None = None,
 ) -> tuple["object", StorageBackend, set[DataTypeEnum], list[str]]:
     """Scan a directory, extract metadata, and assemble the sidecar DataFrame.
 
@@ -1105,7 +1203,13 @@ def _build_sidecar(
     ``unsupported_out`` ``(key, reason)`` for recognized files Flow can't process.
     ``use_file_dates=False`` stops modification times standing in for capture
     dates, for files that are fresh copies (uploads).
+
+    ``limit`` keeps the first N files by path; ``sample`` keeps N random files
+    per (filename-detected) data type, reproducibly for a given ``seed``. Neither
+    applies to a single-file path. ``selection_out`` receives
+    ``(selected, total)`` when that dropped any files.
     """
+    check_selection_args(limit, sample, seed)
     if spatial_reference:
         # Fail fast on an unparseable CRS before doing any extraction work.
         from pyproj import CRS
@@ -1183,11 +1287,30 @@ def _build_sidecar(
                 )
             raise NoSupportedFilesError(f"No supported files found in {backend.display_root}")
 
+    # Labels come from the full listing, so a --limit/--sample run names each
+    # file the way a full run would.
+    display_labels = _disambiguate_filenames(list(types_by_key))
+
+    if (limit is not None or sample is not None) and backend.single_file is None:
+        listed = len(types_by_key)
+        types_by_key = _select_keys(types_by_key, limit=limit, sample=sample, seed=seed)
+        if len(types_by_key) < listed:
+            logger.info(
+                f"Selected {selection_note(len(types_by_key), listed, limit, sample)}."
+            )
+            # Only the selected videos' telemetry is in scope (and paired below).
+            videos = [k for k, t in types_by_key.items() if t in _VIDEO_DATA_TYPES]
+            telemetry_keys = telemetry_near(videos, telemetry_keys)
+            display_labels = {k: display_labels[k] for k in types_by_key}
+            # The linter's inventory then checks only these files.
+            backend.subset = frozenset(types_by_key)
+            if selection_out is not None:
+                selection_out.append((len(types_by_key), listed))
+
     supported_keys = list(types_by_key)
     total = len(supported_keys)
     logger.info(f"Found {total} file(s) to process in {backend.display_root}.")
 
-    display_labels = _disambiguate_filenames(supported_keys)
     display_to_key = {v: k for k, v in display_labels.items()}
     n_disambiguated = sum(
         1 for k, v in display_labels.items() if v != Path(k).name
@@ -1474,19 +1597,41 @@ def _merge_into_existing(existing, new):
     return merged, list(to_add["Filename"]), kept
 
 
+def _default_output_filename(
+    backend: StorageBackend, cut: bool, limit: int | None, update_existing: bool
+) -> str:
+    """``sidecar.csv`` for a full run (or one adding to it); otherwise a name a
+    full sidecar never uses: ``sidecar_IMG_0001_jpg.csv`` for one file,
+    ``sidecar_limit.csv``/``sidecar_sample.csv`` when --limit/--sample left files out.
+    """
+    if update_existing:
+        return "sidecar.csv"
+    if backend.single_file is not None:
+        name = PurePosixPath(backend.single_file).name
+        stem, dot, ext = name.rpartition(".")
+        return f"sidecar_{stem}_{ext}.csv" if dot and stem else f"sidecar_{name}.csv"
+    if cut:
+        return "sidecar_limit.csv" if limit is not None else "sidecar_sample.csv"
+    return "sidecar.csv"
+
+
 def _generate(
     directory: str,
     data_type: DataTypeEnum | None,
-    output_filename: str,
+    output_filename: str | None,
     client_sidecar: str | None,
     client_schema: str | None,
     full: bool = False,
     local_copy: bool = False,
     spatial_reference: str | None = None,
     update_existing: bool = False,
+    limit: int | None = None,
+    sample: int | None = None,
+    seed: int | None = None,
 ) -> tuple[str, list[str], StorageBackend, "object | None"]:
     """Build and write the sidecar.
 
+    ``output_filename=None`` picks one with :func:`_default_output_filename`.
     ``lint_df`` is set when an existing sidecar was updated: lint only those
     rows, not the whole file.
     """
@@ -1497,6 +1642,7 @@ def _generate(
         f"full={full} local_copy={local_copy} spatial_reference={spatial_reference!r}"
     )
 
+    selection: list[tuple[int, int]] = []
     df, backend, _detected, vector_keys = _build_sidecar(
         directory=directory,
         data_type=data_type,
@@ -1504,24 +1650,45 @@ def _generate(
         client_schema=client_schema,
         full=full,
         spatial_reference=spatial_reference,
+        limit=limit,
+        sample=sample,
+        seed=seed,
+        selection_out=selection,
     )
-    if update_existing and backend.single_file is None:
+    if selection and not update_existing:
+        msg = (
+            f"This sidecar covers only {selection_note(*selection[0], limit, sample)}; "
+            "it is not a complete intake sidecar."
+        )
+        logger.warning(msg)
+        click.secho(msg, fg="yellow", err=True)
+    explicit_name = output_filename is not None
+    output_filename = output_filename or _default_output_filename(
+        backend, bool(selection), limit, update_existing
+    )
+    partial = backend.single_file is not None or limit is not None or sample is not None
+    if update_existing and not partial:
         raise InvalidInputError(
-            "--update-existing only applies when --path is a single file; a folder "
-            "run regenerates the whole sidecar."
+            "--update-existing only applies when --path is a single file or with "
+            "--limit/--sample; a full folder run regenerates the whole sidecar."
         )
     out_df = df
     lint_df = None
     existing_version: str | None = None
-    if backend.single_file is not None and backend.output_exists(output_filename):
+    # A default name is this run's own, so it's simply replaced; an explicit
+    # one may be a full sidecar that a single file must not overwrite.
+    if (
+        (update_existing or (backend.single_file is not None and explicit_name))
+        and backend.output_exists(output_filename)
+    ):
         target = f"{backend.output_location}/{output_filename}"
         if not update_existing:
             raise InvalidInputError(
                 f"Refusing to overwrite {target}: this run covers only "
                 f"{PurePosixPath(backend.single_file).name}, so its sidecar would "
                 "replace the existing one with a single row. Pass --update-existing "
-                "to add this file to it, or --output-filename with a name that "
-                "isn't taken."
+                "to add this file to it, or drop --output-filename to write "
+                f"{_default_output_filename(backend, False, None, False)}."
             )
         existing, existing_version = backend.read_output(output_filename)
         out_df, added, kept = _merge_into_existing(existing, df)
@@ -1596,6 +1763,9 @@ def _format_replay_command(
     local_copy: bool = False,
     coco: str | None = None,
     update_existing: bool = False,
+    limit: int | None = None,
+    sample: int | None = None,
+    seed: int | None = None,
 ) -> str:
     """Build the copy-pasteable replay command for ``sidecar`` or ``validate``.
     ``subcommand`` is the command words (e.g. ``["sidecar"]`` or
@@ -1629,6 +1799,12 @@ def _format_replay_command(
         parts += ["--coco", shlex.quote(coco)]
     if update_existing:
         parts.append("--update-existing")
+    if limit is not None:
+        parts += ["--limit", str(limit)]
+    if sample is not None:
+        parts += ["--sample", str(sample)]
+    if seed is not None:
+        parts += ["--seed", str(seed)]
     return " ".join(parts)
 
 
@@ -1658,6 +1834,9 @@ class WizardResult(NamedTuple):
     spatial_reference: str | None
     ignore_missing_orientation: bool
     coco: str | None
+    limit: int | None = None
+    sample: int | None = None
+    seed: int | None = None
 
 
 def _run_interactive_wizard(
@@ -1677,6 +1856,9 @@ def _run_interactive_wizard(
     ignore_missing_orientation_provided: bool,
     coco: str | None = None,
     save: bool = True,
+    limit: int | None = None,
+    sample: int | None = None,
+    seed: int | None = None,
 ) -> WizardResult:
     """Prompt for any value the user didn't pass on the CLI.
 
@@ -1691,6 +1873,8 @@ def _run_interactive_wizard(
     try:
         if directory is None:
             directory = _ask_directory()
+        if limit is None and sample is None and not _is_single_file_path(directory):
+            limit, sample, seed = _ask_selection()
         if data_type is None:
             data_type = _ask_data_type_filter()
         # Conditional prompts follow "show unless an explicit filter rules them
@@ -1739,11 +1923,17 @@ def _run_interactive_wizard(
         spatial_reference=spatial_reference,
         ignore_missing_orientation=ignore_missing_orientation,
         coco=coco,
+        limit=limit,
+        sample=sample,
+        seed=seed,
     )
 
 
 def _run_generate(
-    result: WizardResult, *, wizard_ran: bool, update_existing: bool = False
+    result: WizardResult,
+    *,
+    wizard_ran: bool,
+    update_existing: bool = False,
 ) -> None:
     """Generate and lint a sidecar from a fully-resolved set of options.
 
@@ -1755,8 +1945,10 @@ def _run_generate(
     directory = result.directory
     data_type = result.data_type
 
-    output_filename = result.output_filename or "sidecar.csv"
-    basename = Path(output_filename).name
+    # None (or an empty wizard answer) means the default, picked once the run
+    # knows whether it covers one file, part of a folder, or all of it.
+    output_filename = result.output_filename or None
+    basename = Path(output_filename).name if output_filename else None
     if basename != output_filename:
         logger.warning(
             f"--output-filename ignored directory portion of {output_filename!r}; "
@@ -1784,6 +1976,9 @@ def _run_generate(
                 ignore_missing_orientation=result.ignore_missing_orientation,
                 coco=result.coco,
                 update_existing=update_existing,
+                limit=result.limit,
+                sample=result.sample,
+                seed=result.seed,
             )
         )
 
@@ -1798,6 +1993,9 @@ def _run_generate(
             local_copy=result.local_copy,
             spatial_reference=result.spatial_reference,
             update_existing=update_existing,
+            limit=result.limit,
+            sample=result.sample,
+            seed=result.seed,
         )
     except PointCloudCRSError as e:
         # Nothing was written to the input directory; report loudly and stop.
@@ -1898,6 +2096,49 @@ def offer_sidecar_after_schema(
         )
     )
     _run_generate(result, wizard_ran=True)
+
+
+LimitOption = Annotated[
+    int | None,
+    typer.Option(
+        "--limit",
+        min=1,
+        help=(
+            "Only process the first N files, sorted by path. For a quick check "
+            "of a large folder. Can't be combined with --sample."
+        ),
+    ),
+]
+SampleOption = Annotated[
+    int | None,
+    typer.Option(
+        "--sample",
+        min=1,
+        help=(
+            "Only process N randomly chosen files of each data type. Types come "
+            "from the filename, so ambiguous images (e.g. .jpg) are sampled as "
+            "oriented_image even if some turn out to be spherical. Can't be "
+            "combined with --limit."
+        ),
+    ),
+]
+SeedOption = Annotated[
+    int | None,
+    typer.Option(
+        "--seed",
+        help="With --sample: seed for the random pick, so a run can be repeated.",
+    ),
+]
+
+
+def _check_selection_options(
+    limit: int | None, sample: int | None, seed: int | None
+) -> None:
+    """``check_selection_args`` as a CLI usage error, before any wizard runs."""
+    try:
+        check_selection_args(limit, sample, seed)
+    except InvalidInputError as e:
+        raise typer.BadParameter(str(e)) from None
 
 
 def generate(
@@ -2028,19 +2269,24 @@ def generate(
         typer.Option(
             "--update-existing",
             help=(
-                "Only with a single-file --path: if the file's folder already has "
-                "a sidecar generated by am-tools, add this file's row to it instead "
-                "of refusing. A file that already has a row keeps it unchanged, and "
-                "only this file's row is linted."
+                "Only with a single-file --path, --limit or --sample: if the "
+                "folder already has a sidecar generated by am-tools, add this run's "
+                "rows to it instead of refusing (single file) or writing "
+                "sidecar_limit.csv / sidecar_sample.csv. A file that already has a "
+                "row keeps it unchanged, and only this run's rows are linted."
             ),
         ),
     ] = False,
+    limit: LimitOption = None,
+    sample: SampleOption = None,
+    seed: SeedOption = None,
 ) -> None:
     """Scan a directory or file, extract per-file metadata, and write a sidecar CSV.
 
     With no flags, prompts interactively for each value. Any flag that is
     passed on the command line is used as-is and not prompted for.
     """
+    _check_selection_options(limit, sample, seed)
     from atomic_tools.cli import Verbosity, level_for
 
     verbosity_state: Verbosity = ctx.ensure_object(Verbosity)
@@ -2083,6 +2329,9 @@ def generate(
             ignore_missing_orientation,
             ignore_orientation_provided,
             coco=coco,
+            limit=limit,
+            sample=sample,
+            seed=seed,
         )
         verbosity_choice = result.verbosity
         logging.getLogger().setLevel(
@@ -2104,6 +2353,9 @@ def generate(
             spatial_reference=spatial_reference,
             ignore_missing_orientation=ignore_missing_orientation,
             coco=coco,
+            limit=limit,
+            sample=sample,
+            seed=seed,
         )
 
     _run_generate(result, wizard_ran=wizard_ran, update_existing=update_existing)
