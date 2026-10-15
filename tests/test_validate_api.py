@@ -76,7 +76,7 @@ def test_api_mode_passed_outputs_only_json(stubbed, tmp_path):
     result = _invoke("--path", str(tmp_path), "--api-mode")
     assert result.exit_code == 0, result.output
     payload = _json(result)
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert payload["status"] == "passed"
     assert payload["error"] is None
     assert payload["summary"]["files_scanned"] == 2
@@ -350,6 +350,52 @@ def test_missing_required_value_names_the_row():
     report = lint_sidecar_df(_df(), final=True, data_type=None, input_files_path=None)
     missing = [f for f in report.errors() if "'GPSLatitude'" in f.message]
     assert [f.files for f in missing] == [("b.jpg",)]
+
+
+def test_bad_default_value_names_only_the_rows_that_inherit_it():
+    df = pd.DataFrame(
+        [
+            {"Filename": "DEFAULT", "DataType": "", "GPSAltitude": "not a number"},
+            {"Filename": "own.jpg", "DataType": "oriented_image", "GPSAltitude": "100"},
+            {"Filename": "inherits.jpg", "DataType": "oriented_image", "GPSAltitude": ""},
+            # Point clouds have no GPSAltitude field, so they don't inherit it.
+            {"Filename": "cloud.las", "DataType": "point_cloud", "GPSAltitude": ""},
+        ]
+    )
+    report = lint_sidecar_df(df, final=False, data_type=None, input_files_path=None)
+    bad = [f for f in report.errors() if f.location == "DEFAULT, col 'GPSAltitude'"]
+    assert [f.files for f in bad] == [("inherits.jpg",)]
+
+
+def test_files_section_skips_untyped_rows_and_lists_rowless_files(stubbed, tmp_path):
+    report = stubbed["report"]
+    report.checked_files = ["a.jpg"]  # b.jpg was untyped, so never checked
+    report.add_error("no sidecar row", files=["extra/c.jpg"])
+
+    files = validate_path(str(tmp_path))["files"]
+    assert files == {
+        "passed": ["a.jpg"],
+        "passed_with_warnings": [],
+        "failed": ["extra/c.jpg"],
+    }
+
+
+def test_inventory_findings_name_their_files(tmp_path):
+    (tmp_path / "x").mkdir()
+    (tmp_path / "y").mkdir()
+    for rel in ("x/a.jpg", "y/a.jpg", "b.jpg"):
+        (tmp_path / rel).write_text("x")
+    df = pd.DataFrame(
+        [
+            {"Filename": "DEFAULT", "DataType": "", "GPSLatitude": ""},
+            {"Filename": "a.jpg", "DataType": "oriented_image", "GPSLatitude": "51"},
+        ]
+    )
+    report = lint_sidecar_df(df, final=True, data_type=None, input_files_path=str(tmp_path))
+    ambiguous = [f for f in report.warnings() if "matches 2 input files" in f.message]
+    assert [f.files for f in ambiguous] == [("a.jpg",)]
+    rowless = [f for f in report.errors() if "have no sidecar row" in f.message]
+    assert [f.files for f in rowless] == [("b.jpg",)]
 
 
 # ---- in-memory lint parity ---------------------------------------------------

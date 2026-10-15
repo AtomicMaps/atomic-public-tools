@@ -211,13 +211,20 @@ def run_validation(
 
 
 def file_results(result: ValidationResult) -> dict[str, Any]:
-    """Sort every checked file into passed / passed_with_warnings / failed."""
-    df = result.df
-    labels = [
-        str(name).strip()
-        for name in (df[df.columns[0]] if df.shape[1] else [])
-        if str(name).strip() != DEFAULT_ROW_NAME
-    ]
+    """Sort files into passed / passed_with_warnings / failed.
+
+    Covers the rows the per-type checks ran on, plus any other file a finding
+    names (e.g. an input file with no sidecar row). Rows skipped as untyped are
+    left out unless a finding names them.
+    """
+    checked = result.report.checked_files
+    if checked is None:
+        df = result.df
+        checked = [
+            str(name).strip()
+            for name in (df[df.columns[0]] if df.shape[1] else [])
+            if str(name).strip() != DEFAULT_ROW_NAME
+        ]
     failed = set(result.crs_failures)
     warned: set[str] = set()
     for finding in result.report.findings:
@@ -225,14 +232,16 @@ def file_results(result: ValidationResult) -> dict[str, Any]:
             failed.update(finding.files)
         elif finding.level == "warning":
             warned.update(finding.files)
+    warned -= failed
+    passed = set(checked) - failed - warned
 
     def keys(names: Iterable[str]) -> list[str]:
-        return sorted(result.keys_by_label.get(n, n) for n in names)
+        return sorted({result.keys_by_label.get(n, n) for n in names})
 
     return {
-        "passed": keys(n for n in labels if n not in failed and n not in warned),
-        "passed_with_warnings": keys(n for n in labels if n in warned and n not in failed),
-        "failed": keys(n for n in labels if n in failed),
+        "passed": keys(passed),
+        "passed_with_warnings": keys(warned),
+        "failed": keys(failed),
     }
 
 

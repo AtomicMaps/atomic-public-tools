@@ -1319,13 +1319,13 @@ def _build_sidecar(
             if selection_out is not None:
                 selection_out.append((len(types_by_key), listed))
 
-    if labels_out is not None:
-        labels_out.update({label: key for key, label in display_labels.items()})
     supported_keys = list(types_by_key)
     total = len(supported_keys)
     logger.info(f"Found {total} file(s) to process in {backend.display_root}.")
 
     display_to_key = {v: k for k, v in display_labels.items()}
+    if labels_out is not None:
+        labels_out.update(display_to_key)
     n_disambiguated = sum(
         1 for k, v in display_labels.items() if v != Path(k).name
     )

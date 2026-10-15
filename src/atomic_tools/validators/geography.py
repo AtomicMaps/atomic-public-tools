@@ -142,11 +142,12 @@ def _sd_outliers(values: np.ndarray, *, high_only: bool) -> tuple[np.ndarray, fl
 
 def _outlier_details(
     names: list[str], values: np.ndarray, value_mask: np.ndarray, unit: str
-) -> list[str]:
-    """Return ``"'name' (value unit)"`` for each file flagged in ``value_mask``."""
+) -> list[tuple[str, str]]:
+    """Return ``(name, "'name' (value unit)")`` for each file flagged in ``value_mask``."""
     unit_suffix = f" {unit}" if unit else ""
     return [
-        f"{names[i]!r} ({values[i]:,.1f}{unit_suffix})" for i in np.nonzero(value_mask)[0]
+        (names[i], f"{names[i]!r} ({values[i]:,.1f}{unit_suffix})")
+        for i in np.nonzero(value_mask)[0]
     ]
 
 
@@ -161,16 +162,11 @@ def _outlier_bin_mask(values: np.ndarray, edges: np.ndarray, value_mask: np.ndar
     return bin_mask
 
 
-def _masked(names: list[str], value_mask: np.ndarray) -> list[str]:
-    """The ``names`` flagged in ``value_mask``."""
-    return [names[i] for i in np.nonzero(value_mask)[0]]
-
-
-def _format_outlier_listing(details: list[str]) -> str:
+def _format_outlier_listing(details: list[tuple[str, str]]) -> str:
     """Return a ``\\n``-prefixed block listing the outlier ``details``, or "" if none."""
     if not details:
         return ""
-    lines = ["  outlier file(s) >2 SD from median:", *(f"    {d}" for d in details)]
+    lines = ["  outlier file(s) >2 SD from median:", *(f"    {d}" for _, d in details)]
     return "\n" + "\n".join(lines)
 
 
@@ -460,7 +456,6 @@ def _analyze_coordinates(
 
     _flag_sd_outliers(
         details=details,
-        files=_masked(names, outlier_mask),
         center=center,
         std=std,
         report=report,
@@ -501,7 +496,6 @@ def _analyze_altitude(
 
     _flag_sd_outliers(
         details=details,
-        files=_masked(names, outlier_mask),
         center=center,
         std=std,
         report=report,
@@ -674,7 +668,6 @@ def _analyze_point_cloud_bounds(
         )
         _flag_sd_outliers(
             details=details,
-            files=_masked(names, outlier_mask),
             center=center,
             std=std,
             report=report,
@@ -710,7 +703,6 @@ def _analyze_point_cloud_elevation(
     )
     _flag_sd_outliers(
         details=details,
-        files=_masked(z_names, outlier_mask),
         center=center,
         std=std,
         report=report,
@@ -721,8 +713,7 @@ def _analyze_point_cloud_elevation(
 
 def _flag_sd_outliers(
     *,
-    details: list[str],
-    files: list[str],
+    details: list[tuple[str, str]],
     center: float,
     std: float,
     report: LintReport,
@@ -741,9 +732,9 @@ def _flag_sd_outliers(
     report.add_warning(
         f"{len(details)} file(s) are more than 2 SD from the median {label} "
         f"(median {center:,.1f}{unit_suffix}, SD {std:,.1f}{unit_suffix}): "
-        + _truncated_listing(details),
+        + _truncated_listing([d for _, d in details]),
         fix_hint=(
             "Far outliers often indicate a malformed coordinate or altitude; double-check them."
         ),
-        files=files,
+        files=[name for name, _ in details],
     )

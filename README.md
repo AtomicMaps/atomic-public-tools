@@ -195,13 +195,13 @@ am-tools validate --path ./data --api-mode --include findings,metadata
 
 `--include` picks which sections come back: `findings`, `missing_data`, `metadata`, `details`, `files` or `all`. The default is `findings,missing_data,details,files`; `metadata`, which has every extracted field for every file, is opt-in because it can be large. `schema_version`, `status`, `summary` and `error` are always present. `summary.files_total` appears only when `--limit` or `--sample` left files out; it is how many files there were before the cut. `validate_path` takes the same `limit`, `sample` and `seed` keyword arguments.
 
-`files` sorts every checked file by outcome into `passed`, `passed_with_warnings` and `failed`, each a list of paths. A file is `failed` when an error names it and `passed_with_warnings` when only warnings do. Batch-level findings name no file, so they can fail the run while every file is still listed as `passed`.
+`files` sorts every checked file by outcome into `passed`, `passed_with_warnings` and `failed`, each a list of paths. A file is `failed` when an error names it and `passed_with_warnings` when only warnings do; an input file with no sidecar row is listed too when a finding names it. Sidecar rows whose data type can't be determined aren't checked, so they're left out. Batch-level findings (such as COCO images missing from the input) name no file, so they can fail the run while every file is still listed as `passed`.
 
 `missing_data` lists, per data type, each file that is missing required fields and only the fields it is missing. With `--coco`, each entry also has `coco_status` and `coco_labels`, and COCO images with no sidecar row are listed under `unknown`.
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "status": "passed | passed_with_warnings | failed | error",
   "summary": {"errors": 0, "warnings": 1, "infos": 2, "files_scanned": 3,
               "detected_types": ["oriented_image"], "crs_failures": 0,

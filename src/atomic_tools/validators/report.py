@@ -32,8 +32,9 @@ class LintFinding:
     # Terminal-only output (e.g. the geography histograms); omitted from the
     # API response.
     cli_only: bool = False
-    # Sidecar Filename labels of the rows this finding is about; empty for a
-    # batch-level finding. Feeds the API's per-file pass/fail lists.
+    # The files this finding is about — sidecar Filename labels, or input keys
+    # for files with no sidecar row; empty for a batch-level finding. Feeds the
+    # API's per-file pass/fail lists.
     files: tuple[str, ...] = ()
 
 
@@ -97,6 +98,9 @@ class LintReport:
     # Populated by the sidecar linter when a datatype (and thus a set of
     # required fields) is known. None when there's nothing to tabulate.
     missing_data: MissingDataReport | None = None
+    # Filenames of the rows the per-type checks ran on (typed, non-DEFAULT).
+    # None when the linter never got that far (e.g. an unreadable sidecar).
+    checked_files: list[str] | None = None
     # Populated when a COCO file is supplied (image datatypes only).
     coco_impact: CocoImpact | None = None
 

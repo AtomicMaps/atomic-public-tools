@@ -10,7 +10,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 Status = Literal["passed", "passed_with_warnings", "failed", "error"]
 ErrorType = Literal[
@@ -89,8 +89,10 @@ class FileResults(BaseModel):
     the files that weren't checked.
 
     A file is ``failed`` when an error names it, ``passed_with_warnings`` when
-    only warnings do. Batch-level findings (e.g. an unreadable COCO file) name
-    no file, so they set ``status`` without moving any file out of ``passed``.
+    only warnings do; a file a finding names is listed even if it has no
+    sidecar row. Batch-level findings (e.g. an unreadable COCO file, or COCO
+    images missing from the input) name no file, so they set ``status``
+    without moving any file out of ``passed``.
     Telemetry paired with a video is part of that video and isn't listed.
     """
 

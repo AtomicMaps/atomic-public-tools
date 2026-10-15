@@ -246,6 +246,9 @@ def test_lint_attaches_coco_impact_and_csv(tmp_path):
     assert crow["coco_status"] == "unusable"
     assert crow["coco_labels"] == "2"
     assert any("Label impact" in f.message for f in report.infos())
+    # The unusable-images warning names the image, for the API's per-file lists.
+    unusable = [f for f in report.warnings() if "unusable carry" in f.message]
+    assert [f.files for f in unusable] == [("c.jpg",)]
 
 
 def test_lint_not_on_disk_fails_unusable_warns(tmp_path):

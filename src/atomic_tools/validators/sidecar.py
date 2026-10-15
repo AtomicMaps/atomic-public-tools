@@ -39,6 +39,7 @@ from atomic_tools.validators.geography import analyze_spatial_distribution
 from atomic_tools.validators.report import MISSING_MARKER, LintReport, MissingDataReport
 from atomic_tools.validators.required_fields import (
     ALL_SIDECAR_FIELD_GROUPS,
+    ALL_SIDECAR_FIELD_GROUPS_FULL,
     OPTIONAL_SIDECAR_FIELD_GROUPS,
     REQUIRED_SIDECAR_FIELD_GROUPS,
 )
@@ -196,6 +197,10 @@ def _lint_loaded_df(
     # honouring the optional `data_type` filter. DEFAULT and unclassifiable rows
     # map to None and are excluded from per-type checks.
     row_types = _row_types(df, data_type, default_row_idx, report)
+    if df.shape[1]:
+        report.checked_files = [
+            str(df.iat[idx, 0]).strip() for idx, t in row_types.items() if t is not None
+        ]
     detected_types = list(dict.fromkeys(t for t in row_types.values() if t is not None))
     multi = len(detected_types) > 1
 
@@ -233,19 +238,18 @@ def _lint_loaded_df(
             ]
             if has_rows:
                 # Column-presence errors apply only to a type that has rows.
-                names = type_rows[df.columns[0]].astype(str).str.strip()
+                names = type_rows[df.columns[0]].astype(str).str.strip().tolist()
                 _check_required_columns(
                     required_groups, columns_set, report, type_label=label,
                     soft=(
                         ECW_HEADER_FIELDS
-                        if names.str.lower().str.endswith(".ecw").all()
+                        if all(n.lower().endswith(".ecw") for n in names)
                         else frozenset()
                     ),
-                    files=names.tolist(),
+                    files=names,
                 )
                 _check_optional_columns(
-                    optional_groups, columns_set, report, type_label=label,
-                    files=names.tolist(),
+                    optional_groups, columns_set, report, type_label=label, files=names,
                 )
             sat = _check_required_values(
                 df, type_rows, required_groups, columns_set, default_row_idx, report,
@@ -259,7 +263,7 @@ def _lint_loaded_df(
             for group in required_groups:
                 default_satisfied[(detected.value, group[0])] = False
 
-    _check_value_formats(df, columns, default_row_idx, report)
+    _check_value_formats(df, columns, default_row_idx, report, row_types)
 
     inventory_backend = input_backend
     if input_files_path:
@@ -675,15 +679,10 @@ def _check_value_formats(
     columns: list[str],
     default_row_idx: int | None,
     report: LintReport,
+    row_types: dict[int, DataTypeEnum | None] | None = None,
 ) -> None:
     file_col = columns[0] if columns else None
     file_col_series = df[file_col].astype(str).str.strip() if file_col else None
-    # A bad DEFAULT value is inherited by every file row.
-    all_files = (
-        [n for i, n in file_col_series.items() if i != default_row_idx]
-        if file_col_series is not None
-        else []
-    )
     for col in columns:
         validator = VALIDATORS.get(col)
         if validator is None:
@@ -699,7 +698,7 @@ def _check_value_formats(
                 continue
             if idx == default_row_idx:
                 label = DEFAULT_ROW_NAME
-                files = all_files
+                files = _rows_inheriting_default(df, col, default_row_idx, row_types or {})
             else:
                 fname = file_col_series[idx] if file_col_series is not None else ""
                 label = f"row {idx} ({fname!r})" if fname else f"row {idx}"
@@ -711,6 +710,35 @@ def _check_value_formats(
             )
 
     _check_bounds_consistency(df, columns, report)
+
+
+def _rows_inheriting_default(
+    df: pd.DataFrame,
+    col: str,
+    default_row_idx: int,
+    row_types: dict[int, DataTypeEnum | None],
+) -> list[str]:
+    """Filenames of the rows that take ``col`` from DEFAULT.
+
+    A row inherits it when its own cell is blank and ``col`` is one of its
+    type's fields (a column no type lists, e.g. ``fallback_srs``, applies to all).
+    """
+    def fields(t: DataTypeEnum) -> set[str]:
+        return {f for group in ALL_SIDECAR_FIELD_GROUPS_FULL.get(t, []) for f in group}
+
+    typed = {t for t in row_types.values() if t is not None}
+    users = {t for t in typed if col in fields(t)}
+    listed_anywhere = any(
+        col in group for groups in ALL_SIDECAR_FIELD_GROUPS_FULL.values() for group in groups
+    )
+    file_col = df.columns[0]
+    return [
+        str(row[file_col]).strip()
+        for idx, row in df.iterrows()
+        if idx != default_row_idx
+        and not has_value(row[col])
+        and (not listed_anywhere or row_types.get(int(idx)) in users)
+    ]
 
 
 def _check_bounds_consistency(
@@ -881,6 +909,7 @@ def _check_file_inventory(
             report.add_warning(
                 f"Input file {key!r} matches {len(matches)} sidecar rows: {matches}.",
                 fix_hint="Use more specific paths in the sidecar to disambiguate.",
+                files=sidecar_filenames.loc[matches].tolist(),
             )
             continue
         if not matches:
@@ -895,6 +924,7 @@ def _check_file_inventory(
                 f"Sidecar row {row_idx} ({sidecar_name!r}) matches "
                 f"{len(files)} input files: {files}.",
                 fix_hint="Use more specific paths in the sidecar to disambiguate.",
+                files=[sidecar_name],
             )
 
     if not missing:
@@ -935,6 +965,7 @@ def _check_file_inventory(
                 f"{len(uncovered)} input file(s) have no sidecar row and DEFAULT "
                 f"does not cover every required field: {_listing(uncovered)}",
                 fix_hint="Add a row for each missing file or set values in DEFAULT.",
+                files=uncovered,
             )
         if covered:
             report.add_warning(
@@ -944,6 +975,7 @@ def _check_file_inventory(
                     "This is OK — DEFAULT supplies the values. Add per-file rows "
                     "if some files need overrides."
                 ),
+                files=covered,
             )
     else:
         report.add_warning(
@@ -952,6 +984,7 @@ def _check_file_inventory(
             fix_hint=(
                 "The generator will fill in any missing files automatically; this is informational."
             ),
+            files=missing,
         )
     return backend
 
@@ -1105,4 +1138,9 @@ def _apply_coco_impact(
             f"{impact.unusable} image(s) unusable carry "
             f"{impact.labels_in_tier(coco_mod.TIER_UNUSABLE)} label(s): {detail}",
             fix_hint=csv_hint,
+            files=[
+                v.row_filename
+                for v in impact.verdicts
+                if v.tier == coco_mod.TIER_UNUSABLE and v.row_filename is not None
+            ],
         )
