@@ -6,7 +6,7 @@ Library exports load lazily so ``am-tools --version`` stays fast.
 import logging
 from typing import TYPE_CHECKING, Any
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 logging.getLogger(__name__).addHandler(logging.NullHandler())
 
