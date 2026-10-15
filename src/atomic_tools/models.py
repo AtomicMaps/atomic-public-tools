@@ -35,6 +35,9 @@ class Summary(BaseModel):
     skipped_vector: int
     unclassified: int
     skipped_unsupported: int = 0
+    # Set only when --limit/--sample cut the file list: how many files there
+    # were before the cut (files_scanned is how many were checked).
+    files_total: int | None = None
 
 
 class MissingData(BaseModel):

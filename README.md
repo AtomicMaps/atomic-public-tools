@@ -160,6 +160,20 @@ am-tools validate \
   --ignore-missing-orientation
 ```
 
+#### Checking part of a large folder
+
+To spot-check a big folder or bucket without extracting every file, pass one of these (not both):
+
+- `--limit N` checks the first N files, sorted by path, so repeated runs check the same files.
+- `--sample N` checks N randomly chosen files of **each** data type. Add `--seed <int>` to repeat the same pick. The type used here comes from the filename, so ambiguous images (`.jpg`, `.png`) are all sampled as `oriented_image`, even if some turn out to be spherical.
+
+The report then includes an info line such as `Checked 5 of 1,240 files (--limit 5)`. Neither option does anything when `--path` is a single file. `am-tools sidecar` accepts the same options, but it prints a warning that the sidecar it writes covers only part of the folder. Don't submit that sidecar for intake.
+
+```bash
+am-tools validate --path s3://bucket/prefix --limit 20
+am-tools validate --path s3://bucket/prefix --sample 5 --seed 1
+```
+
 #### Faster validation of remote files
 
 For `s3://`, `gs://` and `az://` paths, `sidecar` and `validate` don't download each image or video in full. They fetch only the byte ranges exiftool reads, such as the JPEG header, the TIFF directories (even when a GeoTIFF stores them at the end of a 1.5 GB file), or an MP4's `moov` box. The ranges are written into a sparse local file the size of the original, and exiftool runs on that file with the same flags as before, so the extracted values are identical. If exiftool reports any warning or error on the partial copy, or the format has no partial reader (for example PNG), the file is downloaded in full and read again. Point clouds are always downloaded in full, because pdal reads them.
@@ -175,7 +189,7 @@ am-tools validate --path s3://bucket/prefix/IMG_0001.jpg --api-mode
 am-tools validate --path ./data --api-mode --include findings,metadata
 ```
 
-`--include` picks which sections come back: `findings`, `missing_data`, `metadata`, `details` or `all`. The default is `findings,missing_data,details`; `metadata`, which has every extracted field for every file, is opt-in because it can be large. `schema_version`, `status`, `summary` and `error` are always present.
+`--include` picks which sections come back: `findings`, `missing_data`, `metadata`, `details` or `all`. The default is `findings,missing_data,details`; `metadata`, which has every extracted field for every file, is opt-in because it can be large. `schema_version`, `status`, `summary` and `error` are always present. `summary.files_total` appears only when `--limit` or `--sample` left files out; it is how many files there were before the cut. `validate_path` takes the same `limit`, `sample` and `seed` keyword arguments.
 
 ```json
 {
@@ -183,7 +197,7 @@ am-tools validate --path ./data --api-mode --include findings,metadata
   "status": "passed | passed_with_warnings | failed | error",
   "summary": {"errors": 0, "warnings": 1, "infos": 2, "files_scanned": 3,
               "detected_types": ["oriented_image"], "crs_failures": 0,
-              "skipped_vector": 0, "unclassified": 0},
+              "skipped_vector": 0, "unclassified": 0, "files_total": 1240},
   "findings": [{"level": "warning", "message": "...", "fix_hint": "...", "location": null}],
   "missing_data": {"filename_column": "Filename", "field_columns": ["..."], "columns": ["..."],
                    "rows": [{"Filename": "b.jpg", "GPSLatitude": "MISSING"}]},

@@ -11,6 +11,7 @@ Requires the following external binaries at runtime (NOT pip-installable):
 """
 
 import logging
+import random
 import re
 import shlex
 import shutil
@@ -901,6 +902,53 @@ def _classify_keys(
     return types_by_key, unclassified, vector_keys
 
 
+def check_selection_args(limit: int | None, sample: int | None, seed: int | None) -> None:
+    """Raise :class:`InvalidInputError` for a bad ``limit``/``sample``/``seed`` combination."""
+    if limit is not None and sample is not None:
+        raise InvalidInputError("--limit and --sample can't be used together; pick one.")
+    if seed is not None and sample is None:
+        raise InvalidInputError("--seed only applies with --sample.")
+    for name, value in (("limit", limit), ("sample", sample)):
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise InvalidInputError(
+                f"--{name} must be a whole number of at least 1, got {value!r}."
+            )
+
+
+def selection_note(selected: int, total: int, limit: int | None, sample: int | None) -> str:
+    """E.g. ``"5 of 1,240 files (--limit 5)"``."""
+    how = f"--limit {limit}" if limit is not None else f"--sample {sample} per data type"
+    return f"{selected:,} of {total:,} files ({how})"
+
+
+def _select_keys(
+    types_by_key: dict[str, DataTypeEnum],
+    *,
+    limit: int | None = None,
+    sample: int | None = None,
+    seed: int | None = None,
+) -> dict[str, DataTypeEnum]:
+    """Keep the first ``limit`` keys by path, or ``sample`` random keys per type.
+
+    Keys are sorted before picking, so a given seed picks the same files whatever
+    order the listing came back in. Types are the filename-based ones, before any
+    oriented↔spherical refinement from EXIF.
+    """
+    if limit is not None:
+        return {key: types_by_key[key] for key in sorted(types_by_key)[:limit]}
+    rng = random.Random(seed)
+    by_type: dict[DataTypeEnum, list[str]] = defaultdict(list)
+    for key in sorted(types_by_key):
+        by_type[types_by_key[key]].append(key)
+    return {
+        key: t
+        for t in sorted(by_type, key=lambda t: t.value)
+        for key in rng.sample(by_type[t], min(sample, len(by_type[t])))  # type: ignore[arg-type]
+    }
+
+
 def _warn_skipped(keys: list[str], message: str) -> None:
     sample = keys[:5]
     suffix = f" (+{len(keys) - 5} more)" if len(keys) > 5 else ""
@@ -1081,6 +1129,10 @@ def _build_sidecar(
     unclassified_out: list[str] | None = None,
     unsupported_out: list[tuple[str, str]] | None = None,
     use_file_dates: bool = True,
+    limit: int | None = None,
+    sample: int | None = None,
+    seed: int | None = None,
+    selection_out: list[tuple[int, int]] | None = None,
 ) -> tuple["object", StorageBackend, set[DataTypeEnum], list[str]]:
     """Scan a directory, extract metadata, and assemble the sidecar DataFrame.
 
@@ -1105,7 +1157,13 @@ def _build_sidecar(
     ``unsupported_out`` ``(key, reason)`` for recognized files Flow can't process.
     ``use_file_dates=False`` stops modification times standing in for capture
     dates, for files that are fresh copies (uploads).
+
+    ``limit`` keeps the first N files by path; ``sample`` keeps N random files
+    per (filename-detected) data type, reproducibly for a given ``seed``. Neither
+    applies to a single-file path. ``selection_out`` receives
+    ``(selected, total)`` when that dropped any files.
     """
+    check_selection_args(limit, sample, seed)
     if spatial_reference:
         # Fail fast on an unparseable CRS before doing any extraction work.
         from pyproj import CRS
@@ -1183,6 +1241,26 @@ def _build_sidecar(
                 )
             raise NoSupportedFilesError(f"No supported files found in {backend.display_root}")
 
+    # Pair on the full listing (the backend's grouping is greedy, so pairing a
+    # subset could group differently), before any --limit/--sample cut.
+    videos = [k for k, t in types_by_key.items() if t in _VIDEO_DATA_TYPES]
+    telemetry_by_video, orphan_telemetry = (
+        pair_telemetry(sorted([*videos, *telemetry_keys])) if telemetry_keys else ({}, [])
+    )
+
+    if (limit is not None or sample is not None) and backend.single_file is None:
+        listed = len(types_by_key)
+        types_by_key = _select_keys(types_by_key, limit=limit, sample=sample, seed=seed)
+        telemetry_by_video = {
+            v: ts for v, ts in telemetry_by_video.items() if v in types_by_key
+        }
+        if len(types_by_key) < listed:
+            logger.info(
+                f"Selected {selection_note(len(types_by_key), listed, limit, sample)}."
+            )
+            if selection_out is not None:
+                selection_out.append((len(types_by_key), listed))
+
     supported_keys = list(types_by_key)
     total = len(supported_keys)
     logger.info(f"Found {total} file(s) to process in {backend.display_root}.")
@@ -1219,8 +1297,6 @@ def _build_sidecar(
         if not quiet:
             click.secho(msg, fg="yellow", err=True)
 
-    videos = [k for k, t in types_by_key.items() if t in _VIDEO_DATA_TYPES]
-    telemetry_by_video, orphan_telemetry = pair_telemetry(sorted([*videos, *telemetry_keys]))
     if orphan_telemetry:
         _warn_skipped(
             orphan_telemetry,
@@ -1484,6 +1560,9 @@ def _generate(
     local_copy: bool = False,
     spatial_reference: str | None = None,
     update_existing: bool = False,
+    limit: int | None = None,
+    sample: int | None = None,
+    seed: int | None = None,
 ) -> tuple[str, list[str], StorageBackend, "object | None"]:
     """Build and write the sidecar.
 
@@ -1497,6 +1576,7 @@ def _generate(
         f"full={full} local_copy={local_copy} spatial_reference={spatial_reference!r}"
     )
 
+    selection: list[tuple[int, int]] = []
     df, backend, _detected, vector_keys = _build_sidecar(
         directory=directory,
         data_type=data_type,
@@ -1504,7 +1584,18 @@ def _generate(
         client_schema=client_schema,
         full=full,
         spatial_reference=spatial_reference,
+        limit=limit,
+        sample=sample,
+        seed=seed,
+        selection_out=selection,
     )
+    if selection:
+        msg = (
+            f"This sidecar covers only {selection_note(*selection[0], limit, sample)}; "
+            "it is not a complete intake sidecar."
+        )
+        logger.warning(msg)
+        click.secho(msg, fg="yellow", err=True)
     if update_existing and backend.single_file is None:
         raise InvalidInputError(
             "--update-existing only applies when --path is a single file; a folder "
@@ -1596,6 +1687,9 @@ def _format_replay_command(
     local_copy: bool = False,
     coco: str | None = None,
     update_existing: bool = False,
+    limit: int | None = None,
+    sample: int | None = None,
+    seed: int | None = None,
 ) -> str:
     """Build the copy-pasteable replay command for ``sidecar`` or ``validate``.
     ``subcommand`` is the command words (e.g. ``["sidecar"]`` or
@@ -1629,6 +1723,12 @@ def _format_replay_command(
         parts += ["--coco", shlex.quote(coco)]
     if update_existing:
         parts.append("--update-existing")
+    if limit is not None:
+        parts += ["--limit", str(limit)]
+    if sample is not None:
+        parts += ["--sample", str(sample)]
+    if seed is not None:
+        parts += ["--seed", str(seed)]
     return " ".join(parts)
 
 
@@ -1743,7 +1843,13 @@ def _run_interactive_wizard(
 
 
 def _run_generate(
-    result: WizardResult, *, wizard_ran: bool, update_existing: bool = False
+    result: WizardResult,
+    *,
+    wizard_ran: bool,
+    update_existing: bool = False,
+    limit: int | None = None,
+    sample: int | None = None,
+    seed: int | None = None,
 ) -> None:
     """Generate and lint a sidecar from a fully-resolved set of options.
 
@@ -1784,6 +1890,9 @@ def _run_generate(
                 ignore_missing_orientation=result.ignore_missing_orientation,
                 coco=result.coco,
                 update_existing=update_existing,
+                limit=limit,
+                sample=sample,
+                seed=seed,
             )
         )
 
@@ -1798,6 +1907,9 @@ def _run_generate(
             local_copy=result.local_copy,
             spatial_reference=result.spatial_reference,
             update_existing=update_existing,
+            limit=limit,
+            sample=sample,
+            seed=seed,
         )
     except PointCloudCRSError as e:
         # Nothing was written to the input directory; report loudly and stop.
@@ -1898,6 +2010,49 @@ def offer_sidecar_after_schema(
         )
     )
     _run_generate(result, wizard_ran=True)
+
+
+LimitOption = Annotated[
+    int | None,
+    typer.Option(
+        "--limit",
+        min=1,
+        help=(
+            "Only process the first N files, sorted by path. For a quick check "
+            "of a large folder. Can't be combined with --sample."
+        ),
+    ),
+]
+SampleOption = Annotated[
+    int | None,
+    typer.Option(
+        "--sample",
+        min=1,
+        help=(
+            "Only process N randomly chosen files of each data type. Types come "
+            "from the filename, so ambiguous images (e.g. .jpg) are sampled as "
+            "oriented_image even if some turn out to be spherical. Can't be "
+            "combined with --limit."
+        ),
+    ),
+]
+SeedOption = Annotated[
+    int | None,
+    typer.Option(
+        "--seed",
+        help="With --sample: seed for the random pick, so a run can be repeated.",
+    ),
+]
+
+
+def _check_selection_options(
+    limit: int | None, sample: int | None, seed: int | None
+) -> None:
+    """``check_selection_args`` as a CLI usage error, before any wizard runs."""
+    try:
+        check_selection_args(limit, sample, seed)
+    except InvalidInputError as e:
+        raise typer.BadParameter(str(e)) from None
 
 
 def generate(
@@ -2035,12 +2190,18 @@ def generate(
             ),
         ),
     ] = False,
+    limit: LimitOption = None,
+    sample: SampleOption = None,
+    seed: SeedOption = None,
 ) -> None:
     """Scan a directory or file, extract per-file metadata, and write a sidecar CSV.
 
     With no flags, prompts interactively for each value. Any flag that is
     passed on the command line is used as-is and not prompted for.
     """
+    _check_selection_options(limit, sample, seed)
+    if update_existing and (limit is not None or sample is not None):
+        raise typer.BadParameter("--update-existing can't be combined with --limit or --sample.")
     from atomic_tools.cli import Verbosity, level_for
 
     verbosity_state: Verbosity = ctx.ensure_object(Verbosity)
@@ -2106,4 +2267,11 @@ def generate(
             coco=coco,
         )
 
-    _run_generate(result, wizard_ran=wizard_ran, update_existing=update_existing)
+    _run_generate(
+        result,
+        wizard_ran=wizard_ran,
+        update_existing=update_existing,
+        limit=limit,
+        sample=sample,
+        seed=seed,
+    )
