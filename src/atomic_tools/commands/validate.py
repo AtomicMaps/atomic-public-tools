@@ -296,6 +296,9 @@ def validate(
             ignore_orientation_provided,
             coco=coco,
             save=False,
+            limit=limit,
+            sample=sample,
+            seed=seed,
         )
         path = result.directory
         data_type_enum = result.data_type
@@ -306,6 +309,7 @@ def validate(
         spatial_reference = result.spatial_reference
         ignore_missing_orientation = result.ignore_missing_orientation
         coco = result.coco
+        limit, sample, seed = result.limit, result.sample, result.seed
         logging.getLogger().setLevel(
             level_for(
                 verbose=verbosity_choice == "verbose",

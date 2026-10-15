@@ -167,6 +167,8 @@ To spot-check a big folder or bucket without extracting every file, pass one of 
 - `--limit N` checks the first N files, sorted by path, so repeated runs check the same files.
 - `--sample N` checks N randomly chosen files of **each** data type. Add `--seed <int>` to repeat the same pick. The type used here comes from the filename, so ambiguous images (`.jpg`, `.png`) are all sampled as `oriented_image`, even if some turn out to be spherical.
 
+In the interactive wizard, right after the path, a folder path gets the question **Which files?** with three answers: all files (the default), the first N, or N random files of each data type. A sampled run also asks for an optional seed. The question is skipped for a single file or when you already passed `--limit` or `--sample`, and the command echoed at the end includes whatever you chose.
+
 The report then includes an info line such as `Checked 5 of 1,240 files (--limit 5)`. Every check, including the comparison against files on disk and `--coco`, covers only the files that were picked, so the files that were left out aren't reported as missing. Neither option does anything when `--path` is a single file.
 
 `am-tools sidecar` accepts the same options. So that a partial sidecar never replaces a full one, it writes to `sidecar_limit.csv` or `sidecar_sample.csv` (replacing any earlier one) unless you pass `--output-filename`. If N covers every file, nothing was left out and it writes the normal `sidecar.csv`. To add the picked files' rows to an existing `sidecar.csv` instead, pass `--update-existing`. Files that already have a row keep it unchanged.

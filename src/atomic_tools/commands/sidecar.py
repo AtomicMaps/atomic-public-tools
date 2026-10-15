@@ -158,6 +158,46 @@ def _ask_directory() -> str:
     return normalize_directory(answer)
 
 
+_ALL_FILES_CHOICE = "All files (recommended)"
+_LIMIT_CHOICE = "The first N files, sorted by path"
+_SAMPLE_CHOICE = "N random files of each data type"
+
+
+def _is_single_file_path(directory: str) -> bool:
+    """Best guess, before listing, that ``directory`` names one file."""
+    if is_remote_uri(directory):
+        return infer_data_type(directory) is not None
+    return Path(directory).is_file()
+
+
+def _ask_selection() -> tuple[int | None, int | None, int | None]:
+    """``(limit, sample, seed)`` for a quick check of part of a folder."""
+    choice = questionary.select(
+        "Which files?",
+        instruction="(Checking only some of them is quicker on a large folder)",
+        choices=[_ALL_FILES_CHOICE, _LIMIT_CHOICE, _SAMPLE_CHOICE],
+        default=_ALL_FILES_CHOICE,
+    ).unsafe_ask()
+    if choice == _ALL_FILES_CHOICE:
+        return None, None, None
+    n = int(
+        questionary.text(
+            "How many files?" if choice == _LIMIT_CHOICE else "How many files per data type?",
+            validate=lambda v: (
+                (v.strip().isdigit() and int(v) >= 1) or "A whole number, 1 or more."
+            ),
+        ).unsafe_ask()
+    )
+    if choice == _LIMIT_CHOICE:
+        return n, None, None
+    seed = questionary.text(
+        "Random seed:",
+        instruction="(Optional — the same seed picks the same files again)",
+        validate=lambda v: not v.strip() or v.strip().lstrip("-").isdigit() or "A whole number.",
+    ).unsafe_ask().strip()
+    return None, n, int(seed) if seed else None
+
+
 def _ask_data_type() -> DataTypeEnum:
     choice = questionary.select(
         "Data type of the input data:",
@@ -1794,6 +1834,9 @@ class WizardResult(NamedTuple):
     spatial_reference: str | None
     ignore_missing_orientation: bool
     coco: str | None
+    limit: int | None = None
+    sample: int | None = None
+    seed: int | None = None
 
 
 def _run_interactive_wizard(
@@ -1813,6 +1856,9 @@ def _run_interactive_wizard(
     ignore_missing_orientation_provided: bool,
     coco: str | None = None,
     save: bool = True,
+    limit: int | None = None,
+    sample: int | None = None,
+    seed: int | None = None,
 ) -> WizardResult:
     """Prompt for any value the user didn't pass on the CLI.
 
@@ -1827,6 +1873,8 @@ def _run_interactive_wizard(
     try:
         if directory is None:
             directory = _ask_directory()
+        if limit is None and sample is None and not _is_single_file_path(directory):
+            limit, sample, seed = _ask_selection()
         if data_type is None:
             data_type = _ask_data_type_filter()
         # Conditional prompts follow "show unless an explicit filter rules them
@@ -1875,6 +1923,9 @@ def _run_interactive_wizard(
         spatial_reference=spatial_reference,
         ignore_missing_orientation=ignore_missing_orientation,
         coco=coco,
+        limit=limit,
+        sample=sample,
+        seed=seed,
     )
 
 
@@ -1883,9 +1934,6 @@ def _run_generate(
     *,
     wizard_ran: bool,
     update_existing: bool = False,
-    limit: int | None = None,
-    sample: int | None = None,
-    seed: int | None = None,
 ) -> None:
     """Generate and lint a sidecar from a fully-resolved set of options.
 
@@ -1928,9 +1976,9 @@ def _run_generate(
                 ignore_missing_orientation=result.ignore_missing_orientation,
                 coco=result.coco,
                 update_existing=update_existing,
-                limit=limit,
-                sample=sample,
-                seed=seed,
+                limit=result.limit,
+                sample=result.sample,
+                seed=result.seed,
             )
         )
 
@@ -1945,9 +1993,9 @@ def _run_generate(
             local_copy=result.local_copy,
             spatial_reference=result.spatial_reference,
             update_existing=update_existing,
-            limit=limit,
-            sample=sample,
-            seed=seed,
+            limit=result.limit,
+            sample=result.sample,
+            seed=result.seed,
         )
     except PointCloudCRSError as e:
         # Nothing was written to the input directory; report loudly and stop.
@@ -2281,6 +2329,9 @@ def generate(
             ignore_missing_orientation,
             ignore_orientation_provided,
             coco=coco,
+            limit=limit,
+            sample=sample,
+            seed=seed,
         )
         verbosity_choice = result.verbosity
         logging.getLogger().setLevel(
@@ -2302,13 +2353,9 @@ def generate(
             spatial_reference=spatial_reference,
             ignore_missing_orientation=ignore_missing_orientation,
             coco=coco,
+            limit=limit,
+            sample=sample,
+            seed=seed,
         )
 
-    _run_generate(
-        result,
-        wizard_ran=wizard_ran,
-        update_existing=update_existing,
-        limit=limit,
-        sample=sample,
-        seed=seed,
-    )
+    _run_generate(result, wizard_ran=wizard_ran, update_existing=update_existing)

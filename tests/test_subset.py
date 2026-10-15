@@ -10,6 +10,7 @@ from typer.testing import CliRunner
 
 from atomic_tools import validate_path
 from atomic_tools.cli import app
+from atomic_tools.commands import sidecar as sidecar_mod
 from atomic_tools.commands.sidecar import _build_sidecar, _select_keys
 from atomic_tools.errors import InvalidInputError
 from atomic_tools.utils.utils import DataTypeEnum
@@ -282,3 +283,90 @@ def test_full_folder_still_rejects_update_existing(tmp_path, patched_extractors)
     _make_dir(tmp_path)
     result = runner.invoke(app, ["sidecar", "--path", str(tmp_path), "--update-existing"])
     assert result.exit_code == 1
+
+
+# ---- wizard ------------------------------------------------------------------------------
+
+
+class _Canned:
+    def __init__(self, answer):
+        self._answer = answer
+
+    def unsafe_ask(self):
+        return self._answer
+
+
+@pytest.mark.parametrize(
+    "answers,expected",
+    [
+        (["All files (recommended)"], (None, None, None)),
+        (["The first N files, sorted by path", "5"], (5, None, None)),
+        (["N random files of each data type", "3", "7"], (None, 3, 7)),
+        (["N random files of each data type", "3", ""], (None, 3, None)),
+    ],
+)
+def test_ask_selection(monkeypatch, answers, expected):
+    queue = iter(answers)
+    for name in ("select", "text"):
+        monkeypatch.setattr(sidecar_mod.questionary, name, lambda *a, **k: _Canned(next(queue)))
+    assert sidecar_mod._ask_selection() == expected
+
+
+@pytest.fixture
+def wizard(monkeypatch, tmp_path):
+    """Answer every wizard prompt; ``asked`` records whether the selection was asked."""
+    asked: list[str] = []
+    answers = {
+        "_ask_directory": lambda: str(tmp_path),
+        "_ask_data_type_filter": lambda: None,
+        "_ask_ignore_missing_orientation": lambda: False,
+        "_ask_output_filename": lambda: "",
+        "_ask_client_sidecar": lambda: None,
+        "_ask_client_schema": lambda: None,
+        "_ask_coco": lambda: None,
+        "_ask_spatial_reference": lambda: None,
+        "_ask_full": lambda: False,
+        "_ask_local_copy": lambda: False,
+        "_ask_verbosity": lambda: "default",
+        "_ask_selection": lambda: (asked.append("selection"), (1, None, None))[1],
+    }
+    for name, fn in answers.items():
+        monkeypatch.setattr(sidecar_mod, name, fn)
+    return asked
+
+
+def test_wizard_asks_selection_and_uses_it(tmp_path, patched_extractors, wizard):  # noqa: F811
+    _make_dir(tmp_path)
+    result = runner.invoke(app, ["validate"])
+    assert wizard == ["selection"]
+    assert "Checked 1 of 6 files (--limit 1)" in result.stdout
+    assert "--limit 1" in result.stderr  # the replay command
+
+
+def test_wizard_sidecar_uses_selection(tmp_path, patched_extractors, wizard):  # noqa: F811
+    _make_dir(tmp_path)
+    runner.invoke(app, ["sidecar"])
+    assert _rows(pd.read_csv(tmp_path / "sidecar_limit.csv", dtype=str)) == ["a.jpg"]
+
+
+def test_wizard_skips_selection_when_flag_given(tmp_path, patched_extractors, wizard):  # noqa: F811
+    _make_dir(tmp_path)
+    result = runner.invoke(app, ["validate", "--sample", "1", "--seed", "0"])
+    assert wizard == []
+    assert "--sample 1 per data type" in result.stdout
+
+
+def test_wizard_skips_selection_for_a_single_file(tmp_path, monkeypatch, wizard):
+    _make_dir(tmp_path)
+    monkeypatch.setattr(sidecar_mod, "_ask_directory", lambda: str(tmp_path / "a.jpg"))
+    result = sidecar_mod._run_interactive_wizard(
+        None, None, None, None, None, False, True, "default", True, False, True,
+        None, False, True,
+    )
+    assert wizard == []
+    assert (result.limit, result.sample) == (None, None)
+
+
+def test_remote_single_file_guess():
+    assert sidecar_mod._is_single_file_path("s3://bucket/flight/IMG_0001.jpg")
+    assert not sidecar_mod._is_single_file_path("s3://bucket/flight")

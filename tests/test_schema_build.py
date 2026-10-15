@@ -378,6 +378,7 @@ def test_build_then_offer_sidecar_carries_over(tmp_path, monkeypatch):
             True,  # build a sidecar now? -> yes
             # ...remaining sidecar-wizard questions:
             str(tmp_path),  # directory to scan
+            sidecar_cmd._ALL_FILES_CHOICE,  # which files? -> all
             False,  # ignore missing orientation? (oriented_image)
             "sidecar.csv",  # output filename
             "",  # COCO label file -> skip
