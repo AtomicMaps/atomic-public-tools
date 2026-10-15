@@ -2,6 +2,9 @@
 
 import logging
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, TypeAlias, cast
 
 import boto3
@@ -14,6 +17,26 @@ from obstore.store import AzureStore, GCSStore, S3Store
 from atomic_tools.utils.aws_errors import S3CredentialsMissingError
 
 logger = logging.getLogger(__name__)
+
+# A ContextVar rather than a parameter: S3 stores are built from several call paths.
+_session_override: ContextVar[boto3.Session | None] = ContextVar(
+    "atomic_tools_boto3_session", default=None
+)
+
+
+@contextmanager
+def use_session(session: boto3.Session | None) -> Iterator[None]:
+    """Make ``init_session`` use `session` instead of the default credential chain.
+
+    Scoped to the current thread/task, so concurrent API requests can each read
+    S3 with their own credentials. ``None`` keeps the default chain.
+    """
+    token = _session_override.set(session)
+    try:
+        yield
+    finally:
+        _session_override.reset(token)
+
 
 # Instances returned by boto/obstore bindings; accepted by obstore.head/put/sign/etc.
 ObstoreBackend: TypeAlias = S3Store | GCSStore | AzureStore
@@ -220,7 +243,7 @@ class ObjectStore:
 
         if not self.config:
             self.config = {}
-            session = boto3.Session()
+            session = _session_override.get() or boto3.Session()
         else:
             self.config = {key.lower(): value for key, value in self.config.items()}
             session = boto3.Session(

@@ -128,3 +128,89 @@ def test_list_keys_passes_through_non_auth_runtime_error(monkeypatch):
 
     with pytest.raises(RuntimeError, match="disk full"):
         backend.list_keys(include=[], exclude=[])
+
+
+class _RecordingStore:
+    """Captures the session ``_initialize_store`` was handed."""
+
+    def __init__(self, session) -> None:
+        self.session = session
+
+
+def _record_store(monkeypatch):
+    monkeypatch.setattr(
+        object_store_module.ObjectStore,
+        "_initialize_store",
+        lambda self, method, *, session, bucket, **kw: _RecordingStore(session),
+    )
+    monkeypatch.setattr(
+        object_store_module.ObjectStore,
+        "_resolve_bucket_region",
+        lambda self, session, bucket: None,
+    )
+
+
+def test_use_session_overrides_default_chain(monkeypatch):
+    _record_store(monkeypatch)
+    monkeypatch.setattr(
+        object_store_module.boto3,
+        "Session",
+        lambda *a, **kw: pytest.fail("default boto3.Session() must not be built"),
+    )
+    injected = _FakeSession(has_credentials=True)
+    with object_store_module.use_session(injected):
+        store = object_store_module.ObjectStore("s3").init_session(bucket="b")
+    assert store.session is injected
+
+
+def test_default_chain_without_session(monkeypatch):
+    _record_store(monkeypatch)
+    default = _FakeSession(has_credentials=True)
+    monkeypatch.setattr(object_store_module.boto3, "Session", lambda *a, **kw: default)
+    with object_store_module.use_session(None):
+        store = object_store_module.ObjectStore("s3").init_session(bucket="b")
+    assert store.session is default
+
+
+def test_use_session_is_reset_on_exit(monkeypatch):
+    with object_store_module.use_session(_FakeSession(has_credentials=True)):
+        pass
+    assert object_store_module._session_override.get() is None
+
+
+def test_use_session_isolated_between_threads(monkeypatch):
+    import threading
+
+    _record_store(monkeypatch)
+    sessions = [_FakeSession(has_credentials=True) for _ in range(2)]
+    barrier = threading.Barrier(2)
+    seen: dict[int, object] = {}
+
+    def worker(i: int) -> None:
+        with object_store_module.use_session(sessions[i]):
+            barrier.wait()  # both overrides are set before either store is built
+            seen[i] = object_store_module.ObjectStore("s3").init_session(bucket="b").session
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert seen == {0: sessions[0], 1: sessions[1]}
+
+
+def test_validate_path_passes_session_to_s3_reads(monkeypatch):
+    from atomic_tools import api
+
+    injected = _FakeSession(has_credentials=True)
+    seen = []
+
+    def fake_run_validation(path, **kwargs):
+        seen.append(object_store_module._session_override.get())
+        raise RuntimeError("stop")
+
+    monkeypatch.setattr(api, "run_validation", fake_run_validation)
+    response = api.validate_path("s3://bucket/prefix", session=injected)
+    assert seen == [injected]
+    assert response.status == "error"
+    assert object_store_module._session_override.get() is None

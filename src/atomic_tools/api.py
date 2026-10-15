@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any
 
+import boto3
+
 from atomic_tools.client_sidecar import SidecarMergeError
 from atomic_tools.commands.sidecar import (
     NoSupportedFilesError,
@@ -37,6 +39,7 @@ from atomic_tools.models import (
 )
 from atomic_tools.utils.aws_errors import find_auth_error
 from atomic_tools.utils.extractors import PdalNotFoundError, find_pdal_bin
+from atomic_tools.utils.object_store import use_session
 from atomic_tools.utils.raster import gdal_status
 from atomic_tools.utils.utils import (
     DataTypeEnum,
@@ -297,6 +300,7 @@ def validate_path(
     coco: str | None = None,
     include: str | Iterable[str] | None = None,
     use_file_dates: bool = True,
+    session: boto3.Session | None = None,
     limit: int | None = None,
     sample: int | None = None,
     seed: int | None = None,
@@ -306,6 +310,9 @@ def validate_path(
     A folder is scanned recursively, so never point this at a shared one.
     Pass ``use_file_dates=False`` when the files are fresh copies, so their
     modification times aren't taken as capture dates.
+
+    ``session`` reads S3 with the given boto3 session (e.g. assumed-role
+    credentials) instead of the default credential chain.
 
     ``limit`` checks only the first N files by path; ``sample`` checks N random
     files per data type (repeatable with ``seed``). Not both.
@@ -324,21 +331,22 @@ def validate_path(
         return error_payload("invalid_input", str(e))
 
     try:
-        result = run_validation(
-            path,
-            data_type=dt,
-            client_sidecar=client_sidecar,
-            client_schema=client_schema,
-            full=full,
-            spatial_reference=spatial_reference,
-            ignore_missing_orientation=ignore_missing_orientation,
-            coco=coco,
-            quiet=True,
-            use_file_dates=use_file_dates,
-            limit=limit,
-            sample=sample,
-            seed=seed,
-        )
+        with use_session(session):
+            result = run_validation(
+              path,
+              data_type=dt,
+              client_sidecar=client_sidecar,
+              client_schema=client_schema,
+              full=full,
+              spatial_reference=spatial_reference,
+              ignore_missing_orientation=ignore_missing_orientation,
+              coco=coco,
+              quiet=True,
+              use_file_dates=use_file_dates,
+              limit=limit,
+              sample=sample,
+              seed=seed,
+          )
     except Exception as e:  # noqa: BLE001 — API contract: never raise
         logger.error(f"Validation failed: {e}", exc_info=logger.isEnabledFor(logging.INFO))
         return error_payload(_classify_exception(e), str(e))
