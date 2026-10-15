@@ -24,6 +24,10 @@ import typer
 
 from atomic_tools.api import error_payload, run_validation, validate_path
 from atomic_tools.commands.sidecar import (
+    LimitOption,
+    SampleOption,
+    SeedOption,
+    _check_selection_options,
     _echo_replay_command,
     _fail,
     _format_replay_command,
@@ -55,6 +59,9 @@ def _run_api_mode(
     coco: str | None,
     include: str | None,
     verbose: bool,
+    limit: int | None = None,
+    sample: int | None = None,
+    seed: int | None = None,
 ) -> None:
     """Print one JSON document to stdout. Exit 0 if validation ran, else 2/1."""
     real_stdout = sys.stdout
@@ -77,6 +84,9 @@ def _run_api_mode(
                 ignore_missing_orientation=ignore_missing_orientation,
                 coco=coco,
                 include=include,
+                limit=limit,
+                sample=sample,
+                seed=seed,
             )
 
     _emit_json(response, real_stdout)
@@ -212,6 +222,9 @@ def validate(
             ),
         ),
     ] = None,
+    limit: LimitOption = None,
+    sample: SampleOption = None,
+    seed: SeedOption = None,
 ) -> None:
     """Scan a directory or file, extract metadata, and lint it — without saving a sidecar.
 
@@ -243,10 +256,15 @@ def validate(
             coco=coco,
             include=include,
             verbose=verbosity_state.verbose,
+            limit=limit,
+            sample=sample,
+            seed=seed,
         )
         return
     if include is not None:
         raise typer.BadParameter("--include only applies with --api-mode.")
+    # After the api-mode branch, where validate_path reports these as JSON.
+    _check_selection_options(limit, sample, seed)
 
     # The wizard now only runs when the path is missing; --datatype being
     # unset just means auto-detect, not "ask me".
@@ -278,6 +296,9 @@ def validate(
             ignore_orientation_provided,
             coco=coco,
             save=False,
+            limit=limit,
+            sample=sample,
+            seed=seed,
         )
         path = result.directory
         data_type_enum = result.data_type
@@ -288,6 +309,7 @@ def validate(
         spatial_reference = result.spatial_reference
         ignore_missing_orientation = result.ignore_missing_orientation
         coco = result.coco
+        limit, sample, seed = result.limit, result.sample, result.seed
         logging.getLogger().setLevel(
             level_for(
                 verbose=verbosity_choice == "verbose",
@@ -312,6 +334,9 @@ def validate(
                 spatial_reference=spatial_reference,
                 ignore_missing_orientation=ignore_missing_orientation,
                 coco=coco,
+                limit=limit,
+                sample=sample,
+                seed=seed,
             )
         )
 
@@ -325,6 +350,9 @@ def validate(
             spatial_reference=spatial_reference,
             ignore_missing_orientation=ignore_missing_orientation,
             coco=coco,
+            limit=limit,
+            sample=sample,
+            seed=seed,
         )
     except Exception as e:
         _fail("Failed to validate data", e)

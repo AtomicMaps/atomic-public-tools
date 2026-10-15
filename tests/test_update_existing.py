@@ -44,9 +44,18 @@ def folder(tmp_path, patched_extractors):  # noqa: F811
 # ---- CLI behaviour ---------------------------------------------------------------
 
 
-def test_refusal_suggests_update_existing(folder):
+def test_single_file_gets_its_own_sidecar(folder):
     before = (folder / "sidecar.csv").read_bytes()
     result = _single(folder, "c.jpg")
+    assert result.exit_code == 0, result.output
+    assert (folder / "sidecar.csv").read_bytes() == before
+    df = pd.read_csv(folder / "sidecar_c_jpg.csv", dtype=str, keep_default_na=False)
+    assert list(df["Filename"]) == ["DEFAULT", "c.jpg"]
+
+
+def test_refusal_suggests_update_existing(folder):
+    before = (folder / "sidecar.csv").read_bytes()
+    result = _single(folder, "c.jpg", "--output-filename", "sidecar.csv")
     assert result.exit_code == 1
     assert (folder / "sidecar.csv").read_bytes() == before
 

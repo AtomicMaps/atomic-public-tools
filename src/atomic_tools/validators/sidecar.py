@@ -283,9 +283,7 @@ def _lint_loaded_df(
             default_row_idx=default_row_idx,
             report=report,
             not_on_disk_is_error=coco_not_on_disk_is_error,
-            scope_to_sidecar=(
-                inventory_backend is not None and inventory_backend.single_file is not None
-            ),
+            scope_to_sidecar=inventory_backend is not None and inventory_backend.scoped,
         )
 
     # An explicit --datatype restricts every other check to the matching rows, so
