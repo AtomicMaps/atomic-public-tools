@@ -18,6 +18,7 @@ from atomic_tools.commands.sidecar import (
     _ask_ignore_missing_orientation,
     _ask_verbosity,
     ask_schema_uri,
+    passed_on_command_line,
 )
 from atomic_tools.utils.utils import DataTypeEnum, DataTypeFilter, uri_stem
 from atomic_tools.validators.coco import IMAGE_DATA_TYPES
@@ -314,16 +315,11 @@ def lint_sidecar_cmd(
     verbosity_provided = verbosity_state.verbose or verbosity_state.silent
 
     # check to see if they provided the fields
-    final_provided = ctx.get_parameter_source("final") == click.core.ParameterSource.COMMANDLINE
-    schema_provided = ctx.get_parameter_source("schema") == click.core.ParameterSource.COMMANDLINE
-    input_files_provided = (
-        ctx.get_parameter_source("input_files") == click.core.ParameterSource.COMMANDLINE
-    )
-    ignore_orientation_provided = (
-        ctx.get_parameter_source("ignore_missing_orientation")
-        == click.core.ParameterSource.COMMANDLINE
-    )
-    coco_provided = ctx.get_parameter_source("coco") == click.core.ParameterSource.COMMANDLINE
+    final_provided = passed_on_command_line(ctx, "final")
+    schema_provided = passed_on_command_line(ctx, "schema")
+    input_files_provided = passed_on_command_line(ctx, "input_files")
+    ignore_orientation_provided = passed_on_command_line(ctx, "ignore_missing_orientation")
+    coco_provided = passed_on_command_line(ctx, "coco")
 
     # --datatype is an optional filter; convert it to the full enum immediately.
     datatype_enum: DataTypeEnum | None = (

@@ -19,7 +19,6 @@ import logging
 import sys
 from typing import Annotated
 
-import click
 import typer
 
 from atomic_tools.api import error_payload, run_validation, validate_path
@@ -34,6 +33,7 @@ from atomic_tools.commands.sidecar import (
     _raise_crs_failures_loudly,
     _run_interactive_wizard,
     _warn_skipped_vectors,
+    passed_on_command_line,
 )
 from atomic_tools.models import ValidationResponse
 from atomic_tools.utils.utils import DataTypeEnum, DataTypeFilter
@@ -270,13 +270,8 @@ def validate(
     # unset just means auto-detect, not "ask me".
     wizard_ran = path is None
     if wizard_ran:
-        full_provided = (
-            ctx.get_parameter_source("full") == click.core.ParameterSource.COMMANDLINE
-        )
-        ignore_orientation_provided = (
-            ctx.get_parameter_source("ignore_missing_orientation")
-            == click.core.ParameterSource.COMMANDLINE
-        )
+        full_provided = passed_on_command_line(ctx, "full")
+        ignore_orientation_provided = passed_on_command_line(ctx, "ignore_missing_orientation")
         # output_filename / local_copy are irrelevant when nothing is saved, so
         # they're left at their defaults and ignored (hence save=False).
         result = _run_interactive_wizard(

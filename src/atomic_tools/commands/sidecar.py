@@ -118,6 +118,16 @@ _POINT_CLOUD_DATA_TYPES = {DataTypeEnum.point_cloud}
 _CRS_WEB_MERCATOR_COL = "crs_web_mercator_ok"
 
 
+def passed_on_command_line(ctx: typer.Context, name: str) -> bool:
+    """Whether option `name` was given on the command line.
+
+    Compares by name: typer 0.27+ vendors its own click, so its
+    ``ParameterSource`` is not ``click.core.ParameterSource``.
+    """
+    source = ctx.get_parameter_source(name)
+    return source is not None and source.name == "COMMANDLINE"
+
+
 def _fail(message: str, exc: Exception) -> NoReturn:
     """Log a failure, surface AWS auth help if applicable, and exit non-zero."""
     # A missing pdal is a setup problem, not a bug — show the install
@@ -2302,17 +2312,9 @@ def generate(
     # unset just means auto-detect, not "ask me".
     wizard_ran = directory is None
     if wizard_ran:
-        full_provided = (
-            ctx.get_parameter_source("full") == click.core.ParameterSource.COMMANDLINE
-        )
-        local_copy_provided = (
-            ctx.get_parameter_source("local_copy")
-            == click.core.ParameterSource.COMMANDLINE
-        )
-        ignore_orientation_provided = (
-            ctx.get_parameter_source("ignore_missing_orientation")
-            == click.core.ParameterSource.COMMANDLINE
-        )
+        full_provided = passed_on_command_line(ctx, "full")
+        local_copy_provided = passed_on_command_line(ctx, "local_copy")
+        ignore_orientation_provided = passed_on_command_line(ctx, "ignore_missing_orientation")
         result = _run_interactive_wizard(
             directory,
             data_type_enum,
