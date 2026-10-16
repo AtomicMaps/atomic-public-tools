@@ -128,9 +128,15 @@ def test_missing_data_lists_only_missing_fields_by_type():
             {"Filename": "p.jpg", "CreateDate": "", "GPSLatitude": "MISSING", "Pitch": "MISSING"},
             # Added from COCO alone: no sidecar row, so no type.
             {"Filename": "gone.jpg", "coco_status": "not_on_disk", "coco_labels": "3"},
+            # Added from COCO with nothing missing (e.g. only orientation, a
+            # warning): not missing data, so left out.
+            {"Filename": "warn.jpg", "CreateDate": "", "GPSLatitude": "", "Pitch": "",
+             "coco_status": "degraded", "coco_labels": "4"},
         ],
         include_coco=True,
-        row_types={"v.avi": "full_motion_video", "p.jpg": "oriented_image"},
+        row_types={
+            "v.avi": "full_motion_video", "p.jpg": "oriented_image", "warn.jpg": "oriented_image",
+        },
     )
     table.rows[0].update(coco_status="ok", coco_labels="0")
     table.rows[1].update(coco_status="unusable", coco_labels="2")

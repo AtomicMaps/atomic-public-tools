@@ -199,7 +199,7 @@ am-tools validate --path ./data --api-mode --include findings,metadata
 
 API mode ignores missing orientation by default: an oriented image without Pitch/Heading/Roll gets a warning and is listed under `passed_with_warnings`, and its missing orientation fields are listed under `optional_missing` (same shape as `missing_data`) rather than `missing_data`. Pass `--require-orientation` (or `ignore_missing_orientation=False` to `validate_path`) to make it an error again.
 
-`missing_data` lists, per data type, each file that is missing required fields and only the fields it is missing. An ortho image or point cloud with no CRS is listed with `file_srs` missing. With `--coco`, each entry also has `coco_status` and `coco_labels`, and COCO images with no sidecar row are listed under `unknown`.
+`missing_data` lists, per data type, each file that is missing required fields and only the fields it is missing. An ortho image or point cloud with no CRS is listed with `file_srs` missing. With `--coco`, each entry also has `coco_status` and `coco_labels`. An image with no missing fields is listed only when it is `unusable` or `not_on_disk` (COCO images with no sidecar row go under `unknown`); other tiers such as `degraded` are in `details.coco`.
 
 ```json
 {

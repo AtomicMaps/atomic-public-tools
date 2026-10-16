@@ -87,18 +87,23 @@ class MissingDataReport:
 
         ``keys_by_name`` maps a Filename to the path to report (default: as is).
         Rows with no data type (COCO images with no sidecar row) go under
-        ``"unknown"``.
+        ``"unknown"``. Rows COCO added with nothing missing are left out unless
+        their images are unusable or not on disk; the rest (e.g. ``degraded``)
+        stay in ``details.coco`` and the CSV.
         """
+        from atomic_tools.validators.coco import TIER_NOT_ON_DISK, TIER_UNUSABLE
+
         keys_by_name = keys_by_name or {}
         grouped: dict[str, list[dict]] = {}
         for row in self.rows:
             name = row.get(self.filename_column, "")
-            entry: dict = {
-                "file": keys_by_name.get(name, name),
-                "missing": [c for c in self.field_columns if row.get(c) == MISSING_MARKER],
-            }
+            missing = [c for c in self.field_columns if row.get(c) == MISSING_MARKER]
+            status = row.get(COCO_STATUS_COLUMN, "")
+            if not missing and status not in (TIER_UNUSABLE, TIER_NOT_ON_DISK):
+                continue
+            entry: dict = {"file": keys_by_name.get(name, name), "missing": missing}
             if self.include_coco:
-                entry["coco_status"] = row.get(COCO_STATUS_COLUMN, "")
+                entry["coco_status"] = status
                 entry["coco_labels"] = int(row.get(COCO_LABELS_COLUMN) or 0)
             grouped.setdefault(self.row_types.get(name, "unknown"), []).append(entry)
         return grouped
