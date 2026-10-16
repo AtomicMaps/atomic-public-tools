@@ -76,7 +76,7 @@ def test_api_mode_passed_outputs_only_json(stubbed, tmp_path):
     result = _invoke("--path", str(tmp_path), "--api-mode")
     assert result.exit_code == 0, result.output
     payload = _json(result)
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert payload["status"] == "passed"
     assert payload["error"] is None
     assert payload["summary"]["files_scanned"] == 2
@@ -98,6 +98,7 @@ def test_api_mode_failed_lint_still_exits_zero(stubbed, tmp_path):
         filename_column="Filename",
         field_columns=["GPSLatitude"],
         rows=[{"Filename": "b.jpg", "GPSLatitude": "MISSING"}],
+        row_types={"b.jpg": "oriented_image"},
     )
     stubbed["report"] = report
 
@@ -113,7 +114,79 @@ def test_api_mode_failed_lint_still_exits_zero(stubbed, tmp_path):
         "fix_hint": "fix it",
         "location": "row 2",
     }
-    assert payload["missing_data"]["rows"] == [{"Filename": "b.jpg", "GPSLatitude": "MISSING"}]
+    assert payload["missing_data"] == {
+        "oriented_image": [{"file": "b.jpg", "missing": ["GPSLatitude"]}]
+    }
+
+
+def test_missing_data_lists_only_missing_fields_by_type():
+    table = MissingDataReport(
+        filename_column="Filename",
+        field_columns=["CreateDate", "GPSLatitude", "Pitch"],
+        rows=[
+            {"Filename": "v.avi", "CreateDate": "MISSING", "GPSLatitude": "", "Pitch": ""},
+            {"Filename": "p.jpg", "CreateDate": "", "GPSLatitude": "MISSING", "Pitch": "MISSING"},
+            # Added from COCO alone: no sidecar row, so no type.
+            {"Filename": "gone.jpg", "coco_status": "not_on_disk", "coco_labels": "3"},
+            # Added from COCO with nothing missing (e.g. only orientation, a
+            # warning): not missing data, so left out.
+            {"Filename": "warn.jpg", "CreateDate": "", "GPSLatitude": "", "Pitch": "",
+             "coco_status": "degraded", "coco_labels": "4"},
+        ],
+        include_coco=True,
+        row_types={
+            "v.avi": "full_motion_video", "p.jpg": "oriented_image", "warn.jpg": "oriented_image",
+        },
+    )
+    table.rows[0].update(coco_status="ok", coco_labels="0")
+    table.rows[1].update(coco_status="unusable", coco_labels="2")
+    assert table.to_dict({"p.jpg": "imgs/p.jpg"}) == {
+        "full_motion_video": [
+            {"file": "v.avi", "missing": ["CreateDate"], "coco_status": "ok", "coco_labels": 0}
+        ],
+        "oriented_image": [
+            {
+                "file": "imgs/p.jpg",
+                "missing": ["GPSLatitude", "Pitch"],
+                "coco_status": "unusable",
+                "coco_labels": 2,
+            }
+        ],
+        "unknown": [
+            {"file": "gone.jpg", "missing": [], "coco_status": "not_on_disk", "coco_labels": 3}
+        ],
+    }
+
+
+def test_api_mode_omits_cli_only_findings(stubbed, tmp_path):
+    stubbed["report"].add_info("Batch center (median): ...\n  [0 - 1] mi  1", cli_only=True)
+    stubbed["report"].add_info("kept")
+
+    payload = _json(_invoke("--path", str(tmp_path), "--api-mode"))
+    assert [f["message"] for f in payload["findings"]] == ["kept"]
+    assert payload["summary"]["infos"] == 1
+
+
+def test_files_section_sorts_files_by_outcome(stubbed, tmp_path):
+    stubbed["report"].add_error("missing lat", files=["b.jpg"])
+    stubbed["report"].add_warning("far away", files=["a.jpg", "b.jpg"])
+    stubbed["report"].add_error("batch-level, names no file")
+
+    files = validate_path(str(tmp_path))["files"]
+    assert files["passed"] == []
+    assert files["passed_with_warnings"] == ["a.jpg"]
+    assert files["failed"] == ["b.jpg"]  # an error outranks a warning
+    assert "skipped" not in files
+
+
+def test_api_mode_ignores_missing_orientation_by_default(stubbed, tmp_path):
+    assert _invoke("--path", str(tmp_path), "--api-mode").exit_code == 0
+    assert stubbed["lint_kwargs"]["ignore_missing_orientation"] is True
+    validate_path(str(tmp_path))
+    assert stubbed["lint_kwargs"]["ignore_missing_orientation"] is True
+
+    _invoke("--path", str(tmp_path), "--api-mode", "--require-orientation")
+    assert stubbed["lint_kwargs"]["ignore_missing_orientation"] is False
 
 
 def test_api_mode_warnings_only_status(stubbed, tmp_path):
@@ -277,6 +350,91 @@ def test_validate_path_end_to_end(tmp_path, patched_extractors):  # noqa: F811
     names = {row["Filename"] for row in payload["metadata"]}
     assert {"DEFAULT", "a.jpg", "b.las", "c.mp4"} <= names
     assert any(k.endswith("d.geojson") for k in payload["details"]["skipped_vector"])
+
+
+def test_validate_path_files_end_to_end(tmp_path, patched_extractors):  # noqa: F811
+    _make_mixed_dir(tmp_path)
+    files = validate_path(str(tmp_path), limit=2)["files"]
+
+    checked = files["passed"] + files["passed_with_warnings"] + files["failed"]
+    # Keys as in ``details`` (relative to the scanned folder), only the files
+    # the limit kept.
+    assert sorted(checked) == ["a.jpg", "b.las"]
+
+
+def test_missing_required_value_names_the_row():
+    report = lint_sidecar_df(_df(), final=True, data_type=None, input_files_path=None)
+    missing = [f for f in report.errors() if "'GPSLatitude'" in f.message]
+    assert [f.files for f in missing] == [("b.jpg",)]
+
+
+def test_bad_default_value_names_only_the_rows_that_inherit_it():
+    df = pd.DataFrame(
+        [
+            {"Filename": "DEFAULT", "DataType": "", "GPSAltitude": "not a number"},
+            {"Filename": "own.jpg", "DataType": "oriented_image", "GPSAltitude": "100"},
+            {"Filename": "inherits.jpg", "DataType": "oriented_image", "GPSAltitude": ""},
+            # Point clouds have no GPSAltitude field, so they don't inherit it.
+            {"Filename": "cloud.las", "DataType": "point_cloud", "GPSAltitude": ""},
+        ]
+    )
+    report = lint_sidecar_df(df, final=False, data_type=None, input_files_path=None)
+    bad = [f for f in report.errors() if f.location == "DEFAULT, col 'GPSAltitude'"]
+    assert [f.files for f in bad] == [("inherits.jpg",)]
+
+
+def test_files_section_skips_untyped_rows_and_lists_rowless_files(stubbed, tmp_path):
+    report = stubbed["report"]
+    report.missing_data = MissingDataReport(  # b.jpg was untyped, so never checked
+        filename_column="Filename", field_columns=[], row_types={"a.jpg": "oriented_image"}
+    )
+    report.add_error("no sidecar row", files=["extra/c.jpg"])
+
+    files = validate_path(str(tmp_path))["files"]
+    assert files == {
+        "passed": ["a.jpg"],
+        "passed_with_warnings": [],
+        "failed": ["extra/c.jpg"],
+    }
+
+
+def test_inventory_findings_name_their_files(tmp_path):
+    (tmp_path / "x").mkdir()
+    (tmp_path / "y").mkdir()
+    for rel in ("x/a.jpg", "y/a.jpg", "b.jpg"):
+        (tmp_path / rel).write_text("x")
+    df = pd.DataFrame(
+        [
+            {"Filename": "DEFAULT", "DataType": "", "GPSLatitude": ""},
+            {"Filename": "a.jpg", "DataType": "oriented_image", "GPSLatitude": "51"},
+        ]
+    )
+    report = lint_sidecar_df(df, final=True, data_type=None, input_files_path=str(tmp_path))
+    ambiguous = [f for f in report.warnings() if "matches 2 input files" in f.message]
+    assert [f.files for f in ambiguous] == [("a.jpg",)]
+    rowless = [f for f in report.errors() if "have no sidecar row" in f.message]
+    assert [f.files for f in rowless] == [("b.jpg",)]
+
+
+def test_missing_crs_is_listed_in_missing_data():
+    df = pd.DataFrame(
+        [
+            {"Filename": "DEFAULT", "DataType": "", "file_srs": "", "fallback_srs": ""},
+            {"Filename": "has.tif", "DataType": "ortho_image", "file_srs": "EPSG:32618",
+             "fallback_srs": ""},
+            {"Filename": "none.tif", "DataType": "ortho_image", "file_srs": "",
+             "fallback_srs": ""},
+        ]
+    )
+    report = lint_sidecar_df(df, final=True, data_type=None, input_files_path=None)
+    assert any("have no CRS" in f.message for f in report.errors())
+    assert report.missing_data is not None
+    # (Both rows also lack the ortho's other required fields; only CRS differs.)
+    no_crs = [
+        e["file"] for e in report.missing_data.to_dict()["ortho_image"]
+        if "file_srs" in e["missing"]
+    ]
+    assert no_crs == ["none.tif"]
 
 
 # ---- in-memory lint parity ---------------------------------------------------

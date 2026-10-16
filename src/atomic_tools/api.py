@@ -63,11 +63,14 @@ __all__ = [
     "validate_upload",
 ]
 
-SECTIONS: tuple[str, ...] = ("findings", "missing_data", "metadata", "details")
+SECTIONS: tuple[str, ...] = (
+    "findings", "missing_data", "optional_missing", "metadata", "details", "files"
+)
 # metadata is opt-in: one dict per file gets large.
-DEFAULT_SECTIONS: frozenset[str] = frozenset({"findings", "missing_data", "details"})
+DEFAULT_SECTIONS: frozenset[str] = frozenset(SECTIONS) - {"metadata"}
 
-# Some findings embed click colours (e.g. the geography histogram).
+# Safety net: findings are plain text today, but a click-coloured one must not
+# leak escape codes into JSON.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
@@ -85,6 +88,8 @@ class ValidationResult:
     unclassified: list[str] = field(default_factory=list)
     skipped_unsupported: list[tuple[str, str]] = field(default_factory=list)
     files_total: int | None = None  # set when --limit/--sample dropped files
+    # Sidecar Filename label → source key.
+    keys_by_label: dict[str, str] = field(default_factory=dict)
 
     @property
     def failed(self) -> bool:
@@ -138,7 +143,7 @@ def run_validation(
     client_schema: str | None = None,
     full: bool = False,
     spatial_reference: str | None = None,
-    ignore_missing_orientation: bool = False,
+    ignore_missing_orientation: bool = True,
     coco: str | None = None,
     quiet: bool = False,
     use_file_dates: bool = True,
@@ -156,6 +161,7 @@ def run_validation(
     unclassified: list[str] = []
     unsupported: list[tuple[str, str]] = []
     selection: list[tuple[int, int]] = []
+    keys_by_label: dict[str, str] = {}
     df, backend, detected_types, skipped_vector = _build_sidecar(
         directory=path,
         data_type=data_type,
@@ -171,6 +177,7 @@ def run_validation(
         sample=sample,
         seed=seed,
         selection_out=selection,
+        labels_out=keys_by_label,
     )
     df = _as_csv_strings(df)
     crs_failures = _crs_failures(df)
@@ -202,13 +209,44 @@ def run_validation(
         unclassified=unclassified,
         skipped_unsupported=unsupported,
         files_total=selection[0][1] if selection else None,
+        keys_by_label=keys_by_label,
     )
+
+
+def file_results(result: ValidationResult) -> dict[str, Any]:
+    """Sort files into passed / passed_with_warnings / failed.
+
+    Covers the rows the per-type checks ran on, plus any other file a finding
+    names (e.g. an input file with no sidecar row). Rows skipped as untyped are
+    left out unless a finding names them.
+    """
+    missing_data = result.report.missing_data
+    checked = missing_data.row_types if missing_data is not None else {}
+    failed = set(result.crs_failures)
+    warned: set[str] = set()
+    for finding in result.report.api_findings():
+        if finding.level == "error":
+            failed.update(finding.files)
+        elif finding.level == "warning":
+            warned.update(finding.files)
+    warned -= failed
+    passed = set(checked) - failed - warned
+
+    def keys(names: Iterable[str]) -> list[str]:
+        return sorted({result.keys_by_label.get(n, n) for n in names})
+
+    return {
+        "passed": keys(passed),
+        "passed_with_warnings": keys(warned),
+        "failed": keys(failed),
+    }
 
 
 def build_payload(result: ValidationResult, include: Iterable[str]) -> ValidationResponse:
     """Serialise a :class:`ValidationResult` to the response model."""
     include = set(include)
     report = result.report
+    findings = report.api_findings()
     df = result.df
     filenames = df["Filename"].astype(str) if "Filename" in df.columns else None
     files_scanned = (
@@ -220,9 +258,9 @@ def build_payload(result: ValidationResult, include: Iterable[str]) -> Validatio
         "schema_version": SCHEMA_VERSION,
         "status": result.status,
         "summary": {
-            "errors": len(report.errors()),
-            "warnings": len(report.warnings()),
-            "infos": len(report.infos()),
+            "errors": sum(f.level == "error" for f in findings),
+            "warnings": sum(f.level == "warning" for f in findings),
+            "infos": sum(f.level == "info" for f in findings),
             "files_scanned": files_scanned,
             "detected_types": sorted(t.value for t in result.detected_types),
             "crs_failures": len(result.crs_failures),
@@ -238,10 +276,10 @@ def build_payload(result: ValidationResult, include: Iterable[str]) -> Validatio
             {**f, "message": _plain(f["message"]), "fix_hint": _plain(f["fix_hint"])}
             for f in report.findings_as_dicts()
         ]
-    if "missing_data" in include:
-        fields["missing_data"] = (
-            report.missing_data.to_dict() if report.missing_data is not None else None
-        )
+    for section in ("missing_data", "optional_missing"):
+        if section in include:
+            table = getattr(report, section)
+            fields[section] = table.to_dict(result.keys_by_label) if table is not None else None
     if "metadata" in include:
         fields["metadata"] = df.to_dict(orient="records")
     if "details" in include:
@@ -254,6 +292,8 @@ def build_payload(result: ValidationResult, include: Iterable[str]) -> Validatio
             ],
             "coco": report.coco_impact.to_dict() if report.coco_impact else None,
         }
+    if "files" in include:
+        fields["files"] = file_results(result)
     return ValidationResponse.model_validate(fields)
 
 
@@ -296,7 +336,7 @@ def validate_path(
     client_schema: str | None = None,
     full: bool = False,
     spatial_reference: str | None = None,
-    ignore_missing_orientation: bool = False,
+    ignore_missing_orientation: bool = True,
     coco: str | None = None,
     include: str | Iterable[str] | None = None,
     use_file_dates: bool = True,
@@ -316,6 +356,10 @@ def validate_path(
 
     ``limit`` checks only the first N files by path; ``sample`` checks N random
     files per data type (repeatable with ``seed``). Not both.
+
+    Missing orientation (Pitch/Heading/Roll) only warns unless
+    ``ignore_missing_orientation=False``, so those images come back as
+    ``passed_with_warnings``.
     """
     try:
         sections = parse_include(include)
@@ -540,7 +584,7 @@ def validate_upload(
     data_type: DataTypeEnum | str | None = None,
     full: bool = False,
     spatial_reference: str | None = None,
-    ignore_missing_orientation: bool = False,
+    ignore_missing_orientation: bool = True,
     include: str | Iterable[str] | None = None,
     work_dir: str | os.PathLike[str] | None = None,
     max_bytes: int | None = None,

@@ -142,11 +142,12 @@ def _sd_outliers(values: np.ndarray, *, high_only: bool) -> tuple[np.ndarray, fl
 
 def _outlier_details(
     names: list[str], values: np.ndarray, value_mask: np.ndarray, unit: str
-) -> list[str]:
-    """Return ``"'name' (value unit)"`` for each file flagged in ``value_mask``."""
+) -> list[tuple[str, str]]:
+    """Return ``(name, "'name' (value unit)")`` for each file flagged in ``value_mask``."""
     unit_suffix = f" {unit}" if unit else ""
     return [
-        f"{names[i]!r} ({values[i]:,.1f}{unit_suffix})" for i in np.nonzero(value_mask)[0]
+        (names[i], f"{names[i]!r} ({values[i]:,.1f}{unit_suffix})")
+        for i in np.nonzero(value_mask)[0]
     ]
 
 
@@ -161,11 +162,11 @@ def _outlier_bin_mask(values: np.ndarray, edges: np.ndarray, value_mask: np.ndar
     return bin_mask
 
 
-def _format_outlier_listing(details: list[str]) -> str:
+def _format_outlier_listing(details: list[tuple[str, str]]) -> str:
     """Return a ``\\n``-prefixed block listing the outlier ``details``, or "" if none."""
     if not details:
         return ""
-    lines = ["  outlier file(s) >2 SD from median:", *(f"    {d}" for d in details)]
+    lines = ["  outlier file(s) >2 SD from median:", *(f"    {d}" for _, d in details)]
     return "\n" + "\n".join(lines)
 
 
@@ -295,6 +296,9 @@ def _check_point_cloud_crs(
                 untransformable.append(name)
 
         reader = "PDAL" if dtype == _POINT_CLOUD_TYPE else "am-tools"
+        if report.missing_data is not None:
+            for name in missing:
+                report.missing_data.mark(name, _FILE_SRS_COL, dtype)
         if missing:
             report.add_error(
                 f"{len(missing)} {noun} row(s) have no CRS in either "
@@ -305,6 +309,7 @@ def _check_point_cloud_crs(
                     f"'{_FILE_SRS_COL}', or pass --spatial-reference to set a "
                     f"'{_FALLBACK_SRS_COL}'."
                 ),
+                files=missing,
             )
         if unreadable:
             report.add_warning(
@@ -314,6 +319,7 @@ def _check_point_cloud_crs(
                     "Flow reads it during intake. Install GDAL to check it here, or "
                     "pass --spatial-reference if it's wrong."
                 ),
+                files=unreadable,
             )
         if untransformable:
             report.add_error(
@@ -326,6 +332,7 @@ def _check_point_cloud_crs(
                     "convertible to it. Correct the CRS or pass a valid "
                     "--spatial-reference."
                 ),
+                files=untransformable,
             )
 
 
@@ -424,6 +431,7 @@ def _analyze_coordinates(
                 "Verify lat/lon aren't swapped or sign-flipped. (US check is an "
                 "approximate bounding box — ignore if your data is legitimately abroad.)"
             ),
+            files=outside_us,
         )
 
     # Median rather than mean so a single wild outlier doesn't drag the center
@@ -445,7 +453,8 @@ def _analyze_coordinates(
         f"Batch center (median): {center_lat:.5f}, {center_lon:.5f} "
         f"({len(names)} geolocated files). Distance from center (miles):\n"
         + _render_histogram(distances, "mi", outlier_mask)
-        + _format_outlier_listing(details)
+        + _format_outlier_listing(details),
+        cli_only=True,
     )
 
     _flag_sd_outliers(
@@ -484,7 +493,8 @@ def _analyze_altitude(
     report.add_info(
         f"Altitude distribution across {len(names)} files (units as provided):\n"
         + _render_histogram(alt_arr, "", outlier_mask)
-        + _format_outlier_listing(details)
+        + _format_outlier_listing(details),
+        cli_only=True,
     )
 
     _flag_sd_outliers(
@@ -628,6 +638,7 @@ def _analyze_point_cloud_bounds(
                 f"Ensure each row's '{_FILE_SRS_COL}' (or the batch "
                 f"'{_FALLBACK_SRS_COL}') is a CRS pyproj can transform to EPSG:3857."
             ),
+            files=names,
         )
         return
     cx_list, cy_list = transformed
@@ -655,7 +666,8 @@ def _analyze_point_cloud_bounds(
             f"Batch center (median bbox center): {center_label} "
             f"({len(names)} point clouds). Distance from center (miles){crs_note}:\n"
             + _render_histogram(distances, "mi", outlier_mask)
-            + _format_outlier_listing(details)
+            + _format_outlier_listing(details),
+            cli_only=True,
         )
         _flag_sd_outliers(
             details=details,
@@ -689,7 +701,8 @@ def _analyze_point_cloud_elevation(
         f"Elevation distribution across {len(z_names)} point clouds "
         f"(bbox Z center, feet):\n"
         + _render_histogram(z_arr, "ft", outlier_mask)
-        + _format_outlier_listing(details)
+        + _format_outlier_listing(details),
+        cli_only=True,
     )
     _flag_sd_outliers(
         details=details,
@@ -703,7 +716,7 @@ def _analyze_point_cloud_elevation(
 
 def _flag_sd_outliers(
     *,
-    details: list[str],
+    details: list[tuple[str, str]],
     center: float,
     std: float,
     report: LintReport,
@@ -722,8 +735,9 @@ def _flag_sd_outliers(
     report.add_warning(
         f"{len(details)} file(s) are more than 2 SD from the median {label} "
         f"(median {center:,.1f}{unit_suffix}, SD {std:,.1f}{unit_suffix}): "
-        + _truncated_listing(details),
+        + _truncated_listing([d for _, d in details]),
         fix_hint=(
             "Far outliers often indicate a malformed coordinate or altitude; double-check them."
         ),
+        files=[name for name, _ in details],
     )

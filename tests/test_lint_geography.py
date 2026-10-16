@@ -95,6 +95,10 @@ def test_distance_outlier_over_2sd_flagged(tmp_path):
         "2 SD from the median distance" in f.message and "far.jpg" in f.message
         for f in report.warnings()
     ), _messages(report)
+    # The warning names the outlier so the API can list it per file.
+    assert [
+        f.files for f in report.warnings() if "2 SD from the median distance" in f.message
+    ] == [("far.jpg",)]
 
 
 def test_single_point_skips_distance_distribution(tmp_path):

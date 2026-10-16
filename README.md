@@ -193,20 +193,27 @@ am-tools validate --path s3://bucket/prefix/IMG_0001.jpg --api-mode
 am-tools validate --path ./data --api-mode --include findings,metadata
 ```
 
-`--include` picks which sections come back: `findings`, `missing_data`, `metadata`, `details` or `all`. The default is `findings,missing_data,details`; `metadata`, which has every extracted field for every file, is opt-in because it can be large. `schema_version`, `status`, `summary` and `error` are always present. `summary.files_total` appears only when `--limit` or `--sample` left files out; it is how many files there were before the cut. `validate_path` takes the same `limit`, `sample` and `seed` keyword arguments.
+`--include` picks which sections come back: `findings`, `missing_data`, `optional_missing`, `metadata`, `details`, `files` or `all`. The default is every section except `metadata`; `metadata`, which has every extracted field for every file, is opt-in because it can be large. `schema_version`, `status`, `summary` and `error` are always present. `summary.files_total` appears only when `--limit` or `--sample` left files out; it is how many files there were before the cut. `validate_path` takes the same `limit`, `sample` and `seed` keyword arguments.
+
+`files` sorts every checked file by outcome into `passed`, `passed_with_warnings` and `failed`, each a list of paths. A file is `failed` when an error names it and `passed_with_warnings` when only warnings do; an input file with no sidecar row is listed too when a finding names it. Sidecar rows whose data type can't be determined aren't checked, so they're left out. Batch-level findings (such as COCO images missing from the input) name no file, so they can fail the run while every file is still listed as `passed`.
+
+API mode ignores missing orientation by default: an oriented image without Pitch/Heading/Roll gets a warning and is listed under `passed_with_warnings`, and its missing orientation fields are listed under `optional_missing` (same shape as `missing_data`) rather than `missing_data`. Pass `--require-orientation` (or `ignore_missing_orientation=False` to `validate_path`) to make it an error again.
+
+`missing_data` lists, per data type, each file that is missing required fields and only the fields it is missing. An ortho image or point cloud with no CRS is listed with `file_srs` missing. With `--coco`, each entry also has `coco_status` and `coco_labels`. An image with no missing fields is listed only when it is `unusable` or `not_on_disk` (COCO images with no sidecar row go under `unknown`); other tiers such as `degraded` are in `details.coco`.
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "status": "passed | passed_with_warnings | failed | error",
   "summary": {"errors": 0, "warnings": 1, "infos": 2, "files_scanned": 3,
               "detected_types": ["oriented_image"], "crs_failures": 0,
               "skipped_vector": 0, "unclassified": 0, "files_total": 1240},
   "findings": [{"level": "warning", "message": "...", "fix_hint": "...", "location": null}],
-  "missing_data": {"filename_column": "Filename", "field_columns": ["..."], "columns": ["..."],
-                   "rows": [{"Filename": "b.jpg", "GPSLatitude": "MISSING"}]},
+  "missing_data": {"oriented_image": [{"file": "b.jpg", "missing": ["GPSLatitude"]}]},
+  "optional_missing": {"oriented_image": [{"file": "b.jpg", "missing": ["Pitch", "Roll"]}]},
   "metadata": [{"Filename": "DEFAULT", "DataType": "", "...": "..."}],
   "details": {"crs_failures": [], "skipped_vector": [], "unclassified": [], "coco": null},
+  "files": {"passed": ["a.jpg"], "passed_with_warnings": [], "failed": ["b.jpg"]},
   "error": null
 }
 ```

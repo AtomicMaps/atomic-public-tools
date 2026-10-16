@@ -175,17 +175,20 @@ def validate(
         ),
     ] = None,
     ignore_missing_orientation: Annotated[
-        bool,
+        bool | None,
         typer.Option(
-            "--ignore-missing-orientation",
+            "--ignore-missing-orientation/--require-orientation",
             help=(
-                "Only meaningful for --datatype oriented_image. By default, "
-                "missing orientation (Pitch/Heading/Roll) is an error; pass this "
-                "to downgrade it to a warning (the images still process, "
-                "appearing in Lens without orientation)."
+                "Oriented images only. Missing orientation (Pitch/Heading/Roll) "
+                "is an error by default, or a warning with "
+                "--ignore-missing-orientation (the images still process, "
+                "appearing in Lens without orientation). With --api-mode the "
+                "default is to ignore it; pass --require-orientation to make it "
+                "an error."
             ),
+            show_default=False,
         ),
-    ] = False,
+    ] = None,
     coco: Annotated[
         str | None,
         typer.Option(
@@ -217,8 +220,8 @@ def validate(
             "--include",
             help=(
                 "With --api-mode: comma-separated JSON sections to return — "
-                "findings, missing_data, metadata, details, or 'all'. "
-                "Default: findings,missing_data,details."
+                "findings, missing_data, optional_missing, metadata, details, "
+                "files, or 'all'. Default: everything but metadata."
             ),
         ),
     ] = None,
@@ -252,7 +255,9 @@ def validate(
             client_schema=client_schema,
             full=full,
             spatial_reference=spatial_reference,
-            ignore_missing_orientation=ignore_missing_orientation,
+            ignore_missing_orientation=(
+                True if ignore_missing_orientation is None else ignore_missing_orientation
+            ),
             coco=coco,
             include=include,
             verbose=verbosity_state.verbose,
@@ -263,6 +268,7 @@ def validate(
         return
     if include is not None:
         raise typer.BadParameter("--include only applies with --api-mode.")
+    ignore_missing_orientation = bool(ignore_missing_orientation)
     # After the api-mode branch, where validate_path reports these as JSON.
     _check_selection_options(limit, sample, seed)
 

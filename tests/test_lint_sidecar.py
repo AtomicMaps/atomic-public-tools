@@ -99,6 +99,38 @@ def test_final_missing_orientation_columns_warn_when_ignored(tmp_path):
     assert "Roll" in warning_text
 
 
+def test_final_blank_orientation_values_warn_per_file_when_ignored(tmp_path):
+    """Orientation columns present but blank on a row: a warning naming that
+    file (not an error), so the API lists it as passed_with_warnings."""
+    header = _oriented_image_header()
+    rows = [
+        ["DEFAULT", "", "", "", "", "", "", ""],
+        ["1.jpg", "2024:06:15 10:30:00", "1000", "51.0", "-114.0", "1", "2", "3"],
+        ["2.jpg", "2024:06:15 10:30:00", "1000", "51.0", "-114.0", "", "2", ""],
+    ]
+    p = _write_csv(tmp_path, "s.csv", header, rows)
+    report = lint_sidecar_file(
+        str(p),
+        final=True,
+        data_type=DataTypeEnum.oriented_image,
+        schema_path=None,
+        input_files_path=None,
+        ignore_missing_orientation=True,
+    )
+    assert not report.has_errors(), [f.message for f in report.errors()]
+    flagged = {
+        f.message.split()[0]: f.files for f in report.warnings() if "is missing on" in f.message
+    }
+    # Columns are Pitch, Roll, Heading: 2.jpg has only Roll.
+    assert flagged == {"'Pitch'": ("2.jpg",), "'Heading'": ("2.jpg",)}
+    # Listed as optional gaps, not as missing required data.
+    assert report.missing_data is not None and report.missing_data.is_empty()
+    assert report.optional_missing is not None
+    assert report.optional_missing.to_dict() == {
+        "oriented_image": [{"file": "2.jpg", "missing": ["Pitch", "Heading"]}]
+    }
+
+
 def test_final_referenced_fields_produce_no_lint_signal(tmp_path):
     """Missing referenced (non-required) fields must not error or warn."""
     header = _oriented_image_header()  # has required + orientation, no FocalLength/Make
